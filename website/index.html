@@ -493,6 +493,10 @@
       background: #f59e0b;
     }
 
+    .usage-progress-bar.red {
+      background: #ef4444;
+    }
+
     .usage-section-percent {
       font-size: 11px;
       color: var(--text-muted);
@@ -1015,34 +1019,34 @@
               </span>
               <span class="menu-item" style="color: var(--claude-orange);">67%</span>
             </div>
-            <div class="usage-popup">
+            <div class="usage-popup" id="usagePopup">
               <div class="usage-popup-title">Claude Usage</div>
 
               <div class="usage-section">
                 <div class="usage-section-header">
                   <span class="usage-section-label">Session (5 hour)</span>
-                  <span class="usage-section-reset">Resets at 3:45 PM</span>
+                  <span class="usage-section-reset" id="sessionReset">Resets at 3:45 PM</span>
                 </div>
                 <div class="usage-progress">
-                  <div class="usage-progress-bar green" style="width: 67%;"></div>
+                  <div class="usage-progress-bar green" id="sessionBar" style="width: 67%;"></div>
                 </div>
-                <span class="usage-section-percent">67% used</span>
+                <span class="usage-section-percent" id="sessionPercent">67% used</span>
               </div>
 
               <div class="usage-section">
                 <div class="usage-section-header">
                   <span class="usage-section-label">Weekly (7 day)</span>
-                  <span class="usage-section-reset">Resets on 31 Jan 2026</span>
+                  <span class="usage-section-reset" id="weeklyReset">Resets on 31 Jan 2026</span>
                 </div>
                 <div class="usage-progress">
-                  <div class="usage-progress-bar orange" style="width: 82%;"></div>
+                  <div class="usage-progress-bar" id="weeklyBar" style="width: 82%;"></div>
                 </div>
-                <span class="usage-section-percent">82% used</span>
+                <span class="usage-section-percent" id="weeklyPercent">82% used</span>
               </div>
 
               <div class="usage-popup-footer">
-                <span>Last updated: 11:22 AM</span>
-                <span class="usage-popup-refresh">Refresh</span>
+                <span id="lastUpdated">Last updated: 11:22 AM</span>
+                <span class="usage-popup-refresh" id="refreshBtn" onclick="refreshUsage()">Refresh</span>
               </div>
             </div>
           </div>
@@ -1142,12 +1146,12 @@
 
       <div class="faq-item">
         <div class="faq-question">Is my data safe?</div>
-        <div class="faq-answer">Yes. ClaudeUsageBar is fully open source, so you can inspect every line of code. Your session cookie and usage data never leave your computer. There's no analytics, no telemetry, and no data collection of any kind.</div>
+        <div class="faq-answer">Yes. Your session cookie and usage data never leave your computer. There's no analytics, no telemetry, and no data collection of any kind. ClaudeUsageBar is fully open source, so you can inspect every line of code.</div>
       </div>
 
       <div class="faq-item">
         <div class="faq-question">How do I get my session cookie?</div>
-        <div class="faq-answer">Go to <a href="https://claude.ai" target="_blank">claude.ai</a>, open Developer Tools (Cmd+Option+I), go to the Network tab, refresh the page, click any request, and copy the full "Cookie" value from the Request Headers.</div>
+        <div class="faq-answer">Go to <a href="https://claude.ai/settings/usage" target="_blank">claude.ai/settings/usage</a>, open Developer Tools (Cmd+Option+I), go to the Network tab, refresh the page, click the "usage" request, and copy the full "Cookie" value from the Request Headers.</div>
       </div>
 
       <div class="faq-item">
@@ -1193,5 +1197,67 @@
       </div>
     </div>
   </footer>
+
+  <script>
+    // Update last updated time to user's current time
+    function updateLastUpdatedTime() {
+      const now = new Date();
+      const timeStr = now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+      document.getElementById('lastUpdated').textContent = 'Last updated: ' + timeStr;
+    }
+
+    // Generate random usage data
+    function refreshUsage() {
+      const sessionPercent = Math.floor(Math.random() * 85) + 5; // 5-90%
+      const weeklyPercent = Math.floor(Math.random() * 85) + 10; // 10-95%
+
+      // Update session
+      const sessionBar = document.getElementById('sessionBar');
+      sessionBar.style.width = sessionPercent + '%';
+      sessionBar.className = 'usage-progress-bar ' + (sessionPercent < 70 ? 'green' : sessionPercent < 90 ? 'orange' : 'red');
+      document.getElementById('sessionPercent').textContent = sessionPercent + '% used';
+
+      // Update weekly
+      const weeklyBar = document.getElementById('weeklyBar');
+      weeklyBar.style.width = weeklyPercent + '%';
+      weeklyBar.className = 'usage-progress-bar ' + (weeklyPercent < 70 ? 'green' : weeklyPercent < 90 ? 'orange' : 'red');
+      document.getElementById('weeklyPercent').textContent = weeklyPercent + '% used';
+
+      // Update menu bar percentage display
+      const menuPercent = document.querySelector('.menu-item[style]');
+      if (menuPercent) menuPercent.textContent = sessionPercent + '%';
+
+      // Update last updated time
+      updateLastUpdatedTime();
+    }
+
+    // Toggle usage popup with Cmd+U
+    function toggleUsagePopup() {
+      const popup = document.getElementById('usagePopup');
+      if (popup.style.display === 'none') {
+        popup.style.display = 'block';
+        updateLastUpdatedTime();
+      } else {
+        popup.style.display = 'none';
+      }
+    }
+
+    // Listen for Cmd+U keyboard shortcut
+    document.addEventListener('keydown', function(e) {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'u') {
+        e.preventDefault();
+        toggleUsagePopup();
+      }
+    });
+
+    // Initialize on page load
+    document.addEventListener('DOMContentLoaded', function() {
+      updateLastUpdatedTime();
+
+      // Set initial weekly bar color
+      const weeklyBar = document.getElementById('weeklyBar');
+      weeklyBar.className = 'usage-progress-bar orange';
+    });
+  </script>
 </body>
 </html>
