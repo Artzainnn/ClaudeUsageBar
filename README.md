@@ -11,6 +11,10 @@ A lightweight, open-source macOS menu bar application that displays your Claude.
 
 **[Download Latest Release](https://github.com/Artzainnn/claudeusagebar/releases)** (DMG Installer)
 
+## 📦 Set Up (1mn)
+
+Go to [claude.ai/settings/usage](https://claude.ai/settings/usage) from browser, open Developer Tools (Cmd+Option+I), go to the Network tab, refresh the page, click the "usage" request, and copy the full "Cookie" value from the Request Headers.
+
 ## ✨ Features
 
 - 🟢 **Real-time usage tracking** - Monitor session (5-hour) and weekly (7-day) limits
