@@ -55,12 +55,12 @@ A lightweight macOS menu bar app that displays your Claude.ai session and weekly
 ### Option 3: Build from Source
 
 ```bash
-cd ClaudeUsageBar
+cd app
 chmod +x build.sh
 ./build.sh
 ```
 
-See [INSTALL.md](INSTALL.md) for detailed installation instructions.
+The built app will be in `build/ClaudeUsageBar.app`.
 
 ## 🔧 First-Time Setup
 
@@ -162,10 +162,9 @@ rm -rf build
 
 ## 📦 Distribution Files
 
-- **ClaudeUsageBar-Installer.dmg** - Drag-to-install DMG (492 KB)
-- **ClaudeUsageBar.zip** - Simple ZIP archive
-- **INSTALL.md** - Detailed installation guide
+- **ClaudeUsageBar-Installer.dmg** - Drag-to-install DMG (1.6 MB)
 - **README.md** - This file
+- **LICENSE** - MIT License
 
 ## 🤝 Contributing
 

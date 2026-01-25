@@ -31,20 +31,48 @@ if [ -f "ClaudeUsageBar.icns" ]; then
     /usr/libexec/PlistBuddy -c "Set :CFBundleIconFile ClaudeUsageBar" "$APP_PATH/Contents/Info.plist"
 fi
 
-# Compile the Swift app with correct flags
-swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar" \
+# Compile the Swift app for arm64
+swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_arm64" \
     ClaudeUsageBar.swift \
     -framework SwiftUI \
     -framework AppKit \
     -framework WebKit \
     -target arm64-apple-macos12.0
 
-if [ $? -eq 0 ]; then
-    echo "Build successful!"
-    echo "App bundle created at: $APP_PATH"
-    echo "Launching app..."
-    open "$APP_PATH"
+# Compile for x86_64 (Intel)
+swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_x86_64" \
+    ClaudeUsageBar.swift \
+    -framework SwiftUI \
+    -framework AppKit \
+    -framework WebKit \
+    -target x86_64-apple-macos12.0
+
+# Create universal binary
+lipo -create -output "$APP_PATH/Contents/MacOS/ClaudeUsageBar" \
+    "$APP_PATH/Contents/MacOS/ClaudeUsageBar_arm64" \
+    "$APP_PATH/Contents/MacOS/ClaudeUsageBar_x86_64"
+
+# Clean up individual arch binaries
+rm "$APP_PATH/Contents/MacOS/ClaudeUsageBar_arm64"
+rm "$APP_PATH/Contents/MacOS/ClaudeUsageBar_x86_64"
+
+# Create PkgInfo file
+echo -n "APPL????" > "$APP_PATH/Contents/PkgInfo"
+
+# Set proper permissions first
+chmod 755 "$APP_PATH/Contents/MacOS/ClaudeUsageBar"
+
+# Clean extended attributes before signing
+xattr -cr "$APP_PATH"
+
+# Sign with ad-hoc signature (required for macOS to launch)
+if codesign --force --deep --sign - "$APP_PATH" 2>/dev/null; then
+    echo "✅ App signed successfully"
 else
-    echo "Build failed!"
-    exit 1
+    echo "⚠️  Warning: Could not sign app"
 fi
+
+echo "Build successful!"
+echo "App bundle created at: $APP_PATH"
+echo "Launching app..."
+open "$APP_PATH"

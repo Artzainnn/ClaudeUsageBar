@@ -21,7 +21,9 @@ This website can be deployed to GitHub Pages:
 4. Folder: `/website`
 5. Save
 
-Your site will be available at: `https://yourname.github.io/claudeusagebar/`
+Your site will be available at: `https://Artzainnn.github.io/claudeusagebar/`
+
+**Note:** This project uses a custom domain: `claudeusagebar.com` configured via Vercel.
 
 ### Local Development
 

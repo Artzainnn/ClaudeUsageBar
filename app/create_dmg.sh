@@ -12,6 +12,9 @@ mkdir -p "$TMP_DIR"
 # Copy the app
 cp -R "build/${APP_NAME}.app" "$TMP_DIR/"
 
+# Strip all extended attributes (including quarantine)
+xattr -cr "$TMP_DIR/${APP_NAME}.app"
+
 # Create symbolic link to Applications folder
 ln -s /Applications "$TMP_DIR/Applications"
 

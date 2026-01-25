@@ -9,9 +9,9 @@ A lightweight, open-source macOS menu bar application that displays your Claude.
 
 ## 📥 Download
 
-**[Download Latest Release](https://github.com/yourname/claudeusagebar/releases)** (DMG Installer - 521 KB)
+**[Download Latest Release](https://github.com/Artzainnn/claudeusagebar/releases)** (DMG Installer - 1.6 MB)
 
-Alternative: [ZIP Archive](https://github.com/yourname/claudeusagebar/releases) (470 KB)
+Alternative: [ZIP Archive](https://github.com/Artzainnn/claudeusagebar/releases) (if available)
 
 ## ✨ Features
 
@@ -28,13 +28,15 @@ Alternative: [ZIP Archive](https://github.com/yourname/claudeusagebar/releases) 
 
 ## 🚀 Quick Start
 
-1. **Download** `ClaudeUsageBar-Installer.dmg` from [Releases](https://github.com/yourname/claudeusagebar/releases)
-2. **Drag** to Applications folder
-3. **Open** the app (Right-click → Open first time)
-4. **Set cookie** from claude.ai (instructions in app)
+1. **Download** `ClaudeUsageBar-Installer.dmg` from [Releases](https://github.com/Artzainnn/ClaudeUsageBar/releases)
+2. **Open DMG** and drag ClaudeUsageBar to Applications folder
+3. **⚠️ First Launch (Important!):**
+   - **Right-click** (or Control-click) on ClaudeUsageBar in Applications
+   - Select **"Open"** from the menu
+   - Click **"Open"** in the dialog that appears
+   - *(This bypasses macOS Gatekeeper for unsigned apps - only needed once!)*
+4. **Set cookie** from claude.ai (follow in-app instructions)
 5. **Done!** Usage appears in menu bar
-
-[Full Installation Guide →](app/INSTALL.md)
 
 ## 📸 Screenshots
 
@@ -96,7 +98,7 @@ The built app will be in `app/build/ClaudeUsageBar.app`
 
 Contributions are welcome! Here's how you can help:
 
-- 🐛 Report bugs via [Issues](https://github.com/yourname/claudeusagebar/issues)
+- 🐛 Report bugs via [Issues](https://github.com/Artzainnn/claudeusagebar/issues)
 - 💡 Suggest features or improvements
 - 🔧 Submit pull requests
 - 📖 Improve documentation
@@ -114,14 +116,13 @@ This app uses Claude.ai's internal API endpoints which may change without notice
 
 If you find this useful, consider:
 - ⭐ Starring this repository
-- ☕ [Buy me a coffee](https://donate.stripe.com/3cIcN5b5H7Q8ay8bIDfIs02)
 - 📢 Sharing with others who use Claude
 
 ## 🔗 Links
 
-- **Website:** [yourname.github.io/claudeusagebar](https://yourname.github.io/claudeusagebar)
-- **Issues:** [GitHub Issues](https://github.com/yourname/claudeusagebar/issues)
-- **Releases:** [GitHub Releases](https://github.com/yourname/claudeusagebar/releases)
+- **Website:** [claudeusagebar.com](https://claudeusagebar.com)
+- **Issues:** [GitHub Issues](https://github.com/Artzainnn/claudeusagebar/issues)
+- **Releases:** [GitHub Releases](https://github.com/Artzainnn/claudeusagebar/releases)
 
 ---
 
