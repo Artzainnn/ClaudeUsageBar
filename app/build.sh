@@ -65,11 +65,13 @@ chmod 755 "$APP_PATH/Contents/MacOS/ClaudeUsageBar"
 # Clean extended attributes before signing
 xattr -cr "$APP_PATH"
 
-# Sign with ad-hoc signature (required for macOS to launch)
-if codesign --force --deep --sign - "$APP_PATH" 2>/dev/null; then
-    echo "✅ App signed successfully"
+# Sign with Developer ID certificate
+DEVELOPER_ID="Developer ID Application: Linkko Technology Pte Ltd (Q467HQ5432)"
+if codesign --force --deep --options runtime --sign "$DEVELOPER_ID" "$APP_PATH" 2>/dev/null; then
+    echo "✅ App signed with Developer ID"
 else
-    echo "⚠️  Warning: Could not sign app"
+    echo "⚠️  Falling back to ad-hoc signature"
+    codesign --force --deep --sign - "$APP_PATH"
 fi
 
 echo "Build successful!"
