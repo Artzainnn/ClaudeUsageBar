@@ -42,15 +42,13 @@ A lightweight macOS menu bar app that displays your Claude.ai session and weekly
 3. Drag ClaudeUsageBar to the Applications folder
 4. Eject the DMG
 5. Open ClaudeUsageBar from Applications
-   - **First time**: Right-click → Open (to bypass Gatekeeper)
-   - **After that**: Just open normally
 
 ### Option 2: ZIP Archive
 
 1. Download `ClaudeUsageBar.zip` from [Releases](../../releases)
 2. Extract the ZIP file
 3. Drag ClaudeUsageBar.app to Applications folder
-4. Right-click → Open (first time only)
+4. Open ClaudeUsageBar from Applications
 
 ### Option 3: Build from Source
 

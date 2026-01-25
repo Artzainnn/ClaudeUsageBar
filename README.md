@@ -30,11 +30,7 @@ Alternative: [ZIP Archive](https://github.com/Artzainnn/claudeusagebar/releases)
 
 1. **Download** `ClaudeUsageBar-Installer.dmg` from [Releases](https://github.com/Artzainnn/ClaudeUsageBar/releases)
 2. **Open DMG** and drag ClaudeUsageBar to Applications folder
-3. **⚠️ First Launch (Important!):**
-   - **Right-click** (or Control-click) on ClaudeUsageBar in Applications
-   - Select **"Open"** from the menu
-   - Click **"Open"** in the dialog that appears
-   - *(This bypasses macOS Gatekeeper for unsigned apps - only needed once!)*
+3. **Launch** ClaudeUsageBar from Applications
 4. **Set cookie** from claude.ai (follow in-app instructions)
 5. **Done!** Usage appears in menu bar
 
