@@ -910,7 +910,7 @@ struct UsageView: View {
                         Text("1. Go to Settings > Usage on claude.ai")
                         Text("2. Press F12 (or Cmd+Option+I)")
                         Text("3. Go to Network tab")
-                        Text("4. Refresh page, click any request")
+                        Text("4. Refresh page, click 'usage' request")
                         Text("5. Find 'Cookie' in Request Headers")
                         Text("6. Copy full cookie value\n   (starts with anthropic-device-id=...)")
                     }

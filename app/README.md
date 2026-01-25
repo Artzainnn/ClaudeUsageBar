@@ -69,7 +69,7 @@ When you first launch ClaudeUsageBar, you'll see a welcome message. Follow these
 1. Go to **Settings > Usage** on claude.ai
 2. Press **F12** (or Cmd+Option+I on Mac)
 3. Go to **Network** tab in DevTools
-4. Refresh the page, click any request
+4. Refresh the page, click the "usage" request
 5. Find **'Cookie'** in Request Headers
 6. Copy the **full cookie value** (starts with `anthropic-device-id=...`)
 
