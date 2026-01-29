@@ -199,7 +199,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Create popover with dynamic sizing
         popover = NSPopover()
         // Initial guess; SwiftUI's intrinsic size (capped at 600) will drive the actual size.
-        popover.contentSize = NSSize(width: 380, height: 320)
+        popover.contentSize = NSSize(width: 520, height: 320)
         popover.behavior = .transient
         popover.animates = false  // Disable animation for consistent positioning
         popover.contentViewController = NSHostingController(rootView: makeUsageView())
@@ -472,10 +472,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             // Adjust popover position to be consistent across different sizes
             // The popover window needs to be positioned just below the menu bar
+            // Use the screen where the status item button is located, not where the popover ends up
             if let popoverWindow = popover.contentViewController?.view.window,
-               let screen = popoverWindow.screen ?? NSScreen.main {
+               let buttonScreen = button.window?.screen ?? NSScreen.main {
                 let menuBarHeight: CGFloat = 24
-                let targetY = screen.frame.height - menuBarHeight - popoverWindow.frame.height
+                let targetY = buttonScreen.frame.origin.y + buttonScreen.frame.height - menuBarHeight - popoverWindow.frame.height
                 var newFrame = popoverWindow.frame
                 newFrame.origin.y = targetY
                 popoverWindow.setFrame(newFrame, display: true)
@@ -2336,7 +2337,7 @@ struct WebLoginView: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: WKWebView, context: Context) {
-        // Check if extraction was triggered (user clicked Create Account)
+        // Check if extraction was triggered (user clicked Connect)
         if extractTrigger && !detectedCookie.isEmpty {
             DispatchQueue.main.async {
                 self.extractTrigger = false
@@ -2534,7 +2535,7 @@ struct WebLoginWindowView: View {
                         .foregroundColor(Color.secondaryText)
                 }
                 Spacer()
-                Button("Create Account") {
+                Button("Connect") {
                     extractTrigger = true
                 }
                 .buttonStyle(.borderedProminent)
@@ -2711,10 +2712,116 @@ struct UltraCompactChartView: View {
     @ObservedObject var usageManager: UsageManager
     let options: ChartOptions
 
+    // Check if any account has an icon
+    var hasAnyIcon: Bool {
+        usageManager.accounts.contains(where: { $0.iconImage != nil })
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            ForEach(UsageMetric.metrics(for: usageManager.accounts), id: \.label) { metric in
-                MetricRow(metric: metric, accounts: usageManager.accounts, options: options)
+        let metrics = UsageMetric.metrics(for: usageManager.accounts)
+        VStack(alignment: .leading, spacing: 8) {
+            // Header row with metric labels
+            HStack(spacing: 4) {
+                // Space for icon/name column
+                Text("")
+                    .frame(width: hasAnyIcon ? 24 : 60, alignment: .leading)
+
+                // One header per metric (bar + %)
+                ForEach(metrics, id: \.label) { metric in
+                    Text(metric.label)
+                        .font(.caption2)
+                        .foregroundColor(Color.secondaryText)
+                        .frame(maxWidth: .infinity)
+                    Text("")
+                        .frame(width: 30)
+                }
+            }
+
+            // One row per account
+            ForEach(Array(usageManager.accounts.enumerated()), id: \.element.id) { index, account in
+                AccountMetricRow(
+                    account: account,
+                    index: index,
+                    metrics: metrics,
+                    options: options,
+                    hasAnyIcon: hasAnyIcon
+                )
+            }
+        }
+    }
+}
+
+struct AccountMetricRow: View {
+    let account: ClaudeAccount
+    let index: Int
+    let metrics: [UsageMetric]
+    let options: ChartOptions
+    var hasAnyIcon: Bool = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 4) {
+                // Account icon (if available) or name
+                if let iconImage = account.iconImage {
+                    Image(nsImage: iconImage)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .frame(width: 20, height: 20)
+                        .clipShape(Circle())
+                        .overlay(Circle().stroke(account.displayColor, lineWidth: 2))
+                        .frame(width: 24, alignment: .center)
+                } else if hasAnyIcon {
+                    // Show colored circle placeholder when other accounts have icons
+                    Circle()
+                        .fill(account.displayColor.opacity(0.3))
+                        .overlay(Circle().stroke(account.displayColor, lineWidth: 2))
+                        .frame(width: 20, height: 20)
+                        .frame(width: 24, alignment: .center)
+                } else {
+                    Text(account.name)
+                        .font(.caption)
+                        .lineLimit(1)
+                        .frame(width: 60, alignment: .leading)
+                }
+
+                // Bar + percentage per metric ("-" when this account lacks it)
+                ForEach(metrics, id: \.label) { metric in
+                    if let value = metric.getValue(account) {
+                        CompactBar(
+                            percentage: value,
+                            color: options.barColor(percentage: value, accountColor: account.displayColor),
+                            pace: options.pace(resetsAt: metric.getResetTime(account), window: metric.paceWindow)
+                        )
+                        Text("\(Int(value * 100))%")
+                            .font(.caption2)
+                            .foregroundColor(Color.secondaryText)
+                            .frame(width: 30)
+                    } else {
+                        Text("-")
+                            .font(.caption2)
+                            .foregroundColor(Color.secondaryText)
+                            .frame(maxWidth: .infinity)
+                        Text("")
+                            .frame(width: 30)
+                    }
+                }
+            }
+
+            // Reset times
+            HStack(spacing: 4) {
+                Text("Resets:")
+                    .font(.caption2)
+                    .foregroundColor(Color.secondaryText)
+                if let sessionReset = account.sessionResetsAt {
+                    Text("S: \(options.resetText(sessionReset, includeDate: false))")
+                        .font(.caption2)
+                        .foregroundColor(Color.secondaryText)
+                }
+                if let weeklyReset = account.weeklyResetsAt {
+                    Text("W: \(options.resetText(weeklyReset, includeDate: true))")
+                        .font(.caption2)
+                        .foregroundColor(Color.secondaryText)
+                }
             }
         }
     }
@@ -2987,10 +3094,13 @@ func formatResetTimeCompact(_ date: Date, includeDate: Bool, showRemaining: Bool
     if showRemaining {
         let remaining = date.timeIntervalSince(now)
         if remaining <= 0 {
-            return "now"
+            return "on use"
         }
         return "in \(UsageView.countdown(to: date, from: now))"
     } else {
+        if date.timeIntervalSince(now) <= 0 {
+            return "on use"
+        }
         let formatter = DateFormatter()
         if includeDate {
             formatter.dateFormat = "d MMM 'at' h:mm a"
@@ -3933,50 +4043,48 @@ struct UsageView: View {
 
     var settingsSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            // Chart Style picker (only show if multiple accounts)
-            if usageManager.accounts.count > 1 {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Chart Style")
-                        .font(.caption)
-                        .fontWeight(.semibold)
-                    Picker("", selection: Binding(
-                        get: { usageManager.chartStyle },
-                        set: { newValue in
-                            usageManager.chartStyle = newValue
-                            usageManager.saveAccounts()
-                            // Notify AppDelegate to reposition popover
-                            NotificationCenter.default.post(name: NSNotification.Name("ChartStyleChanged"), object: nil)
-                        }
-                    )) {
-                        ForEach(ChartStyle.allCases, id: \.self) { style in
-                            Text(style.rawValue).tag(style)
-                        }
+            // Chart Style picker
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Chart Style")
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                Picker("", selection: Binding(
+                    get: { usageManager.chartStyle },
+                    set: { newValue in
+                        usageManager.chartStyle = newValue
+                        usageManager.saveAccounts()
+                        // Notify AppDelegate to reposition popover
+                        NotificationCenter.default.post(name: NSNotification.Name("ChartStyleChanged"), object: nil)
                     }
-                    .pickerStyle(.menu)
-                    .labelsHidden()
-                }
-
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Color Mode")
-                        .font(.caption)
-                        .fontWeight(.semibold)
-                    Picker("", selection: Binding(
-                        get: { usageManager.colorMode },
-                        set: { newValue in
-                            usageManager.colorMode = newValue
-                            usageManager.saveAccounts()
-                        }
-                    )) {
-                        ForEach(ColorMode.allCases, id: \.self) { mode in
-                            Text(mode.rawValue).tag(mode)
-                        }
+                )) {
+                    ForEach(ChartStyle.allCases, id: \.self) { style in
+                        Text(style.rawValue).tag(style)
                     }
-                    .pickerStyle(.menu)
-                    .labelsHidden()
                 }
-
-                Divider()
+                .pickerStyle(.menu)
+                .labelsHidden()
             }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Color Mode")
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                Picker("", selection: Binding(
+                    get: { usageManager.colorMode },
+                    set: { newValue in
+                        usageManager.colorMode = newValue
+                        usageManager.saveAccounts()
+                    }
+                )) {
+                    ForEach(ColorMode.allCases, id: \.self) { mode in
+                        Text(mode.rawValue).tag(mode)
+                    }
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+            }
+
+            Divider()
 
             Toggle(isOn: Binding(
                 get: { usageManager.openAtLogin },
@@ -4161,11 +4269,11 @@ struct UsageView: View {
     static func popoverWidth(chartStyle: ChartStyle, accountCount: Int) -> CGFloat {
         switch chartStyle {
         case .ultraCompact:
-            return 380
+            return 520
         case .stackedVertical:
-            return 360
+            return 420
         case .separateCards:
-            return accountCount > 2 ? 420 : 380
+            return accountCount > 2 ? 520 : 480
         }
     }
 
