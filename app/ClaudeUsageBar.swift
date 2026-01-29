@@ -36,7 +36,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Create popover with dynamic sizing
         popover = NSPopover()
-        popover.contentSize = NSSize(width: 380, height: 300)
+        popover.contentSize = NSSize(width: 520, height: 300)
         popover.behavior = .transient
         popover.animates = false  // Disable animation for consistent positioning
         popover.contentViewController = NSHostingController(rootView: UsageView(usageManager: usageManager))
@@ -240,10 +240,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             // Adjust popover position to be consistent across different sizes
             // The popover window needs to be positioned just below the menu bar
+            // Use the screen where the status item button is located, not where the popover ends up
             if let popoverWindow = popover.contentViewController?.view.window,
-               let screen = popoverWindow.screen ?? NSScreen.main {
+               let buttonScreen = button.window?.screen ?? NSScreen.main {
                 let menuBarHeight: CGFloat = 24
-                let targetY = screen.frame.height - menuBarHeight - popoverWindow.frame.height
+                let targetY = buttonScreen.frame.origin.y + buttonScreen.frame.height - menuBarHeight - popoverWindow.frame.height
                 var newFrame = popoverWindow.frame
                 newFrame.origin.y = targetY
                 popoverWindow.setFrame(newFrame, display: true)
@@ -269,11 +270,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         switch usageManager.chartStyle {
         case .ultraCompact:
-            width = 380
+            width = 520
         case .stackedVertical:
-            width = 340
+            width = 420
         case .separateCards:
-            width = usageManager.accounts.count > 2 ? 420 : 380
+            width = usageManager.accounts.count > 2 ? 520 : 480
         }
 
         // Adjust height based on number of accounts (with larger icons now ~40px per account)
@@ -1620,42 +1621,169 @@ func colorForUsage(percentage: Double) -> Color {
 struct UltraCompactChartView: View {
     @ObservedObject var usageManager: UsageManager
 
+    var hasAnySonnet: Bool {
+        usageManager.accounts.contains(where: { $0.hasWeeklySonnet })
+    }
+
+    // Check if any account has an icon
+    var hasAnyIcon: Bool {
+        usageManager.accounts.contains(where: { $0.iconImage != nil })
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            // Session row
-            MetricRow(
-                label: "Session",
-                accounts: usageManager.accounts,
-                getValue: { $0.sessionPercentage },
-                getResetTime: { $0.sessionResetsAt },
-                colorMode: usageManager.colorMode,
-                includeDate: false,
-                showRemaining: usageManager.showTimeRemaining
-            )
+        VStack(alignment: .leading, spacing: 8) {
+            // Header row with metric labels
+            HStack(spacing: 4) {
+                // Space for icon/name column
+                Text("")
+                    .frame(width: hasAnyIcon ? 24 : 60, alignment: .leading)
 
-            // Weekly row
-            MetricRow(
-                label: "Weekly",
-                accounts: usageManager.accounts,
-                getValue: { $0.weeklyPercentage },
-                getResetTime: { $0.weeklyResetsAt },
-                colorMode: usageManager.colorMode,
-                includeDate: true,
-                showRemaining: usageManager.showTimeRemaining
-            )
+                // Session header (bar + %)
+                Text("Session")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity)
+                Text("")
+                    .frame(width: 30)
 
-            // Sonnet row (only if any account has it)
-            if usageManager.accounts.contains(where: { $0.hasWeeklySonnet }) {
-                MetricRow(
-                    label: "Sonnet",
-                    accounts: usageManager.accounts,
-                    getValue: { $0.hasWeeklySonnet ? $0.weeklySonnetPercentage : nil },
-                    getResetTime: { $0.weeklySonnetResetsAt },
+                // Weekly header (bar + %)
+                Text("Weekly")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity)
+                Text("")
+                    .frame(width: 30)
+
+                if hasAnySonnet {
+                    // Sonnet header (bar + %)
+                    Text("Sonnet")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .frame(maxWidth: .infinity)
+                    Text("")
+                        .frame(width: 30)
+                }
+            }
+
+            // One row per account
+            ForEach(Array(usageManager.accounts.enumerated()), id: \.element.id) { index, account in
+                AccountMetricRow(
+                    account: account,
+                    index: index,
                     colorMode: usageManager.colorMode,
-                    includeDate: true,
-                    showRemaining: usageManager.showTimeRemaining
+                    showSonnet: hasAnySonnet,
+                    showRemaining: usageManager.showTimeRemaining,
+                    hasAnyIcon: hasAnyIcon
                 )
             }
+        }
+    }
+}
+
+struct AccountMetricRow: View {
+    let account: ClaudeAccount
+    let index: Int
+    let colorMode: ColorMode
+    let showSonnet: Bool
+    var showRemaining: Bool = false
+    var hasAnyIcon: Bool = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 4) {
+                // Account icon (if available) or name
+                if let iconImage = account.iconImage {
+                    Image(nsImage: iconImage)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .frame(width: 20, height: 20)
+                        .clipShape(Circle())
+                        .overlay(Circle().stroke(account.displayColor, lineWidth: 2))
+                        .frame(width: 24, alignment: .center)
+                } else if hasAnyIcon {
+                    // Show colored circle placeholder when other accounts have icons
+                    Circle()
+                        .fill(account.displayColor.opacity(0.3))
+                        .overlay(Circle().stroke(account.displayColor, lineWidth: 2))
+                        .frame(width: 20, height: 20)
+                        .frame(width: 24, alignment: .center)
+                } else {
+                    Text(account.name)
+                        .font(.caption)
+                        .lineLimit(1)
+                        .frame(width: 60, alignment: .leading)
+                }
+
+                // Session bar + percentage
+                CompactBar(
+                    percentage: account.sessionPercentage,
+                    color: barColor(for: account.sessionPercentage)
+                )
+                Text("\(Int(account.sessionPercentage * 100))%")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .frame(width: 30)
+
+                // Weekly bar + percentage
+                CompactBar(
+                    percentage: account.weeklyPercentage,
+                    color: barColor(for: account.weeklyPercentage)
+                )
+                Text("\(Int(account.weeklyPercentage * 100))%")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .frame(width: 30)
+
+                // Sonnet bar + percentage (if applicable)
+                if showSonnet {
+                    if account.hasWeeklySonnet {
+                        CompactBar(
+                            percentage: account.weeklySonnetPercentage,
+                            color: barColor(for: account.weeklySonnetPercentage)
+                        )
+                        Text("\(Int(account.weeklySonnetPercentage * 100))%")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                            .frame(width: 30)
+                    } else {
+                        Text("-")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                            .frame(maxWidth: .infinity)
+                        Text("")
+                            .frame(width: 30)
+                    }
+                }
+            }
+
+            // Reset times
+            HStack(spacing: 4) {
+                Text("Resets:")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                if let sessionReset = account.sessionResetsAt {
+                    Text("S: \(formatResetTimeCompact(sessionReset, includeDate: false, showRemaining: showRemaining))")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+                if let weeklyReset = account.weeklyResetsAt {
+                    Text("W: \(formatResetTimeCompact(weeklyReset, includeDate: true, showRemaining: showRemaining))")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+            }
+        }
+    }
+
+    func barColor(for percentage: Double) -> Color {
+        let accountColor = account.displayColor
+        switch colorMode {
+        case .byUsageLevel:
+            return colorForUsage(percentage: percentage)
+        case .byAccount:
+            return accountColor
+        case .hybrid:
+            return percentage > 0.9 ? .red : accountColor
         }
     }
 }
@@ -2054,7 +2182,7 @@ func formatResetTimeCompact(_ date: Date, includeDate: Bool, showRemaining: Bool
         let now = Date()
         let remaining = date.timeIntervalSince(now)
         if remaining <= 0 {
-            return "now"
+            return "on use"
         }
         let hours = Int(remaining) / 3600
         let minutes = (Int(remaining) % 3600) / 60
@@ -2067,6 +2195,10 @@ func formatResetTimeCompact(_ date: Date, includeDate: Bool, showRemaining: Bool
             return "in \(minutes)m"
         }
     } else {
+        let now = Date()
+        if date.timeIntervalSince(now) <= 0 {
+            return "on use"
+        }
         let formatter = DateFormatter()
         if includeDate {
             formatter.dateFormat = "d MMM 'at' h:mm a"
