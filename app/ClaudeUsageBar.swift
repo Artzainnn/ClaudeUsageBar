@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import Carbon
+import WebKit
 
 // Main entry point
 class AppDelegate: NSObject, NSApplicationDelegate {
@@ -1321,6 +1322,248 @@ struct PasteableTextField: NSViewRepresentable {
     }
 }
 
+// MARK: - WebView Login
+
+struct WebLoginView: NSViewRepresentable {
+    let onCookieExtracted: (String) -> Void
+    let onCookiesDetected: (String) -> Void
+    @Binding var extractTrigger: Bool
+    let detectedCookie: String
+
+    func makeNSView(context: Context) -> WKWebView {
+        let config = WKWebViewConfiguration()
+        config.websiteDataStore = WKWebsiteDataStore.default()
+
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.navigationDelegate = context.coordinator
+        webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+
+        // Store reference in coordinator
+        context.coordinator.webView = webView
+
+        // Load Claude.ai login page
+        if let url = URL(string: "https://claude.ai/login") {
+            webView.load(URLRequest(url: url))
+        }
+
+        return webView
+    }
+
+    func updateNSView(_ nsView: WKWebView, context: Context) {
+        // Check if extraction was triggered (user clicked Create Account)
+        if extractTrigger && !detectedCookie.isEmpty {
+            DispatchQueue.main.async {
+                self.extractTrigger = false
+                onCookieExtracted(detectedCookie)
+            }
+        }
+    }
+
+    func makeCoordinator() -> WebLoginCoordinator {
+        WebLoginCoordinator(onCookiesDetected: onCookiesDetected)
+    }
+}
+
+class WebLoginCoordinator: NSObject, WKNavigationDelegate {
+    weak var webView: WKWebView?
+    let onCookiesDetected: (String) -> Void
+    private var cookieCheckTimer: Timer?
+    private var hasDetectedCookies = false
+
+    init(onCookiesDetected: @escaping (String) -> Void) {
+        self.onCookiesDetected = onCookiesDetected
+        super.init()
+        // Start a timer to periodically check for cookies
+        startCookieCheckTimer()
+    }
+
+    deinit {
+        cookieCheckTimer?.invalidate()
+    }
+
+    func startCookieCheckTimer() {
+        cookieCheckTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.checkCookiesPeriodically()
+        }
+    }
+
+    func checkCookiesPeriodically() {
+        guard !hasDetectedCookies, let webView = webView else { return }
+
+        // Check if we're on a logged-in page
+        guard let url = webView.url else { return }
+        let urlString = url.absoluteString
+
+        let isOnClaudeAi = urlString.contains("claude.ai")
+        let isOnAuthPage = urlString.contains("/login") || urlString.contains("/signup") || urlString.contains("/oauth")
+
+        if isOnClaudeAi && !isOnAuthPage {
+            checkCookies(from: webView)
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard let url = webView.url else { return }
+        let urlString = url.absoluteString
+
+        NSLog("WebLogin: Navigation finished to \(urlString)")
+
+        // Check if we've navigated to a page indicating successful login
+        // User is logged in if they're on claude.ai but NOT on the login/signup pages
+        let isOnClaudeAi = urlString.contains("claude.ai")
+        let isOnAuthPage = urlString.contains("/login") || urlString.contains("/signup") || urlString.contains("/oauth")
+
+        if isOnClaudeAi && !isOnAuthPage {
+            NSLog("WebLogin: Detected logged-in state at \(urlString), checking cookies...")
+            checkCookies(from: webView)
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        NSLog("WebLogin: Navigation failed: \(error.localizedDescription)")
+    }
+
+    func checkCookies(from webView: WKWebView) {
+        NSLog("WebLogin: Checking cookies...")
+
+        webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { [weak self] cookies in
+            guard let self = self else { return }
+
+            // Filter cookies for claude.ai domain
+            let claudeCookies = cookies.filter { cookie in
+                cookie.domain.contains("claude.ai")
+            }
+
+            NSLog("WebLogin: Found \(claudeCookies.count) claude.ai cookies")
+
+            // Build cookie string in the format expected by the app
+            var cookieParts: [String] = []
+            var hasSessionKey = false
+            var hasLastActiveOrg = false
+
+            for cookie in claudeCookies {
+                cookieParts.append("\(cookie.name)=\(cookie.value)")
+                if cookie.name == "sessionKey" {
+                    hasSessionKey = true
+                }
+                if cookie.name == "lastActiveOrg" {
+                    hasLastActiveOrg = true
+                }
+                NSLog("WebLogin: Cookie - \(cookie.name)")
+            }
+
+            let cookieString = cookieParts.joined(separator: "; ")
+
+            DispatchQueue.main.async {
+                if hasSessionKey || hasLastActiveOrg {
+                    NSLog("WebLogin: Valid cookies detected (sessionKey: \(hasSessionKey), lastActiveOrg: \(hasLastActiveOrg))")
+                    self.hasDetectedCookies = true
+                    self.cookieCheckTimer?.invalidate()
+                    self.onCookiesDetected(cookieString)
+                } else {
+                    NSLog("WebLogin: Missing required cookies, waiting for login...")
+                }
+            }
+        }
+    }
+}
+
+struct WebLoginWindowView: View {
+    let onCookieExtracted: (String) -> Void
+    let onCancel: () -> Void
+    @State private var isLoading = true
+    @State private var extractTrigger = false
+    @State private var detectedCookie = ""
+
+    var cookiesReady: Bool {
+        !detectedCookie.isEmpty
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Header
+            HStack {
+                Text("Sign in to Claude")
+                    .font(.headline)
+                Spacer()
+                Button(action: onCancel) {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundColor(.secondary)
+                        .font(.title2)
+                }
+                .buttonStyle(.borderless)
+                .help("Cancel")
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            .background(Color(NSColor.windowBackgroundColor))
+
+            Divider()
+
+            // WebView
+            ZStack {
+                WebLoginView(
+                    onCookieExtracted: { cookie in
+                        onCookieExtracted(cookie)
+                    },
+                    onCookiesDetected: { cookie in
+                        detectedCookie = cookie
+                    },
+                    extractTrigger: $extractTrigger,
+                    detectedCookie: detectedCookie
+                )
+
+                if isLoading {
+                    VStack {
+                        ProgressView()
+                            .scaleEffect(0.8)
+                        Text("Loading...")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+            }
+            .onAppear {
+                // Hide loading indicator after a delay
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                    isLoading = false
+                }
+            }
+
+            Divider()
+
+            // Footer with create account button
+            HStack {
+                if cookiesReady {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundColor(.green)
+                    Text("Login successful")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                } else {
+                    Image(systemName: "clock")
+                        .foregroundColor(.secondary)
+                    Text("Waiting for login...")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                Button("Create Account") {
+                    extractTrigger = true
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(cookiesReady ? .accentColor : .gray)
+                .controlSize(.small)
+                .disabled(!cookiesReady)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+            .background(Color(NSColor.windowBackgroundColor))
+        }
+        .frame(width: 500, height: 650)
+    }
+}
+
 // MARK: - Color Helpers
 
 let defaultAccountColors: [Color] = [.blue, .purple, .teal, .orange]
@@ -1843,6 +2086,8 @@ struct AddAccountInlineView: View {
     @State private var accountName: String = ""
     @State private var cookieInput: String = ""
     @State private var showInstructions: Bool = false
+    @State private var showManualEntry: Bool = false
+    @State private var showWebLogin: Bool = false
     @State private var validationError: String?
 
     var body: some View {
@@ -1861,41 +2106,87 @@ struct AddAccountInlineView: View {
             TextField("Account Name (e.g., Personal, Work)", text: $accountName)
                 .textFieldStyle(.roundedBorder)
 
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text("Session Cookie")
-                        .font(.caption)
-                    Spacer()
-                    Button(showInstructions ? "Hide Help" : "How to get cookie") {
-                        showInstructions.toggle()
+            // Primary action: Login with Browser
+            VStack(alignment: .leading, spacing: 8) {
+                Button(action: { showWebLogin = true }) {
+                    HStack {
+                        Image(systemName: "globe")
+                        Text("Login with Browser")
                     }
-                    .buttonStyle(.borderless)
-                    .font(.caption2)
+                    .frame(maxWidth: .infinity)
                 }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
 
-                if showInstructions {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("1. Go to Settings > Usage on claude.ai")
-                        Text("2. Press F12 (or Cmd+Option+I)")
-                        Text("3. Go to Network tab")
-                        Text("4. Refresh page, click 'usage' request")
-                        Text("5. Find 'Cookie' in Request Headers")
-                        Text("6. Copy full cookie value")
-                    }
+                Text("Sign in to Claude.ai directly - no manual steps needed")
                     .font(.caption2)
                     .foregroundColor(.secondary)
-                    .padding(6)
-                    .background(Color.secondary.opacity(0.1))
-                    .cornerRadius(4)
+            }
+
+            Divider()
+
+            // Secondary option: Manual cookie entry
+            VStack(alignment: .leading, spacing: 4) {
+                Button(action: { showManualEntry.toggle() }) {
+                    HStack {
+                        Text("Paste Cookie Manually")
+                            .font(.caption)
+                        Spacer()
+                        Image(systemName: showManualEntry ? "chevron.up" : "chevron.down")
+                            .font(.caption)
+                    }
                 }
+                .buttonStyle(.borderless)
+                .foregroundColor(.secondary)
 
-                PasteableTextField(text: $cookieInput, placeholder: "Paste cookie here...")
-                    .frame(height: 50)
+                if showManualEntry {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("Session Cookie")
+                                .font(.caption)
+                            Spacer()
+                            Button(showInstructions ? "Hide Help" : "How to get cookie") {
+                                showInstructions.toggle()
+                            }
+                            .buttonStyle(.borderless)
+                            .font(.caption2)
+                        }
 
-                if let error = validationError {
-                    Text(error)
-                        .font(.caption2)
-                        .foregroundColor(.red)
+                        if showInstructions {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("1. Go to Settings > Usage on claude.ai")
+                                Text("2. Press F12 (or Cmd+Option+I)")
+                                Text("3. Go to Network tab")
+                                Text("4. Refresh page, click 'usage' request")
+                                Text("5. Find 'Cookie' in Request Headers")
+                                Text("6. Copy full cookie value")
+                            }
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                            .padding(6)
+                            .background(Color.secondary.opacity(0.1))
+                            .cornerRadius(4)
+                        }
+
+                        PasteableTextField(text: $cookieInput, placeholder: "Paste cookie here...")
+                            .frame(height: 50)
+
+                        if let error = validationError {
+                            Text(error)
+                                .font(.caption2)
+                                .foregroundColor(.red)
+                        }
+
+                        HStack {
+                            Spacer()
+                            Button("Add Account") {
+                                addAccountWithCookie()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(cookieInput.isEmpty)
+                        }
+                    }
+                    .padding(.top, 4)
                 }
             }
 
@@ -1904,30 +2195,51 @@ struct AddAccountInlineView: View {
                     isPresented = false
                 }
                 .buttonStyle(.bordered)
-
                 Spacer()
-
-                Button("Add Account") {
-                    // Validate: check for duplicate cookie
-                    if usageManager.accounts.contains(where: { $0.sessionCookie == cookieInput }) {
-                        validationError = "This cookie is already added to another account"
-                        return
-                    }
-                    // Validate: basic cookie format check
-                    if !cookieInput.contains("sessionKey=") && !cookieInput.contains("lastActiveOrg=") {
-                        validationError = "Cookie doesn't appear to be valid (missing sessionKey or lastActiveOrg)"
-                        return
-                    }
-
-                    let name = accountName.isEmpty ? "Account \(usageManager.accounts.count + 1)" : accountName
-                    usageManager.addAccount(name: name, cookie: cookieInput)
-                    usageManager.fetchUsageForAccount(index: usageManager.accounts.count - 1)
-                    isPresented = false
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(cookieInput.isEmpty)
             }
         }
+        .sheet(isPresented: $showWebLogin) {
+            WebLoginWindowView(
+                onCookieExtracted: { cookie in
+                    showWebLogin = false
+                    handleExtractedCookie(cookie)
+                },
+                onCancel: {
+                    showWebLogin = false
+                }
+            )
+        }
+    }
+
+    private func handleExtractedCookie(_ cookie: String) {
+        // Validate: check for duplicate cookie
+        if usageManager.accounts.contains(where: { $0.sessionCookie == cookie }) {
+            validationError = "This account is already added"
+            return
+        }
+
+        let name = accountName.isEmpty ? "Account \(usageManager.accounts.count + 1)" : accountName
+        usageManager.addAccount(name: name, cookie: cookie)
+        usageManager.fetchUsageForAccount(index: usageManager.accounts.count - 1)
+        isPresented = false
+    }
+
+    private func addAccountWithCookie() {
+        // Validate: check for duplicate cookie
+        if usageManager.accounts.contains(where: { $0.sessionCookie == cookieInput }) {
+            validationError = "This cookie is already added to another account"
+            return
+        }
+        // Validate: basic cookie format check
+        if !cookieInput.contains("sessionKey=") && !cookieInput.contains("lastActiveOrg=") {
+            validationError = "Cookie doesn't appear to be valid (missing sessionKey or lastActiveOrg)"
+            return
+        }
+
+        let name = accountName.isEmpty ? "Account \(usageManager.accounts.count + 1)" : accountName
+        usageManager.addAccount(name: name, cookie: cookieInput)
+        usageManager.fetchUsageForAccount(index: usageManager.accounts.count - 1)
+        isPresented = false
     }
 }
 
