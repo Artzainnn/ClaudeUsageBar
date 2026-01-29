@@ -1,6 +1,5 @@
 import SwiftUI
 import AppKit
-import WebKit
 import Carbon
 
 // Main entry point
@@ -10,6 +9,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var usageManager: UsageManager!
     var eventMonitor: Any?
     var hotKeyRef: EventHotKeyRef?
+    var isPopoverTransitioning: Bool = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // NSUserNotification (deprecated but works without permissions for unsigned apps)
@@ -33,10 +33,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Initialize usage manager
         usageManager = UsageManager(statusItem: statusItem, delegate: self)
 
-        // Create popover
+        // Create popover with dynamic sizing
         popover = NSPopover()
-        popover.contentSize = NSSize(width: 320, height: 260)
+        popover.contentSize = NSSize(width: 380, height: 300)
         popover.behavior = .transient
+        popover.animates = false  // Disable animation for consistent positioning
         popover.contentViewController = NSHostingController(rootView: UsageView(usageManager: usageManager))
 
         // Fetch initial data
@@ -47,8 +48,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self.usageManager.fetchUsage()
         }
 
+        // Listen for chart style changes to reposition popover
+        NotificationCenter.default.addObserver(self, selector: #selector(handleChartStyleChanged), name: NSNotification.Name("ChartStyleChanged"), object: nil)
+
         // Set up Cmd+U keyboard shortcut
         setupKeyboardShortcut()
+    }
+
+    @objc func handleChartStyleChanged() {
+        // Recreate popover entirely to fix positioning after size change
+        guard !isPopoverTransitioning else { return }
+
+        if popover.isShown {
+            isPopoverTransitioning = true
+            closePopover()
+            // Longer delay to ensure popover is fully dismissed
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                // Recreate the popover with fresh state
+                self.recreatePopover()
+                self.openPopover()
+            }
+        }
+    }
+
+    func recreatePopover() {
+        // Create a fresh popover to avoid stale positioning
+        popover = NSPopover()
+        popover.behavior = .transient
+        popover.animates = false  // Disable animation to ensure correct positioning
+        updatePopoverSize()
     }
 
     func setupKeyboardShortcut() {
@@ -65,23 +93,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         if !trusted {
             NSLog("⚠️ Accessibility permissions not granted")
-            // Show alert to guide user
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                let alert = NSAlert()
-                alert.messageText = "Accessibility Permission Required"
-                alert.informativeText = "ClaudeUsageBar needs Accessibility permission to use the Cmd+U keyboard shortcut.\n\nPlease enable it in:\nSystem Settings → Privacy & Security → Accessibility"
-                alert.alertStyle = .informational
-                alert.addButton(withTitle: "Open System Settings")
-                alert.addButton(withTitle: "Skip for Now")
+            // Only show alert if user hasn't dismissed it before
+            if !UserDefaults.standard.bool(forKey: "accessibility_alert_dismissed") {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                    let alert = NSAlert()
+                    alert.messageText = "Accessibility Permission Required"
+                    alert.informativeText = "ClaudeUsageBar needs Accessibility permission to use the Cmd+U keyboard shortcut.\n\nPlease enable it in:\nSystem Settings → Privacy & Security → Accessibility"
+                    alert.alertStyle = .informational
+                    alert.addButton(withTitle: "Open System Settings")
+                    alert.addButton(withTitle: "Don't Show Again")
 
-                let response = alert.runModal()
-                if response == .alertFirstButtonReturn {
-                    // Open System Settings
-                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+                    let response = alert.runModal()
+                    if response == .alertFirstButtonReturn {
+                        // Open System Settings
+                        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+                    } else {
+                        // User chose to skip - remember this choice
+                        UserDefaults.standard.set(true, forKey: "accessibility_alert_dismissed")
+                    }
                 }
             }
         } else {
             NSLog("✅ Accessibility permissions granted")
+            // Clear the dismissed flag if permissions are now granted
+            UserDefaults.standard.removeObject(forKey: "accessibility_alert_dismissed")
         }
     }
 
@@ -144,6 +179,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func togglePopover() {
+        // Prevent rapid clicking from causing positioning issues
+        guard !isPopoverTransitioning else { return }
+
         if popover.isShown {
             closePopover()
         } else {
@@ -173,12 +211,47 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func openPopover() {
         if let button = statusItem.button {
-            // Force UI refresh by updating percentages
-            DispatchQueue.main.async {
-                self.usageManager.updatePercentages()
+            isPopoverTransitioning = true
+
+            // Increment refresh trigger to force complete view redraw with current data
+            usageManager.refreshTrigger += 1
+
+            // Refresh the content view controller
+            let hostingController = NSHostingController(rootView: UsageView(usageManager: usageManager))
+            popover.contentViewController = hostingController
+
+            // Force UI refresh
+            usageManager.updatePercentages()
+
+            // Adjust popover size dynamically based on chart style and account count
+            updatePopoverSize()
+
+            // Close any existing showing state first to ensure clean positioning
+            if popover.isShown {
+                popover.performClose(nil)
             }
 
+            // Force the hosting controller's view to load before showing
+            _ = hostingController.view
+
+            // Show popover below the menu bar button
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+
+            // Adjust popover position to be consistent across different sizes
+            // The popover window needs to be positioned just below the menu bar
+            if let popoverWindow = popover.contentViewController?.view.window,
+               let screen = popoverWindow.screen ?? NSScreen.main {
+                let menuBarHeight: CGFloat = 24
+                let targetY = screen.frame.height - menuBarHeight - popoverWindow.frame.height
+                var newFrame = popoverWindow.frame
+                newFrame.origin.y = targetY
+                popoverWindow.setFrame(newFrame, display: true)
+            }
+
+            // Clear transitioning flag after popover is shown
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                self.isPopoverTransitioning = false
+            }
 
             // Add event monitor to detect clicks outside the popover
             eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
@@ -187,6 +260,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+    }
+
+    func updatePopoverSize() {
+        let width: CGFloat
+        let baseHeight: CGFloat = 320
+
+        switch usageManager.chartStyle {
+        case .ultraCompact:
+            width = 380
+        case .stackedVertical:
+            width = 340
+        case .separateCards:
+            width = usageManager.accounts.count > 2 ? 420 : 380
+        }
+
+        // Adjust height based on number of accounts (with larger icons now ~40px per account)
+        let accountCount = max(usageManager.accounts.count, 1)
+        let hasSonnet = usageManager.accounts.contains { $0.hasWeeklySonnet } || usageManager.hasWeeklySonnet
+        let extraHeight = CGFloat(accountCount - 1) * 45 + (hasSonnet ? 50 : 0)
+
+        popover.contentSize = NSSize(width: width, height: baseHeight + extraHeight)
     }
 
     func closePopover() {
@@ -202,7 +296,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func updateStatusIcon(percentage: Int) {
         guard let button = statusItem.button else { return }
 
-        // Determine color based on percentage
+        // Determine color based on highest percentage
         let color: NSColor
         if percentage < 70 {
             color = NSColor(red: 0.13, green: 0.77, blue: 0.37, alpha: 1.0) // Green
@@ -215,9 +309,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Create spark icon with color
         let sparkIcon = createSparkIcon(color: color)
 
-        // Set image and title
+        // Set image and title - show all account percentages if multiple
         button.image = sparkIcon
-        button.title = " \(percentage)%"
+
+        if let manager = usageManager, manager.accounts.count > 1 {
+            // Show all account session percentages separated by /
+            let percentages = manager.accounts.map { Int($0.sessionPercentage * 100) }
+            button.title = " " + percentages.map { "\($0)%" }.joined(separator: "/")
+        } else {
+            button.title = " \(percentage)%"
+        }
     }
 
     func createSparkIcon(color: NSColor) -> NSImage {
@@ -281,7 +382,90 @@ struct Main {
     }
 }
 
+// MARK: - Multi-Account Data Model
+
+struct ClaudeAccount: Identifiable, Codable {
+    let id: UUID
+    var name: String
+    var sessionCookie: String
+    var lastNotifiedThreshold: Int = 0
+    var customColorHex: String?      // Custom color as hex string (e.g., "#FF5733")
+    var iconURL: String?              // URL to custom icon image
+    var iconData: Data?               // Cached icon image data (persisted to avoid file access prompts)
+
+    // Transient state (not persisted)
+    var sessionUsage: Int = 0
+    var sessionLimit: Int = 100
+    var weeklyUsage: Int = 0
+    var weeklyLimit: Int = 100
+    var weeklySonnetUsage: Int = 0
+    var weeklySonnetLimit: Int = 100
+    var sessionResetsAt: Date?
+    var weeklyResetsAt: Date?
+    var weeklySonnetResetsAt: Date?
+    var hasWeeklySonnet: Bool = false
+    var hasFetchedData: Bool = false
+    var isLoading: Bool = false
+    var errorMessage: String?
+    var iconImage: NSImage?           // Cached icon image (transient)
+
+    // Custom Codable to exclude transient properties
+    enum CodingKeys: String, CodingKey {
+        case id, name, sessionCookie, lastNotifiedThreshold, customColorHex, iconURL, iconData
+    }
+
+    init(id: UUID = UUID(), name: String, sessionCookie: String, lastNotifiedThreshold: Int = 0, customColorHex: String? = nil, iconURL: String? = nil) {
+        self.id = id
+        self.name = name
+        self.sessionCookie = sessionCookie
+        self.lastNotifiedThreshold = lastNotifiedThreshold
+        self.customColorHex = customColorHex
+        self.iconURL = iconURL
+    }
+
+    // Get the display color for this account
+    var displayColor: Color {
+        if let hex = customColorHex {
+            return Color(hex: hex)
+        }
+        return .blue // Default
+    }
+
+    var sessionPercentage: Double {
+        sessionLimit > 0 ? Double(sessionUsage) / Double(sessionLimit) : 0
+    }
+
+    var weeklyPercentage: Double {
+        weeklyLimit > 0 ? Double(weeklyUsage) / Double(weeklyLimit) : 0
+    }
+
+    var weeklySonnetPercentage: Double {
+        weeklySonnetLimit > 0 ? Double(weeklySonnetUsage) / Double(weeklySonnetLimit) : 0
+    }
+}
+
+enum ChartStyle: String, Codable, CaseIterable {
+    case ultraCompact = "Ultra-compact rows"
+    case stackedVertical = "Stacked per metric"
+    case separateCards = "Separate cards"
+}
+
+enum ColorMode: String, Codable, CaseIterable {
+    case byUsageLevel = "By usage level"
+    case byAccount = "By account"
+    case hybrid = "Hybrid"
+}
+
+// MARK: - UsageManager
+
 class UsageManager: ObservableObject {
+    // Multi-account support
+    @Published var accounts: [ClaudeAccount] = []
+    @Published var chartStyle: ChartStyle = .ultraCompact
+    @Published var colorMode: ColorMode = .byUsageLevel
+    @Published var refreshTrigger: Int = 0  // Increment to force view refresh
+
+    // Legacy single-account properties (for backward compatibility during transition)
     @Published var sessionUsage: Int = 0
     @Published var sessionLimit: Int = 100
     @Published var weeklyUsage: Int = 0
@@ -299,6 +483,7 @@ class UsageManager: ObservableObject {
     @Published var hasWeeklySonnet: Bool = false
     @Published var hasFetchedData: Bool = false
     @Published var isAccessibilityEnabled: Bool = false
+    @Published var showTimeRemaining: Bool = false  // Toggle between date/time vs "3h remaining"
 
     private var statusItem: NSStatusItem?
     private var sessionCookie: String = ""
@@ -308,7 +493,7 @@ class UsageManager: ObservableObject {
     init(statusItem: NSStatusItem?, delegate: AppDelegate? = nil) {
         self.statusItem = statusItem
         self.delegate = delegate
-        loadSessionCookie()
+        loadAccounts()
         loadSettings()
         checkAccessibilityStatus()
     }
@@ -317,9 +502,191 @@ class UsageManager: ObservableObject {
         isAccessibilityEnabled = AXIsProcessTrusted()
     }
 
-    func loadSessionCookie() {
-        if let savedCookie = UserDefaults.standard.string(forKey: "claude_session_cookie") {
+    // MARK: - Account Management
+
+    func loadAccounts() {
+        // Try to load accounts from new format
+        if let data = UserDefaults.standard.data(forKey: "claude_accounts"),
+           let savedAccounts = try? JSONDecoder().decode([ClaudeAccount].self, from: data) {
+            accounts = savedAccounts
+            NSLog("ClaudeUsage: Loaded \(accounts.count) accounts")
+        } else {
+            // Migration: check for legacy single-account cookie
+            migrateFromSingleAccount()
+        }
+
+        // Load chart style and color mode
+        if let styleRaw = UserDefaults.standard.string(forKey: "chart_style"),
+           let style = ChartStyle(rawValue: styleRaw) {
+            chartStyle = style
+        }
+        if let modeRaw = UserDefaults.standard.string(forKey: "color_mode"),
+           let mode = ColorMode(rawValue: modeRaw) {
+            colorMode = mode
+        }
+        showTimeRemaining = UserDefaults.standard.bool(forKey: "show_time_remaining")
+
+        // Sync legacy properties from first account for backward compatibility
+        syncLegacyProperties()
+
+        // Load custom icons
+        loadAllIcons()
+    }
+
+    func saveAccounts() {
+        if let data = try? JSONEncoder().encode(accounts) {
+            UserDefaults.standard.set(data, forKey: "claude_accounts")
+        }
+        UserDefaults.standard.set(chartStyle.rawValue, forKey: "chart_style")
+        UserDefaults.standard.set(colorMode.rawValue, forKey: "color_mode")
+        UserDefaults.standard.set(showTimeRemaining, forKey: "show_time_remaining")
+        UserDefaults.standard.synchronize()
+        NSLog("ClaudeUsage: Saved \(accounts.count) accounts")
+    }
+
+    func migrateFromSingleAccount() {
+        if let savedCookie = UserDefaults.standard.string(forKey: "claude_session_cookie"),
+           !savedCookie.isEmpty {
+            NSLog("ClaudeUsage: Migrating from single account format")
+            let lastThreshold = UserDefaults.standard.integer(forKey: "last_notified_threshold")
+            let account = ClaudeAccount(name: "My Account", sessionCookie: savedCookie, lastNotifiedThreshold: lastThreshold)
+            accounts = [account]
+            saveAccounts()
+
+            // Keep legacy cookie for backward compatibility but mark migration done
             sessionCookie = savedCookie
+            lastNotifiedThreshold = lastThreshold
+            NSLog("ClaudeUsage: Migration complete - created 'My Account'")
+        }
+    }
+
+    func syncLegacyProperties() {
+        // Sync legacy single-account properties from first account
+        if let first = accounts.first {
+            sessionCookie = first.sessionCookie
+            sessionUsage = first.sessionUsage
+            weeklyUsage = first.weeklyUsage
+            weeklySonnetUsage = first.weeklySonnetUsage
+            sessionResetsAt = first.sessionResetsAt
+            weeklyResetsAt = first.weeklyResetsAt
+            weeklySonnetResetsAt = first.weeklySonnetResetsAt
+            hasWeeklySonnet = first.hasWeeklySonnet
+            hasFetchedData = first.hasFetchedData
+            lastNotifiedThreshold = first.lastNotifiedThreshold
+        }
+    }
+
+    func addAccount(name: String, cookie: String) {
+        guard accounts.count < 4 else {
+            NSLog("ClaudeUsage: Maximum 4 accounts allowed")
+            return
+        }
+        let account = ClaudeAccount(name: name, sessionCookie: cookie)
+        accounts.append(account)
+        saveAccounts()
+        NSLog("ClaudeUsage: Added account '\(name)'")
+    }
+
+    func removeAccount(id: UUID) {
+        accounts.removeAll { $0.id == id }
+        saveAccounts()
+        syncLegacyProperties()
+        updateStatusBar()
+        NSLog("ClaudeUsage: Removed account")
+    }
+
+    func updateAccount(id: UUID, name: String, cookie: String, colorHex: String? = nil, iconURL: String? = nil) {
+        if let index = accounts.firstIndex(where: { $0.id == id }) {
+            accounts[index].name = name
+            if !cookie.isEmpty {
+                accounts[index].sessionCookie = cookie
+            }
+            if let colorHex = colorHex {
+                accounts[index].customColorHex = colorHex
+            }
+            accounts[index].iconURL = iconURL
+            // Load icon if path/URL provided
+            if let urlString = iconURL, !urlString.isEmpty {
+                loadIcon(for: index, from: urlString)
+            } else {
+                accounts[index].iconImage = nil
+            }
+            saveAccounts()
+            syncLegacyProperties()
+            NSLog("ClaudeUsage: Updated account '\(name)'")
+        }
+    }
+
+    func loadIcon(for index: Int, from urlString: String) {
+        // Support local file paths
+        var imageData: Data?
+
+        if urlString.hasPrefix("/") || urlString.hasPrefix("~") {
+            // Local file path
+            let expandedPath = NSString(string: urlString).expandingTildeInPath
+            imageData = try? Data(contentsOf: URL(fileURLWithPath: expandedPath))
+            if imageData == nil {
+                NSLog("ClaudeUsage: Failed to load local icon from \(expandedPath)")
+                return
+            }
+        } else if urlString.hasPrefix("file://") {
+            // file:// URL
+            guard let url = URL(string: urlString) else { return }
+            imageData = try? Data(contentsOf: url)
+            if imageData == nil {
+                NSLog("ClaudeUsage: Failed to load icon from file URL \(url)")
+                return
+            }
+        } else {
+            // Remote URL - load asynchronously
+            guard let url = URL(string: urlString) else { return }
+            URLSession.shared.dataTask(with: url) { [weak self] data, response, error in
+                guard let data = data, let img = NSImage(data: data) else {
+                    NSLog("ClaudeUsage: Failed to load icon from \(url)")
+                    return
+                }
+                DispatchQueue.main.async {
+                    self?.setResizedIcon(img, for: index, cacheData: data)
+                }
+            }.resume()
+            return
+        }
+
+        // For local files, set immediately and cache the data
+        if let data = imageData, let img = NSImage(data: data) {
+            setResizedIcon(img, for: index, cacheData: data)
+        }
+    }
+
+    func setResizedIcon(_ image: NSImage, for index: Int, cacheData: Data? = nil) {
+        guard index < accounts.count else { return }
+        // Resize image to 32x32 for crisp display at various sizes
+        let resized = NSImage(size: NSSize(width: 32, height: 32))
+        resized.lockFocus()
+        image.draw(in: NSRect(x: 0, y: 0, width: 32, height: 32),
+                  from: NSRect(origin: .zero, size: image.size),
+                  operation: .copy, fraction: 1.0)
+        resized.unlockFocus()
+        accounts[index].iconImage = resized
+
+        // Cache the image data to avoid file access prompts on restart
+        if let data = cacheData {
+            accounts[index].iconData = data
+            saveAccounts()
+        }
+        NSLog("ClaudeUsage: Loaded icon for account \(index)")
+    }
+
+    func loadAllIcons() {
+        for (index, account) in accounts.enumerated() {
+            // First try to restore from cached data (no file access needed)
+            if let data = account.iconData, let img = NSImage(data: data) {
+                setResizedIcon(img, for: index)
+                NSLog("ClaudeUsage: Restored icon from cache for account \(index)")
+            } else if let urlString = account.iconURL {
+                // Fall back to loading from URL/path
+                loadIcon(for: index, from: urlString)
+            }
         }
     }
 
@@ -340,17 +707,25 @@ class UsageManager: ObservableObject {
         UserDefaults.standard.synchronize()
     }
 
+    // Legacy method - now works with first account
     func saveSessionCookie(_ cookie: String) {
         NSLog("ClaudeUsage: Saving cookie, length: \(cookie.count)")
+        if accounts.isEmpty {
+            addAccount(name: "My Account", cookie: cookie)
+        } else {
+            accounts[0].sessionCookie = cookie
+            saveAccounts()
+        }
         sessionCookie = cookie
-        UserDefaults.standard.set(cookie, forKey: "claude_session_cookie")
-        UserDefaults.standard.synchronize()
         NSLog("ClaudeUsage: Cookie saved successfully")
     }
 
+    // Legacy method - clears all accounts
     func clearSessionCookie() {
-        NSLog("ClaudeUsage: Clearing cookie")
+        NSLog("ClaudeUsage: Clearing all accounts")
+        accounts.removeAll()
         sessionCookie = ""
+        UserDefaults.standard.removeObject(forKey: "claude_accounts")
         UserDefaults.standard.removeObject(forKey: "claude_session_cookie")
         UserDefaults.standard.synchronize()
 
@@ -370,12 +745,14 @@ class UsageManager: ObservableObject {
         // Update status bar to show 0%
         delegate?.updateStatusIcon(percentage: 0)
 
-        NSLog("ClaudeUsage: Cookie cleared, data reset")
+        NSLog("ClaudeUsage: All data cleared")
     }
 
-    func fetchOrganizationId(completion: @escaping (String?) -> Void) {
+    // MARK: - Multi-Account Fetching
+
+    func fetchOrganizationId(cookie: String, completion: @escaping (String?) -> Void) {
         // Get org ID from the lastActiveOrg cookie value
-        let cookieParts = sessionCookie.components(separatedBy: ";")
+        let cookieParts = cookie.components(separatedBy: ";")
         for part in cookieParts {
             let trimmed = part.trimmingCharacters(in: .whitespaces)
             if trimmed.hasPrefix("lastActiveOrg=") {
@@ -394,7 +771,7 @@ class UsageManager: ObservableObject {
 
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
-        request.setValue("sessionKey=\(sessionCookie)", forHTTPHeaderField: "Cookie")
+        request.setValue(cookie, forHTTPHeaderField: "Cookie")
 
         NSLog("📡 Fetching bootstrap to get org ID...")
 
@@ -412,20 +789,228 @@ class UsageManager: ObservableObject {
         }.resume()
     }
 
+    // Fetch usage for all accounts
     func fetchUsage() {
-        guard !sessionCookie.isEmpty else {
-            DispatchQueue.main.async {
-                self.errorMessage = "Session cookie not set"
-                self.updateStatusBar()
+        guard !accounts.isEmpty else {
+            // Legacy fallback for single cookie
+            guard !sessionCookie.isEmpty else {
+                DispatchQueue.main.async {
+                    self.errorMessage = "No accounts configured"
+                    self.updateStatusBar()
+                }
+                return
             }
+            // Use legacy single-account fetch
+            fetchUsageLegacy()
             return
         }
 
         isLoading = true
         errorMessage = nil
 
-        // Extract org ID from cookie
-        fetchOrganizationId { [weak self] orgId in
+        // Fetch for each account by UUID (safe against concurrent modifications)
+        for account in accounts {
+            fetchUsageForAccount(id: account.id)
+        }
+    }
+
+    // Helper to find account index by UUID (returns nil if account was removed)
+    private func accountIndex(for id: UUID) -> Int? {
+        accounts.firstIndex(where: { $0.id == id })
+    }
+
+    // Fetch usage for a specific account by index (legacy, for AddAccountInlineView)
+    func fetchUsageForAccount(index: Int) {
+        guard index < accounts.count else { return }
+        fetchUsageForAccount(id: accounts[index].id)
+    }
+
+    // Fetch usage for a specific account by UUID (safe)
+    func fetchUsageForAccount(id: UUID) {
+        guard let index = accountIndex(for: id) else { return }
+
+        let cookie = accounts[index].sessionCookie
+        let accountId = id  // Capture UUID for async callbacks
+
+        guard !cookie.isEmpty else {
+            DispatchQueue.main.async {
+                if let idx = self.accountIndex(for: accountId) {
+                    self.accounts[idx].errorMessage = "No cookie set"
+                    self.accounts[idx].isLoading = false
+                }
+            }
+            return
+        }
+
+        DispatchQueue.main.async {
+            if let idx = self.accountIndex(for: accountId) {
+                self.accounts[idx].isLoading = true
+                self.accounts[idx].errorMessage = nil
+            }
+        }
+
+        fetchOrganizationId(cookie: cookie) { [weak self] orgId in
+            guard let self = self, let orgId = orgId else {
+                DispatchQueue.main.async {
+                    if let idx = self?.accountIndex(for: accountId) {
+                        self?.accounts[idx].errorMessage = "Could not get org ID"
+                        self?.accounts[idx].isLoading = false
+                    }
+                    self?.checkAllAccountsLoaded()
+                }
+                return
+            }
+            self.fetchUsageWithOrgId(orgId, cookie: cookie, accountId: accountId)
+        }
+    }
+
+    func fetchUsageWithOrgId(_ orgId: String, cookie: String, accountId: UUID) {
+        let urlString = "https://claude.ai/api/organizations/\(orgId)/usage"
+
+        guard let url = URL(string: urlString) else {
+            DispatchQueue.main.async {
+                if let idx = self.accountIndex(for: accountId) {
+                    self.accounts[idx].errorMessage = "Invalid URL"
+                    self.accounts[idx].isLoading = false
+                }
+                self.checkAllAccountsLoaded()
+            }
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue(cookie, forHTTPHeaderField: "Cookie")
+        request.setValue("*/*", forHTTPHeaderField: "Accept")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("https://claude.ai", forHTTPHeaderField: "Origin")
+        request.setValue("https://claude.ai", forHTTPHeaderField: "Referer")
+        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
+        request.setValue("claude.ai", forHTTPHeaderField: "authority")
+
+        NSLog("🔍 Fetching for account \(accountId) from: \(urlString)")
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                guard let idx = self.accountIndex(for: accountId) else {
+                    // Account was removed during fetch, ignore result
+                    self.checkAllAccountsLoaded()
+                    return
+                }
+
+                self.accounts[idx].isLoading = false
+
+                if let error = error {
+                    NSLog("❌ Error for account \(accountId): \(error.localizedDescription)")
+                    self.accounts[idx].errorMessage = "Network error"
+                    self.checkAllAccountsLoaded()
+                    return
+                }
+
+                guard let httpResponse = response as? HTTPURLResponse else {
+                    self.accounts[idx].errorMessage = "Invalid response"
+                    self.checkAllAccountsLoaded()
+                    return
+                }
+
+                NSLog("📡 Account \(accountId) status: \(httpResponse.statusCode)")
+
+                if httpResponse.statusCode == 200, let data = data {
+                    self.parseUsageDataForAccount(data, accountId: accountId)
+                } else {
+                    self.accounts[idx].errorMessage = "HTTP \(httpResponse.statusCode)"
+                }
+
+                self.checkAllAccountsLoaded()
+            }
+        }.resume()
+    }
+
+    func parseUsageDataForAccount(_ data: Data, accountId: UUID) {
+        guard let idx = accountIndex(for: accountId) else { return }
+
+        do {
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                accounts[idx].errorMessage = "Invalid JSON"
+                return
+            }
+
+            NSLog("📊 Parsing usage data for account \(accountId)...")
+
+            let iso8601Formatter = ISO8601DateFormatter()
+            iso8601Formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+
+            // Parse the actual claude.ai response format
+            if let fiveHour = json["five_hour"] as? [String: Any] {
+                if let sessionUtil = fiveHour["utilization"] as? Double {
+                    accounts[idx].sessionUsage = Int(sessionUtil)
+                    accounts[idx].sessionLimit = 100
+                }
+                if let resetsAtString = fiveHour["resets_at"] as? String,
+                   let resetsAt = iso8601Formatter.date(from: resetsAtString) {
+                    accounts[idx].sessionResetsAt = resetsAt
+                }
+            }
+
+            if let sevenDay = json["seven_day"] as? [String: Any] {
+                if let weeklyUtil = sevenDay["utilization"] as? Double {
+                    accounts[idx].weeklyUsage = Int(weeklyUtil)
+                    accounts[idx].weeklyLimit = 100
+                }
+                if let resetsAtString = sevenDay["resets_at"] as? String,
+                   let resetsAt = iso8601Formatter.date(from: resetsAtString) {
+                    accounts[idx].weeklyResetsAt = resetsAt
+                }
+            }
+
+            // Check for seven_day_sonnet (Pro plan feature)
+            if let sevenDaySonnet = json["seven_day_sonnet"] as? [String: Any] {
+                accounts[idx].hasWeeklySonnet = true
+                if let sonnetUtil = sevenDaySonnet["utilization"] as? Double {
+                    accounts[idx].weeklySonnetUsage = Int(sonnetUtil)
+                    accounts[idx].weeklySonnetLimit = 100
+                }
+                if let resetsAtString = sevenDaySonnet["resets_at"] as? String,
+                   let resetsAt = iso8601Formatter.date(from: resetsAtString) {
+                    accounts[idx].weeklySonnetResetsAt = resetsAt
+                }
+            } else {
+                accounts[idx].hasWeeklySonnet = false
+            }
+
+            accounts[idx].hasFetchedData = true
+            accounts[idx].errorMessage = nil
+
+            NSLog("✅ Account \(accountId): Session \(accounts[idx].sessionUsage)%, Weekly \(accounts[idx].weeklyUsage)%")
+
+            // Check notifications for this account
+            checkNotificationThresholdsForAccount(id: accountId)
+
+        } catch {
+            NSLog("❌ Parse error for account \(accountId): \(error.localizedDescription)")
+            accounts[idx].errorMessage = "Parse error"
+        }
+    }
+
+    func checkAllAccountsLoaded() {
+        let allLoaded = accounts.allSatisfy { !$0.isLoading }
+        if allLoaded {
+            isLoading = false
+            lastUpdated = Date()
+            syncLegacyProperties()
+            updateStatusBar()
+            updatePercentages()
+            saveAccounts() // Persist notification thresholds
+        }
+    }
+
+    // Legacy single-account fetch (for backward compatibility)
+    func fetchUsageLegacy() {
+        isLoading = true
+        errorMessage = nil
+
+        fetchOrganizationId(cookie: sessionCookie) { [weak self] orgId in
             guard let self = self, let orgId = orgId else {
                 DispatchQueue.main.async {
                     self?.errorMessage = "Could not get org ID from cookie"
@@ -433,12 +1018,11 @@ class UsageManager: ObservableObject {
                 }
                 return
             }
-
-            self.fetchUsageWithOrgId(orgId)
+            self.fetchUsageWithOrgIdLegacy(orgId)
         }
     }
 
-    func fetchUsageWithOrgId(_ orgId: String) {
+    func fetchUsageWithOrgIdLegacy(_ orgId: String) {
         let urlString = "https://claude.ai/api/organizations/\(orgId)/usage"
 
         guard let url = URL(string: urlString) else {
@@ -451,8 +1035,6 @@ class UsageManager: ObservableObject {
 
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
-
-        // Use the full cookie string (user provides all cookies, not just sessionKey)
         request.setValue(sessionCookie, forHTTPHeaderField: "Cookie")
         request.setValue("*/*", forHTTPHeaderField: "Accept")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -461,14 +1043,11 @@ class UsageManager: ObservableObject {
         request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
         request.setValue("claude.ai", forHTTPHeaderField: "authority")
 
-        NSLog("🔍 Fetching from: \(urlString)")
-
         URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             DispatchQueue.main.async {
                 self?.isLoading = false
 
-                if let error = error {
-                    NSLog("❌ Error: \(error.localizedDescription)")
+                if error != nil {
                     self?.errorMessage = "Network error"
                     self?.updateStatusBar()
                     return
@@ -480,14 +1059,8 @@ class UsageManager: ObservableObject {
                     return
                 }
 
-                NSLog("📡 Status: \(httpResponse.statusCode)")
-
-                if let data = data, let responseString = String(data: data, encoding: .utf8) {
-                    NSLog("📦 Response: \(responseString)")
-                }
-
                 if httpResponse.statusCode == 200, let data = data {
-                    self?.parseUsageData(data)
+                    self?.parseUsageDataLegacy(data)
                 } else {
                     self?.errorMessage = "HTTP \(httpResponse.statusCode)"
                 }
@@ -497,32 +1070,24 @@ class UsageManager: ObservableObject {
         }.resume()
     }
 
-    func parseUsageData(_ data: Data) {
+    func parseUsageDataLegacy(_ data: Data) {
         do {
             guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 errorMessage = "Invalid JSON"
                 return
             }
 
-            NSLog("📊 Parsing usage data...")
-
             let iso8601Formatter = ISO8601DateFormatter()
             iso8601Formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
 
-            // Parse the actual claude.ai response format
             if let fiveHour = json["five_hour"] as? [String: Any] {
                 if let sessionUtil = fiveHour["utilization"] as? Double {
                     sessionUsage = Int(sessionUtil)
                     sessionLimit = 100
                 }
-                if let resetsAtString = fiveHour["resets_at"] as? String {
-                    NSLog("🕐 Session resets_at string: \(resetsAtString)")
-                    if let resetsAt = iso8601Formatter.date(from: resetsAtString) {
-                        sessionResetsAt = resetsAt
-                        NSLog("✅ Parsed session reset time: \(resetsAt)")
-                    } else {
-                        NSLog("❌ Failed to parse session reset time")
-                    }
+                if let resetsAtString = fiveHour["resets_at"] as? String,
+                   let resetsAt = iso8601Formatter.date(from: resetsAtString) {
+                    sessionResetsAt = resetsAt
                 }
             }
 
@@ -531,91 +1096,106 @@ class UsageManager: ObservableObject {
                     weeklyUsage = Int(weeklyUtil)
                     weeklyLimit = 100
                 }
-                if let resetsAtString = sevenDay["resets_at"] as? String {
-                    NSLog("🕐 Weekly resets_at string: \(resetsAtString)")
-                    if let resetsAt = iso8601Formatter.date(from: resetsAtString) {
-                        weeklyResetsAt = resetsAt
-                        NSLog("✅ Parsed weekly reset time: \(resetsAt)")
-                    } else {
-                        NSLog("❌ Failed to parse weekly reset time")
-                    }
+                if let resetsAtString = sevenDay["resets_at"] as? String,
+                   let resetsAt = iso8601Formatter.date(from: resetsAtString) {
+                    weeklyResetsAt = resetsAt
                 }
             }
 
-            // Check for seven_day_sonnet (Pro plan feature)
             if let sevenDaySonnet = json["seven_day_sonnet"] as? [String: Any] {
                 hasWeeklySonnet = true
                 if let sonnetUtil = sevenDaySonnet["utilization"] as? Double {
                     weeklySonnetUsage = Int(sonnetUtil)
                     weeklySonnetLimit = 100
                 }
-                if let resetsAtString = sevenDaySonnet["resets_at"] as? String {
-                    NSLog("🕐 Weekly Sonnet resets_at string: \(resetsAtString)")
-                    if let resetsAt = iso8601Formatter.date(from: resetsAtString) {
-                        weeklySonnetResetsAt = resetsAt
-                        NSLog("✅ Parsed weekly Sonnet reset time: \(resetsAt)")
-                    } else {
-                        NSLog("❌ Failed to parse weekly Sonnet reset time")
-                    }
+                if let resetsAtString = sevenDaySonnet["resets_at"] as? String,
+                   let resetsAt = iso8601Formatter.date(from: resetsAtString) {
+                    weeklySonnetResetsAt = resetsAt
                 }
             } else {
                 hasWeeklySonnet = false
             }
 
-            // Log what we found
-            NSLog("✅ Parsed: Session \(sessionUsage)%, Weekly \(weeklyUsage)%\(hasWeeklySonnet ? ", Weekly Sonnet \(weeklySonnetUsage)%" : "")")
-
             lastUpdated = Date()
             errorMessage = nil
             hasFetchedData = true
-
-            // Update percentage values for progress bars
             updatePercentages()
         } catch {
-            NSLog("❌ Parse error: \(error.localizedDescription)")
             errorMessage = "Parse error"
         }
     }
 
+    // MARK: - Status Bar & Notifications
+
     func updateStatusBar() {
-        let sessionPercent = Int((Double(sessionUsage) / Double(sessionLimit)) * 100)
+        // Use max session usage across all accounts for status bar
+        let maxSessionPercent: Int
+        if accounts.isEmpty {
+            maxSessionPercent = Int((Double(sessionUsage) / Double(sessionLimit)) * 100)
+        } else {
+            maxSessionPercent = accounts.map { Int($0.sessionPercentage * 100) }.max() ?? 0
+        }
 
-        // Update the icon color
-        delegate?.updateStatusIcon(percentage: sessionPercent)
-
-        // Check for notification thresholds
-        checkNotificationThresholds(percentage: sessionPercent)
+        // Update the icon color based on highest usage
+        delegate?.updateStatusIcon(percentage: maxSessionPercent)
     }
 
+    func checkNotificationThresholdsForAccount(id: UUID) {
+        guard notificationsEnabled else { return }
+        guard let idx = accountIndex(for: id) else { return }
+
+        let percentage = Int(accounts[idx].sessionPercentage * 100)
+        let lastThreshold = accounts[idx].lastNotifiedThreshold
+        let thresholds = [25, 50, 75, 90]
+
+        for threshold in thresholds {
+            if percentage >= threshold && lastThreshold < threshold {
+                NSLog("📬 Sending notification for account '\(accounts[idx].name)' at \(threshold)%")
+                sendNotificationForAccount(accountName: accounts[idx].name, percentage: percentage, threshold: threshold)
+                accounts[idx].lastNotifiedThreshold = threshold
+            }
+        }
+
+        // Reset if usage drops below current threshold
+        if percentage < lastThreshold {
+            let newThreshold = thresholds.filter { $0 <= percentage }.last ?? 0
+            accounts[idx].lastNotifiedThreshold = newThreshold
+        }
+    }
+
+    // Legacy notification check (for backward compatibility)
     func checkNotificationThresholds(percentage: Int) {
         NSLog("🔔 Checking notifications: percentage=\(percentage)%, enabled=\(notificationsEnabled), lastNotified=\(lastNotifiedThreshold)%")
 
-        guard notificationsEnabled else {
-            NSLog("⚠️ Notifications disabled")
-            return
-        }
+        guard notificationsEnabled else { return }
 
         let thresholds = [25, 50, 75, 90]
 
         for threshold in thresholds {
             if percentage >= threshold && lastNotifiedThreshold < threshold {
-                NSLog("📬 Sending notification for \(threshold)% threshold")
                 sendNotification(percentage: percentage, threshold: threshold)
                 lastNotifiedThreshold = threshold
-                // Persist the threshold
                 UserDefaults.standard.set(lastNotifiedThreshold, forKey: "last_notified_threshold")
                 UserDefaults.standard.synchronize()
             }
         }
 
-        // Reset if usage drops below current threshold
         if percentage < lastNotifiedThreshold {
             let newThreshold = thresholds.filter { $0 <= percentage }.last ?? 0
-            NSLog("🔄 Resetting notification threshold from \(lastNotifiedThreshold)% to \(newThreshold)%")
             lastNotifiedThreshold = newThreshold
             UserDefaults.standard.set(lastNotifiedThreshold, forKey: "last_notified_threshold")
             UserDefaults.standard.synchronize()
         }
+    }
+
+    func sendNotificationForAccount(accountName: String, percentage: Int, threshold: Int) {
+        let notification = NSUserNotification()
+        notification.title = "Claude Usage Alert - \(accountName)"
+        notification.informativeText = "You've reached \(percentage)% of your 5-hour session limit"
+        notification.soundName = NSUserNotificationDefaultSoundName
+
+        NSUserNotificationCenter.default.deliver(notification)
+        NSLog("📬 Sent notification for '\(accountName)' at \(threshold)% threshold")
     }
 
     func sendNotification(percentage: Int, threshold: Int) {
@@ -625,7 +1205,6 @@ class UsageManager: ObservableObject {
         notification.soundName = NSUserNotificationDefaultSoundName
 
         NSUserNotificationCenter.default.deliver(notification)
-        NSLog("📬 Sent notification for \(threshold)% threshold")
     }
 
     func sendTestNotification() {
@@ -645,51 +1224,9 @@ class UsageManager: ObservableObject {
     @Published var weeklySonnetPercentage: Double = 0.0
 
     func updatePercentages() {
-        sessionPercentage = Double(sessionUsage) / Double(sessionLimit)
-        weeklyPercentage = Double(weeklyUsage) / Double(weeklyLimit)
-        weeklySonnetPercentage = Double(weeklySonnetUsage) / Double(weeklySonnetLimit)
-    }
-}
-
-// Custom NSTextField that properly handles paste
-class CustomTextField: NSTextField {
-    var onTextChange: ((String) -> Void)?
-
-    override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        if event.type == .keyDown {
-            if (event.modifierFlags.contains(.command)) {
-                switch event.charactersIgnoringModifiers {
-                case "v":
-                    if let string = NSPasteboard.general.string(forType: .string) {
-                        self.stringValue = string
-                        onTextChange?(string)
-                        NSLog("ClaudeUsage: Pasted text length: \(string.count)")
-                        return true
-                    }
-                case "a":
-                    self.currentEditor()?.selectAll(nil)
-                    return true
-                case "c":
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(self.stringValue, forType: .string)
-                    return true
-                case "x":
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(self.stringValue, forType: .string)
-                    self.stringValue = ""
-                    onTextChange?("")
-                    return true
-                default:
-                    break
-                }
-            }
-        }
-        return super.performKeyEquivalent(with: event)
-    }
-
-    override func textDidChange(_ notification: Notification) {
-        super.textDidChange(notification)
-        onTextChange?(self.stringValue)
+        sessionPercentage = sessionLimit > 0 ? Double(sessionUsage) / Double(sessionLimit) : 0
+        weeklyPercentage = weeklyLimit > 0 ? Double(weeklyUsage) / Double(weeklyLimit) : 0
+        weeklySonnetPercentage = weeklySonnetLimit > 0 ? Double(weeklySonnetUsage) / Double(weeklySonnetLimit) : 0
     }
 }
 
@@ -784,17 +1321,795 @@ struct PasteableTextField: NSViewRepresentable {
     }
 }
 
-struct UsageView: View {
+// MARK: - Color Helpers
+
+let defaultAccountColors: [Color] = [.blue, .purple, .teal, .orange]
+
+// Color extension to parse hex strings
+extension Color {
+    init(hex: String) {
+        let hex = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
+        var int: UInt64 = 0
+        Scanner(string: hex).scanHexInt64(&int)
+        let a, r, g, b: UInt64
+        switch hex.count {
+        case 3: // RGB (12-bit)
+            (a, r, g, b) = (255, (int >> 8) * 17, (int >> 4 & 0xF) * 17, (int & 0xF) * 17)
+        case 6: // RGB (24-bit)
+            (a, r, g, b) = (255, int >> 16, int >> 8 & 0xFF, int & 0xFF)
+        case 8: // ARGB (32-bit)
+            (a, r, g, b) = (int >> 24, int >> 16 & 0xFF, int >> 8 & 0xFF, int & 0xFF)
+        default:
+            (a, r, g, b) = (255, 0, 0, 255) // Default to blue on parse failure
+        }
+        self.init(.sRGB, red: Double(r) / 255, green: Double(g) / 255, blue: Double(b) / 255, opacity: Double(a) / 255)
+    }
+
+    func toHex() -> String {
+        guard let components = NSColor(self).usingColorSpace(.deviceRGB) else { return "#0000FF" }
+        let r = Int(components.redComponent * 255)
+        let g = Int(components.greenComponent * 255)
+        let b = Int(components.blueComponent * 255)
+        return String(format: "#%02X%02X%02X", r, g, b)
+    }
+}
+
+func colorForAccount(index: Int, accounts: [ClaudeAccount]? = nil) -> Color {
+    // Use custom color if available
+    if let accounts = accounts, index < accounts.count, let customHex = accounts[index].customColorHex {
+        return Color(hex: customHex)
+    }
+    return defaultAccountColors[index % defaultAccountColors.count]
+}
+
+func colorForUsage(percentage: Double) -> Color {
+    if percentage < 0.7 {
+        return .green
+    } else if percentage < 0.9 {
+        return .orange
+    } else {
+        return .red
+    }
+}
+
+// MARK: - Chart Style Views
+
+struct UltraCompactChartView: View {
     @ObservedObject var usageManager: UsageManager
-    @State private var sessionCookieInput: String = ""
-    @State private var showingCookieInput: Bool = false
-    @State private var showingSettings: Bool = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            // Session row
+            MetricRow(
+                label: "Session",
+                accounts: usageManager.accounts,
+                getValue: { $0.sessionPercentage },
+                getResetTime: { $0.sessionResetsAt },
+                colorMode: usageManager.colorMode,
+                includeDate: false,
+                showRemaining: usageManager.showTimeRemaining
+            )
+
+            // Weekly row
+            MetricRow(
+                label: "Weekly",
+                accounts: usageManager.accounts,
+                getValue: { $0.weeklyPercentage },
+                getResetTime: { $0.weeklyResetsAt },
+                colorMode: usageManager.colorMode,
+                includeDate: true,
+                showRemaining: usageManager.showTimeRemaining
+            )
+
+            // Sonnet row (only if any account has it)
+            if usageManager.accounts.contains(where: { $0.hasWeeklySonnet }) {
+                MetricRow(
+                    label: "Sonnet",
+                    accounts: usageManager.accounts,
+                    getValue: { $0.hasWeeklySonnet ? $0.weeklySonnetPercentage : nil },
+                    getResetTime: { $0.weeklySonnetResetsAt },
+                    colorMode: usageManager.colorMode,
+                    includeDate: true,
+                    showRemaining: usageManager.showTimeRemaining
+                )
+            }
+        }
+    }
+}
+
+struct MetricRow: View {
+    let label: String
+    let accounts: [ClaudeAccount]
+    let getValue: (ClaudeAccount) -> Double?
+    let getResetTime: (ClaudeAccount) -> Date?
+    let colorMode: ColorMode
+    let includeDate: Bool
+    var showRemaining: Bool = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(label)
+                    .font(.subheadline)
+                    .frame(width: 55, alignment: .leading)
+
+                // Side-by-side bars
+                HStack(spacing: 4) {
+                    ForEach(Array(accounts.enumerated()), id: \.element.id) { index, account in
+                        if let value = getValue(account) {
+                            CompactBar(
+                                percentage: value,
+                                color: colorForBarMetric(percentage: value, index: index, colorMode: colorMode)
+                            )
+                        } else {
+                            // N/A indicator
+                            Text("n/a")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                                .frame(maxWidth: .infinity)
+                        }
+                    }
+                }
+
+                // Percentages
+                HStack(spacing: 4) {
+                    ForEach(Array(accounts.enumerated()), id: \.element.id) { index, account in
+                        if let value = getValue(account) {
+                            Text("\(Int(value * 100))%")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                                .frame(width: 30)
+                        }
+                    }
+                }
+            }
+
+            // Reset times for all accounts
+            HStack(spacing: 8) {
+                Text("Resets")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                ForEach(Array(accounts.enumerated()), id: \.element.id) { index, account in
+                    if let resetTime = getResetTime(account) {
+                        Text(formatResetTimeCompact(resetTime, includeDate: includeDate, showRemaining: showRemaining))
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                        if index < accounts.count - 1 {
+                            Text("/")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    func colorForBarMetric(percentage: Double, index: Int, colorMode: ColorMode) -> Color {
+        let accountColor = index < accounts.count ? accounts[index].displayColor : defaultAccountColors[index % defaultAccountColors.count]
+        switch colorMode {
+        case .byUsageLevel:
+            return colorForUsage(percentage: percentage)
+        case .byAccount:
+            return accountColor
+        case .hybrid:
+            return percentage > 0.9 ? .red : accountColor
+        }
+    }
+}
+
+struct CompactBar: View {
+    let percentage: Double
+    let color: Color
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack(alignment: .leading) {
+                Rectangle()
+                    .fill(Color.secondary.opacity(0.2))
+                    .frame(height: 8)
+                    .cornerRadius(4)
+
+                Rectangle()
+                    .fill(color)
+                    .frame(width: geometry.size.width * min(percentage, 1.0), height: 8)
+                    .cornerRadius(4)
+            }
+        }
+        .frame(height: 8)
+    }
+}
+
+// Reusable colored progress bar (replaces ProgressView which doesn't tint reliably on macOS)
+struct ColoredProgressBar: View {
+    let value: Double
+    let color: Color
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack(alignment: .leading) {
+                Rectangle()
+                    .fill(Color.secondary.opacity(0.3))
+                    .frame(height: 4)
+                    .cornerRadius(2)
+
+                Rectangle()
+                    .fill(color)
+                    .frame(width: geometry.size.width * min(CGFloat(value), 1.0), height: 4)
+                    .cornerRadius(2)
+            }
+        }
+        .frame(height: 4)
+    }
+}
+
+struct StackedVerticalChartView: View {
+    @ObservedObject var usageManager: UsageManager
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("Claude Usage")
-                .font(.headline)
-                .padding(.bottom, 4)
+            // Session section
+            MetricSection(
+                title: "Session (5 hour)",
+                accounts: usageManager.accounts,
+                getValue: { $0.sessionPercentage },
+                getResetTime: { $0.sessionResetsAt },
+                colorMode: usageManager.colorMode,
+                includeDate: false,
+                showRemaining: usageManager.showTimeRemaining
+            )
+
+            // Weekly section
+            MetricSection(
+                title: "Weekly (7 day)",
+                accounts: usageManager.accounts,
+                getValue: { $0.weeklyPercentage },
+                getResetTime: { $0.weeklyResetsAt },
+                colorMode: usageManager.colorMode,
+                includeDate: true,
+                showRemaining: usageManager.showTimeRemaining
+            )
+
+            // Sonnet section (only if any account has it)
+            if usageManager.accounts.contains(where: { $0.hasWeeklySonnet }) {
+                MetricSection(
+                    title: "Weekly Sonnet",
+                    accounts: usageManager.accounts,
+                    getValue: { $0.hasWeeklySonnet ? $0.weeklySonnetPercentage : nil },
+                    getResetTime: { $0.weeklySonnetResetsAt },
+                    colorMode: usageManager.colorMode,
+                    includeDate: true,
+                    showRemaining: usageManager.showTimeRemaining
+                )
+            }
+        }
+    }
+}
+
+struct MetricSection: View {
+    let title: String
+    let accounts: [ClaudeAccount]
+    let getValue: (ClaudeAccount) -> Double?
+    let getResetTime: (ClaudeAccount) -> Date?
+    let colorMode: ColorMode
+    let includeDate: Bool
+    var showRemaining: Bool = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(title)
+                    .font(.subheadline)
+                    .fontWeight(.medium)
+                Spacer()
+                // Show reset times for all accounts
+                HStack(spacing: 4) {
+                    Text("Resets")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    ForEach(Array(accounts.enumerated()), id: \.element.id) { index, account in
+                        if let resetTime = getResetTime(account) {
+                            Text(formatResetTimeCompact(resetTime, includeDate: includeDate, showRemaining: showRemaining))
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            if index < accounts.count - 1 {
+                                Text("/")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                    }
+                }
+            }
+
+            ForEach(Array(accounts.enumerated()), id: \.element.id) { index, account in
+                if let value = getValue(account) {
+                    HStack(spacing: 8) {
+                        // Custom bar instead of ProgressView for reliable colors
+                        GeometryReader { geometry in
+                            ZStack(alignment: .leading) {
+                                Rectangle()
+                                    .fill(Color.secondary.opacity(0.3))
+                                    .frame(height: 6)
+                                    .cornerRadius(3)
+
+                                Rectangle()
+                                    .fill(colorForBarMetric(percentage: value, index: index, colorMode: colorMode))
+                                    .frame(width: geometry.size.width * min(CGFloat(value), 1.0), height: 6)
+                                    .cornerRadius(3)
+                            }
+                        }
+                        .frame(height: 6)
+
+                        Text("\(account.name) \(Int(value * 100))%")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .frame(minWidth: 80, alignment: .trailing)
+                    }
+                } else {
+                    HStack {
+                        Text("\(account.name)")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Spacer()
+                        Text("n/a")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                }
+            }
+        }
+    }
+
+    func colorForBarMetric(percentage: Double, index: Int, colorMode: ColorMode) -> Color {
+        let accountColor = index < accounts.count ? accounts[index].displayColor : defaultAccountColors[index % defaultAccountColors.count]
+        switch colorMode {
+        case .byUsageLevel:
+            return colorForUsage(percentage: percentage)
+        case .byAccount:
+            return accountColor
+        case .hybrid:
+            return percentage > 0.9 ? .red : accountColor
+        }
+    }
+}
+
+struct SeparateCardsView: View {
+    @ObservedObject var usageManager: UsageManager
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            ForEach(Array(usageManager.accounts.enumerated()), id: \.element.id) { index, account in
+                AccountCard(
+                    account: account,
+                    index: index,
+                    colorMode: usageManager.colorMode,
+                    showRemaining: usageManager.showTimeRemaining
+                )
+            }
+        }
+    }
+}
+
+struct AccountCard: View {
+    let account: ClaudeAccount
+    let index: Int
+    let colorMode: ColorMode
+    var showRemaining: Bool = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                // Show custom icon if available, otherwise colored circle
+                if let iconImage = account.iconImage {
+                    ZStack {
+                        // Outer colored ring
+                        Circle()
+                            .fill(account.displayColor)
+                            .frame(width: 28, height: 28)
+                        // White background for transparency
+                        Circle()
+                            .fill(Color.white)
+                            .frame(width: 22, height: 22)
+                        Image(nsImage: iconImage)
+                            .resizable()
+                            .frame(width: 22, height: 22)
+                            .clipShape(Circle())
+                    }
+                } else {
+                    Circle()
+                        .fill(account.displayColor)
+                        .frame(width: 12, height: 12)
+                }
+                Text(account.name)
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                    .lineLimit(1)
+            }
+
+            if let error = account.errorMessage {
+                Text(error)
+                    .font(.caption2)
+                    .foregroundColor(.orange)
+            } else if account.hasFetchedData {
+                // Session
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Session")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                    ColoredProgressBar(value: account.sessionPercentage, color: cardBarColor(percentage: account.sessionPercentage))
+                    HStack {
+                        Text("\(Int(account.sessionPercentage * 100))%")
+                            .font(.caption2)
+                        Spacer()
+                        if let resetTime = account.sessionResetsAt {
+                            Text(formatResetTimeCompact(resetTime, includeDate: false, showRemaining: showRemaining))
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+
+                // Weekly
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Weekly")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                    ColoredProgressBar(value: account.weeklyPercentage, color: cardBarColor(percentage: account.weeklyPercentage))
+                    HStack {
+                        Text("\(Int(account.weeklyPercentage * 100))%")
+                            .font(.caption2)
+                        Spacer()
+                        if let resetTime = account.weeklyResetsAt {
+                            Text(formatResetTimeCompact(resetTime, includeDate: true, showRemaining: showRemaining))
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+
+                // Sonnet (if available)
+                if account.hasWeeklySonnet {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Sonnet")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                        ColoredProgressBar(value: account.weeklySonnetPercentage, color: cardBarColor(percentage: account.weeklySonnetPercentage))
+                        Text("\(Int(account.weeklySonnetPercentage * 100))%")
+                            .font(.caption2)
+                    }
+                }
+            } else if account.isLoading {
+                ProgressView()
+                    .scaleEffect(0.7)
+            } else {
+                Text("No data")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+        }
+        .padding(8)
+        .background(Color.secondary.opacity(0.1))
+        .cornerRadius(8)
+        .frame(maxWidth: .infinity)
+    }
+
+    func cardBarColor(percentage: Double) -> Color {
+        switch colorMode {
+        case .byUsageLevel:
+            return colorForUsage(percentage: percentage)
+        case .byAccount:
+            return account.displayColor
+        case .hybrid:
+            return percentage > 0.9 ? .red : account.displayColor
+        }
+    }
+}
+
+func formatResetTimeCompact(_ date: Date, includeDate: Bool, showRemaining: Bool = false) -> String {
+    if showRemaining {
+        let now = Date()
+        let remaining = date.timeIntervalSince(now)
+        if remaining <= 0 {
+            return "now"
+        }
+        let hours = Int(remaining) / 3600
+        let minutes = (Int(remaining) % 3600) / 60
+        if hours > 24 {
+            let days = hours / 24
+            return "in \(days)d \(hours % 24)h"
+        } else if hours > 0 {
+            return "in \(hours)h \(minutes)m"
+        } else {
+            return "in \(minutes)m"
+        }
+    } else {
+        let formatter = DateFormatter()
+        if includeDate {
+            formatter.dateFormat = "d MMM 'at' h:mm a"
+            return "on \(formatter.string(from: date))"
+        } else {
+            formatter.timeStyle = .short
+            return "at \(formatter.string(from: date))"
+        }
+    }
+}
+
+// MARK: - Account Management Inline Views
+
+struct AddAccountInlineView: View {
+    @ObservedObject var usageManager: UsageManager
+    @Binding var isPresented: Bool
+    @State private var accountName: String = ""
+    @State private var cookieInput: String = ""
+    @State private var showInstructions: Bool = false
+    @State private var validationError: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Add Account")
+                    .font(.headline)
+                Spacer()
+                Button(action: { isPresented = false }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.borderless)
+            }
+
+            TextField("Account Name (e.g., Personal, Work)", text: $accountName)
+                .textFieldStyle(.roundedBorder)
+
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text("Session Cookie")
+                        .font(.caption)
+                    Spacer()
+                    Button(showInstructions ? "Hide Help" : "How to get cookie") {
+                        showInstructions.toggle()
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption2)
+                }
+
+                if showInstructions {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("1. Go to Settings > Usage on claude.ai")
+                        Text("2. Press F12 (or Cmd+Option+I)")
+                        Text("3. Go to Network tab")
+                        Text("4. Refresh page, click 'usage' request")
+                        Text("5. Find 'Cookie' in Request Headers")
+                        Text("6. Copy full cookie value")
+                    }
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .padding(6)
+                    .background(Color.secondary.opacity(0.1))
+                    .cornerRadius(4)
+                }
+
+                PasteableTextField(text: $cookieInput, placeholder: "Paste cookie here...")
+                    .frame(height: 50)
+
+                if let error = validationError {
+                    Text(error)
+                        .font(.caption2)
+                        .foregroundColor(.red)
+                }
+            }
+
+            HStack {
+                Button("Cancel") {
+                    isPresented = false
+                }
+                .buttonStyle(.bordered)
+
+                Spacer()
+
+                Button("Add Account") {
+                    // Validate: check for duplicate cookie
+                    if usageManager.accounts.contains(where: { $0.sessionCookie == cookieInput }) {
+                        validationError = "This cookie is already added to another account"
+                        return
+                    }
+                    // Validate: basic cookie format check
+                    if !cookieInput.contains("sessionKey=") && !cookieInput.contains("lastActiveOrg=") {
+                        validationError = "Cookie doesn't appear to be valid (missing sessionKey or lastActiveOrg)"
+                        return
+                    }
+
+                    let name = accountName.isEmpty ? "Account \(usageManager.accounts.count + 1)" : accountName
+                    usageManager.addAccount(name: name, cookie: cookieInput)
+                    usageManager.fetchUsageForAccount(index: usageManager.accounts.count - 1)
+                    isPresented = false
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(cookieInput.isEmpty)
+            }
+        }
+    }
+}
+
+struct EditAccountInlineView: View {
+    @ObservedObject var usageManager: UsageManager
+    let accountId: UUID
+    @Binding var isPresented: Bool
+    @State private var accountName: String = ""
+    @State private var cookieInput: String = ""
+    @State private var selectedColor: Color = .blue
+    @State private var iconURLInput: String = ""
+    @State private var showDeleteConfirm: Bool = false
+
+    let colorOptions: [(String, Color)] = [
+        ("Blue", .blue), ("Purple", .purple), ("Teal", .teal), ("Orange", .orange),
+        ("Red", .red), ("Green", .green), ("Pink", .pink), ("Yellow", .yellow)
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Edit Account")
+                    .font(.headline)
+                Spacer()
+                Button(action: { isPresented = false }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.borderless)
+            }
+
+            TextField("Account Name", text: $accountName)
+                .textFieldStyle(.roundedBorder)
+
+            // Color picker
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Account Color")
+                    .font(.caption)
+                HStack(spacing: 6) {
+                    ForEach(colorOptions, id: \.0) { name, color in
+                        Circle()
+                            .fill(color)
+                            .frame(width: 20, height: 20)
+                            .overlay(
+                                Circle()
+                                    .stroke(Color.primary, lineWidth: selectedColor.toHex() == color.toHex() ? 2 : 0)
+                            )
+                            .onTapGesture {
+                                selectedColor = color
+                            }
+                    }
+                }
+            }
+
+            // Icon URL
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Icon URL (optional - e.g., GitHub avatar)")
+                    .font(.caption)
+                PasteableTextField(text: $iconURLInput, placeholder: "https://github.com/username.png")
+                    .frame(height: 24)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Session Cookie (leave empty to keep current)")
+                    .font(.caption)
+                PasteableTextField(text: $cookieInput, placeholder: "Paste new cookie to update...")
+                    .frame(height: 50)
+            }
+
+            HStack {
+                Button("Delete", role: .destructive) {
+                    showDeleteConfirm = true
+                }
+                .buttonStyle(.bordered)
+
+                Spacer()
+
+                Button("Cancel") {
+                    isPresented = false
+                }
+                .buttonStyle(.bordered)
+
+                Button("Save") {
+                    let colorHex = selectedColor.toHex()
+                    let iconURL = iconURLInput.isEmpty ? nil : iconURLInput
+                    usageManager.updateAccount(id: accountId, name: accountName, cookie: cookieInput, colorHex: colorHex, iconURL: iconURL)
+                    if !cookieInput.isEmpty {
+                        if let index = usageManager.accounts.firstIndex(where: { $0.id == accountId }) {
+                            usageManager.fetchUsageForAccount(index: index)
+                        }
+                    }
+                    isPresented = false
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(accountName.isEmpty)
+            }
+
+            if showDeleteConfirm {
+                VStack(spacing: 8) {
+                    Text("Delete this account?")
+                        .font(.caption)
+                        .fontWeight(.semibold)
+                    HStack {
+                        Button("Cancel") {
+                            showDeleteConfirm = false
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+
+                        Button("Delete") {
+                            usageManager.removeAccount(id: accountId)
+                            isPresented = false
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.red)
+                        .controlSize(.small)
+                    }
+                }
+                .padding(8)
+                .background(Color.red.opacity(0.1))
+                .cornerRadius(6)
+            }
+        }
+        .onAppear {
+            if let account = usageManager.accounts.first(where: { $0.id == accountId }) {
+                accountName = account.name
+                if let hex = account.customColorHex {
+                    selectedColor = Color(hex: hex)
+                }
+                iconURLInput = account.iconURL ?? ""
+            }
+        }
+    }
+}
+
+// MARK: - Main Usage View
+
+struct UsageView: View {
+    @ObservedObject var usageManager: UsageManager
+    @State private var showingSettings: Bool = false
+    @State private var showingAddAccount: Bool = false
+    @State private var editingAccountId: UUID?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            // Show Add Account form if active
+            if showingAddAccount {
+                AddAccountInlineView(usageManager: usageManager, isPresented: $showingAddAccount)
+            } else if let editId = editingAccountId {
+                EditAccountInlineView(usageManager: usageManager, accountId: editId, isPresented: Binding(
+                    get: { editingAccountId != nil },
+                    set: { if !$0 { editingAccountId = nil } }
+                ))
+            } else {
+                // Normal view
+                mainContentView
+            }
+        }
+        .padding()
+        .frame(width: popoverWidth)
+        .id(usageManager.refreshTrigger)  // Force complete redraw when triggered
+        .onAppear {
+            usageManager.updatePercentages()
+        }
+    }
+
+    var mainContentView: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            // Header
+            HStack {
+                Text("Claude Usage")
+                    .font(.headline)
+                Spacer()
+                if usageManager.accounts.count < 4 {
+                    Button(action: { showingAddAccount = true }) {
+                        Image(systemName: "plus.circle")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Add Account")
+                }
+            }
+            .padding(.bottom, 4)
 
             if let error = usageManager.errorMessage {
                 Text(error)
@@ -803,172 +2118,90 @@ struct UsageView: View {
                     .padding(.bottom, 8)
             }
 
-            // Only show usage if data has been fetched
-            if !usageManager.hasFetchedData {
-                Text("👋 Welcome! Set your session cookie below to get started.")
+            // Show welcome message or usage charts
+            if usageManager.accounts.isEmpty {
+                Text("Welcome! Click + to add your first Claude account.")
                     .font(.subheadline)
                     .foregroundColor(.secondary)
                     .padding(.vertical, 8)
-            }
-
-            // Session Usage
-            if usageManager.hasFetchedData {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text("Session (5 hour)")
-                        .font(.subheadline)
-                    Spacer()
-                    if let resetTime = usageManager.sessionResetsAt {
-                        Text("Resets \(formatResetTime(resetTime))")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
+            } else {
+                // Multi-account chart views
+                switch usageManager.chartStyle {
+                case .ultraCompact:
+                    UltraCompactChartView(usageManager: usageManager)
+                case .stackedVertical:
+                    StackedVerticalChartView(usageManager: usageManager)
+                case .separateCards:
+                    SeparateCardsView(usageManager: usageManager)
                 }
 
-                ProgressView(value: usageManager.sessionPercentage)
-                    .tint(colorForPercentage(usageManager.sessionPercentage))
-
-                Text("\(Int(usageManager.sessionPercentage * 100))% used")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-
-            // Weekly Usage
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text("Weekly (7 day)")
-                        .font(.subheadline)
-                    Spacer()
-                    if let resetTime = usageManager.weeklyResetsAt {
-                        Text("Resets \(formatResetTime(resetTime, includeDate: true))")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                }
-
-                ProgressView(value: usageManager.weeklyPercentage)
-                    .tint(colorForPercentage(usageManager.weeklyPercentage))
-
-                Text("\(Int(usageManager.weeklyPercentage * 100))% used")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-
-            // Weekly Sonnet Usage (only show if available)
-            if usageManager.hasWeeklySonnet && usageManager.hasFetchedData {
+                // Account legend with edit/delete (always show so users can manage accounts)
                 VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text("Weekly Sonnet (7 day)")
-                            .font(.subheadline)
-                        Spacer()
-                        if let resetTime = usageManager.weeklySonnetResetsAt {
-                            Text("Resets \(formatResetTime(resetTime, includeDate: true))")
+                    ForEach(Array(usageManager.accounts.enumerated()), id: \.element.id) { index, account in
+                        HStack {
+                            // Show custom icon if available, otherwise colored circle
+                            if let iconImage = account.iconImage {
+                                ZStack {
+                                    // Outer colored ring
+                                    Circle()
+                                        .fill(account.displayColor)
+                                        .frame(width: 36, height: 36)
+                                    // White background for transparency
+                                    Circle()
+                                        .fill(Color.white)
+                                        .frame(width: 30, height: 30)
+                                    Image(nsImage: iconImage)
+                                        .resizable()
+                                        .frame(width: 30, height: 30)
+                                        .clipShape(Circle())
+                                }
+                            } else {
+                                Circle()
+                                    .fill(account.displayColor)
+                                    .frame(width: 14, height: 14)
+                            }
+                            Text(account.name)
                                 .font(.caption)
-                                .foregroundColor(.secondary)
+                                .lineLimit(1)
+                            Spacer()
+
+                            Menu {
+                                Button("Edit") {
+                                    editingAccountId = account.id
+                                }
+                                Button("Remove", role: .destructive) {
+                                    usageManager.removeAccount(id: account.id)
+                                }
+                            } label: {
+                                Image(systemName: "ellipsis.circle")
+                                    .font(.caption)
+                            }
+                            .menuStyle(.borderlessButton)
+                            .frame(width: 20)
                         }
                     }
+                }
+                .padding(.top, 4)
 
-                    ProgressView(value: usageManager.weeklySonnetPercentage)
-                        .tint(colorForPercentage(usageManager.weeklySonnetPercentage))
+                Divider()
 
-                    Text("\(Int(usageManager.weeklySonnetPercentage * 100))% used")
+                HStack {
+                    Text("Updated: \(formatTime(usageManager.lastUpdated))")
                         .font(.caption)
                         .foregroundColor(.secondary)
-                }
-            }
-            }
-
-            if usageManager.hasFetchedData {
-            Divider()
-
-            HStack {
-                Text("Last updated: \(formatTime(usageManager.lastUpdated))")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                Spacer()
-                Button("Refresh") {
-                    usageManager.fetchUsage()
-                }
-                .buttonStyle(.borderless)
-                .font(.caption)
-            }
-            }
-
-            Button(showingCookieInput ? "Hide Cookie" : "Set Session Cookie") {
-                showingCookieInput.toggle()
-            }
-            .buttonStyle(.borderless)
-            .font(.caption)
-
-            if showingCookieInput {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("How to get your session cookie:")
-                        .font(.caption)
-                        .fontWeight(.semibold)
-
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("1. Go to Settings > Usage on claude.ai")
-                        Text("2. Press F12 (or Cmd+Option+I)")
-                        Text("3. Go to Network tab")
-                        Text("4. Refresh page, click 'usage' request")
-                        Text("5. Find 'Cookie' in Request Headers")
-                        Text("6. Copy full cookie value\n   (starts with anthropic-device-id=...)")
-                    }
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
-
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Paste full cookie string:")
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                        VStack(spacing: 4) {
-                            PasteableTextField(text: $sessionCookieInput, placeholder: "Paste cookie here...")
-                                .frame(height: 60)
-                                .cornerRadius(4)
-
-                            HStack(spacing: 8) {
-                                Button("Save Cookie & Fetch") {
-                                    NSLog("ClaudeUsage: Save clicked, input length: \(sessionCookieInput.count)")
-                                    if sessionCookieInput.isEmpty {
-                                        usageManager.errorMessage = "Cookie field is empty!"
-                                    } else {
-                                        usageManager.saveSessionCookie(sessionCookieInput)
-                                        usageManager.fetchUsage()
-                                        usageManager.errorMessage = "Cookie saved, fetching..."
-                                    }
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .controlSize(.small)
-
-                                if usageManager.hasFetchedData {
-                                    Button("Clear Cookie") {
-                                        sessionCookieInput = ""
-                                        usageManager.clearSessionCookie()
-                                    }
-                                    .buttonStyle(.bordered)
-                                    .controlSize(.small)
-                                }
-                            }
+                    Spacer()
+                    if usageManager.isLoading {
+                        ProgressView()
+                            .scaleEffect(0.6)
+                    } else {
+                        Button("Refresh All") {
+                            usageManager.fetchUsage()
                         }
+                        .buttonStyle(.borderless)
+                        .font(.caption)
                     }
                 }
-                .padding(8)
-                .background(Color.secondary.opacity(0.1))
-                .cornerRadius(6)
             }
-
-            // Support Section
-            Button(action: {
-                NSWorkspace.shared.open(URL(string: "https://donate.stripe.com/3cIcN5b5H7Q8ay8bIDfIs02")!)
-            }) {
-                HStack(spacing: 4) {
-                    Text("☕")
-                    Text("Buy Dev a Coffee")
-                }
-            }
-            .buttonStyle(.borderless)
-            .font(.caption)
-            .foregroundColor(.orange)
 
             // Settings Section
             Button(showingSettings ? "Hide Settings" : "Settings") {
@@ -979,6 +2212,69 @@ struct UsageView: View {
 
             if showingSettings {
                 VStack(alignment: .leading, spacing: 12) {
+                    // Chart Style picker (only show if multiple accounts)
+                    if usageManager.accounts.count > 1 {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Chart Style")
+                                .font(.caption)
+                                .fontWeight(.semibold)
+                            Picker("", selection: Binding(
+                                get: { usageManager.chartStyle },
+                                set: { newValue in
+                                    usageManager.chartStyle = newValue
+                                    usageManager.saveAccounts()
+                                    // Notify AppDelegate to reposition popover
+                                    NotificationCenter.default.post(name: NSNotification.Name("ChartStyleChanged"), object: nil)
+                                }
+                            )) {
+                                ForEach(ChartStyle.allCases, id: \.self) { style in
+                                    Text(style.rawValue).tag(style)
+                                }
+                            }
+                            .pickerStyle(.menu)
+                            .labelsHidden()
+                        }
+
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Color Mode")
+                                .font(.caption)
+                                .fontWeight(.semibold)
+                            Picker("", selection: Binding(
+                                get: { usageManager.colorMode },
+                                set: { newValue in
+                                    usageManager.colorMode = newValue
+                                    usageManager.saveAccounts()
+                                }
+                            )) {
+                                ForEach(ColorMode.allCases, id: \.self) { mode in
+                                    Text(mode.rawValue).tag(mode)
+                                }
+                            }
+                            .pickerStyle(.menu)
+                            .labelsHidden()
+                        }
+
+                        Divider()
+                    }
+
+                    // Reset time format toggle
+                    Toggle(isOn: Binding(
+                        get: { usageManager.showTimeRemaining },
+                        set: { newValue in
+                            usageManager.showTimeRemaining = newValue
+                            usageManager.saveAccounts()
+                        }
+                    )) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Show Time Remaining")
+                                .font(.caption)
+                            Text("Show \"in 3h 15m\" instead of date/time")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .toggleStyle(.checkbox)
+
                     Toggle(isOn: Binding(
                         get: { usageManager.openAtLogin },
                         set: { newValue in
@@ -1026,7 +2322,7 @@ struct UsageView: View {
 
                     VStack(alignment: .leading, spacing: 8) {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("Keyboard Shortcut (⌘U)")
+                            Text("Keyboard Shortcut")
                                 .font(.caption)
                                 .fontWeight(.semibold)
                             Text("Toggle popup from anywhere")
@@ -1041,7 +2337,7 @@ struct UsageView: View {
                             .buttonStyle(.borderedProminent)
                             .controlSize(.small)
 
-                            Text("Grant Accessibility permission in System Settings\nto use ⌘U shortcut")
+                            Text("Grant Accessibility permission in System Settings\nto use Cmd+U shortcut")
                                 .font(.caption2)
                                 .foregroundColor(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
@@ -1053,22 +2349,17 @@ struct UsageView: View {
                 .cornerRadius(6)
             }
         }
-        .padding()
-        .frame(width: 360)
-        .onAppear {
-            // Load saved cookie when view appears
-            if let savedCookie = UserDefaults.standard.string(forKey: "claude_session_cookie") {
-                sessionCookieInput = String(savedCookie.prefix(20)) + "..."
-            }
-            // Force refresh to ensure progress bars show colors
-            usageManager.updatePercentages()
-        }
     }
 
-    func formatNumber(_ number: Int) -> String {
-        let formatter = NumberFormatter()
-        formatter.numberStyle = .decimal
-        return formatter.string(from: NSNumber(value: number)) ?? "\(number)"
+    var popoverWidth: CGFloat {
+        switch usageManager.chartStyle {
+        case .ultraCompact:
+            return 380
+        case .stackedVertical:
+            return 340
+        case .separateCards:
+            return usageManager.accounts.count > 2 ? 420 : 380
+        }
     }
 
     func formatTime(_ date: Date) -> String {
@@ -1076,29 +2367,5 @@ struct UsageView: View {
         formatter.timeStyle = .short
         return formatter.string(from: date)
     }
-
-    func formatResetTime(_ date: Date, includeDate: Bool = false) -> String {
-        let formatter = DateFormatter()
-
-        if includeDate {
-            // Format: "on 31 Jan 2026 at 7:59 AM"
-            formatter.dateFormat = "d MMM yyyy 'at' h:mm a"
-            return "on \(formatter.string(from: date))"
-        } else {
-            formatter.timeStyle = .short
-            formatter.dateStyle = .none
-            return "at \(formatter.string(from: date))"
-        }
-    }
-
-    func colorForPercentage(_ percentage: Double) -> Color {
-        if percentage < 0.7 {
-            return .green
-        } else if percentage < 0.9 {
-            return .orange
-        } else {
-            return .red
-        }
-    }
-
 }
+
