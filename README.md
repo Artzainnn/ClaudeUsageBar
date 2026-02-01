@@ -15,7 +15,12 @@ A lightweight, open-source macOS menu bar application that displays your Claude.
 
 ## 📦 Set Up (1mn)
 
-Go to [claude.ai/settings/usage](https://claude.ai/settings/usage) from browser, open Developer Tools (Cmd+Option+I), go to the Network tab, refresh the page, click the "usage" request, and copy the full "Cookie" value from the Request Headers.
+1. Go to [claude.ai/settings/usage](https://claude.ai/settings/usage)
+2. Open Developer Tools (`Cmd+Option+I`) → **Network** tab
+3. Refresh the page, click the **"usage"** request
+4. Copy the full **"Cookie"** value from the Request Headers
+
+![Setup Guide](setup-guide.png)
 
 ## ✨ Features
 
