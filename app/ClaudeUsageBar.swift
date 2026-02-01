@@ -20,7 +20,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         if let button = statusItem.button {
             // Create Claude logo as initial icon
-            updateStatusIcon(percentage: 0)
+            updateStatusIcon(percentages: [])
             button.action = #selector(handleClick)
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
             button.target = self
@@ -187,11 +187,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func openPopover() {
         if let button = statusItem.button {
-            // Force UI refresh by updating percentages
-            DispatchQueue.main.async {
-                self.usageManager.updatePercentages()
-            }
-
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
 
             // Add event monitor to detect clicks outside the popover
@@ -213,14 +208,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func updateStatusIcon(percentage: Int) {
+    func updateStatusIcon(percentages: [Int]) {
         guard let button = statusItem.button else { return }
 
-        // Determine color based on percentage
+        // Determine color based on max percentage
+        let maxPercentage = percentages.max() ?? 0
         let color: NSColor
-        if percentage < 70 {
+        if maxPercentage < 70 {
             color = NSColor(red: 0.13, green: 0.77, blue: 0.37, alpha: 1.0) // Green
-        } else if percentage < 90 {
+        } else if maxPercentage < 90 {
             color = NSColor(red: 1.0, green: 0.8, blue: 0.0, alpha: 1.0) // Yellow
         } else {
             color = NSColor(red: 1.0, green: 0.23, blue: 0.19, alpha: 1.0) // Red
@@ -231,7 +227,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Set image and title
         button.image = sparkIcon
-        button.title = " \(percentage)%"
+        if percentages.isEmpty {
+            button.title = " 0%"
+        } else if percentages.count == 1 {
+            button.title = " \(percentages[0])%"
+        } else {
+            button.title = " " + percentages.map { "\($0)%" }.joined(separator: " | ")
+        }
     }
 
     func createSparkIcon(color: NSColor) -> NSImage {
@@ -295,35 +297,97 @@ struct Main {
     }
 }
 
+// MARK: - Subscription Model
+
+struct Subscription: Identifiable, Codable {
+    let id: UUID
+    var name: String
+    var cookie: String
+
+    // Runtime usage data (not persisted — re-fetched on launch)
+    var sessionUsage: Int = 0
+    var sessionLimit: Int = 100
+    var weeklyUsage: Int = 0
+    var weeklyLimit: Int = 100
+    var weeklySonnetUsage: Int = 0
+    var weeklySonnetLimit: Int = 100
+    var sessionResetsAt: Date?
+    var weeklyResetsAt: Date?
+    var weeklySonnetResetsAt: Date?
+    var hasWeeklySonnet: Bool = false
+    var hasFetchedData: Bool = false
+    var isLoading: Bool = false
+    var errorMessage: String?
+    var lastUpdated: Date = Date()
+    var lastNotifiedThreshold: Int = 0
+
+    var sessionPercentage: Double {
+        guard sessionLimit > 0 else { return 0 }
+        return Double(sessionUsage) / Double(sessionLimit)
+    }
+
+    var weeklyPercentage: Double {
+        guard weeklyLimit > 0 else { return 0 }
+        return Double(weeklyUsage) / Double(weeklyLimit)
+    }
+
+    var weeklySonnetPercentage: Double {
+        guard weeklySonnetLimit > 0 else { return 0 }
+        return Double(weeklySonnetUsage) / Double(weeklySonnetLimit)
+    }
+
+    // Only persist id, name, cookie, lastNotifiedThreshold
+    enum CodingKeys: String, CodingKey {
+        case id, name, cookie, lastNotifiedThreshold
+    }
+
+    init(id: UUID = UUID(), name: String, cookie: String, lastNotifiedThreshold: Int = 0) {
+        self.id = id
+        self.name = name
+        self.cookie = cookie
+        self.lastNotifiedThreshold = lastNotifiedThreshold
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        cookie = try container.decode(String.self, forKey: .cookie)
+        lastNotifiedThreshold = try container.decodeIfPresent(Int.self, forKey: .lastNotifiedThreshold) ?? 0
+    }
+}
+
+// MARK: - Usage Manager
+
 class UsageManager: ObservableObject {
-    @Published var sessionUsage: Int = 0
-    @Published var sessionLimit: Int = 100
-    @Published var weeklyUsage: Int = 0
-    @Published var weeklyLimit: Int = 100
-    @Published var weeklySonnetUsage: Int = 0
-    @Published var weeklySonnetLimit: Int = 100
-    @Published var sessionResetsAt: Date?
-    @Published var weeklyResetsAt: Date?
-    @Published var weeklySonnetResetsAt: Date?
-    @Published var lastUpdated: Date = Date()
-    @Published var isLoading: Bool = false
-    @Published var errorMessage: String?
+    static let maxSubscriptions = 5
+
+    @Published var subscriptions: [Subscription] = []
     @Published var notificationsEnabled: Bool = true
     @Published var openAtLogin: Bool = false
-    @Published var hasWeeklySonnet: Bool = false
-    @Published var hasFetchedData: Bool = false
     @Published var isAccessibilityEnabled: Bool = false
     @Published var shortcutEnabled: Bool = true
 
     private var statusItem: NSStatusItem?
-    private var sessionCookie: String = ""
     private weak var delegate: AppDelegate?
-    private var lastNotifiedThreshold: Int = 0
+
+    var hasFetchedData: Bool {
+        subscriptions.contains(where: { $0.hasFetchedData })
+    }
+
+    var isLoading: Bool {
+        subscriptions.contains(where: { $0.isLoading })
+    }
+
+    var lastUpdated: Date {
+        subscriptions.compactMap({ $0.hasFetchedData ? $0.lastUpdated : nil }).max() ?? Date()
+    }
 
     init(statusItem: NSStatusItem?, delegate: AppDelegate? = nil) {
         self.statusItem = statusItem
         self.delegate = delegate
-        loadSessionCookie()
+        migrateFromSingleCookie()
+        loadSubscriptions()
         loadSettings()
         checkAccessibilityStatus()
     }
@@ -332,9 +396,48 @@ class UsageManager: ObservableObject {
         isAccessibilityEnabled = AXIsProcessTrusted()
     }
 
-    func loadSessionCookie() {
-        if let savedCookie = UserDefaults.standard.string(forKey: "claude_session_cookie") {
-            sessionCookie = savedCookie
+    // MARK: Migration
+
+    private func migrateFromSingleCookie() {
+        // Only run if old key exists AND new key does not
+        guard let oldCookie = UserDefaults.standard.string(forKey: "claude_session_cookie"),
+              !oldCookie.isEmpty,
+              UserDefaults.standard.data(forKey: "claude_subscriptions") == nil else {
+            return
+        }
+
+        let oldThreshold = UserDefaults.standard.integer(forKey: "last_notified_threshold")
+
+        let migrated = Subscription(
+            name: "My Subscription",
+            cookie: oldCookie,
+            lastNotifiedThreshold: oldThreshold
+        )
+
+        subscriptions = [migrated]
+        saveSubscriptions()
+
+        // Clean up old keys
+        UserDefaults.standard.removeObject(forKey: "claude_session_cookie")
+        UserDefaults.standard.removeObject(forKey: "last_notified_threshold")
+        UserDefaults.standard.synchronize()
+
+        NSLog("ClaudeUsage: Migrated single cookie to subscription '\(migrated.name)'")
+    }
+
+    // MARK: Persistence
+
+    func loadSubscriptions() {
+        if let data = UserDefaults.standard.data(forKey: "claude_subscriptions"),
+           let decoded = try? JSONDecoder().decode([Subscription].self, from: data) {
+            subscriptions = decoded
+        }
+    }
+
+    func saveSubscriptions() {
+        if let data = try? JSONEncoder().encode(subscriptions) {
+            UserDefaults.standard.set(data, forKey: "claude_subscriptions")
+            UserDefaults.standard.synchronize()
         }
     }
 
@@ -346,7 +449,6 @@ class UsageManager: ObservableObject {
             UserDefaults.standard.set(true, forKey: "has_set_notifications")
         }
         openAtLogin = UserDefaults.standard.bool(forKey: "open_at_login")
-        lastNotifiedThreshold = UserDefaults.standard.integer(forKey: "last_notified_threshold")
         // Default shortcut to enabled if not previously set
         if UserDefaults.standard.object(forKey: "shortcut_enabled") == nil {
             shortcutEnabled = true
@@ -362,42 +464,83 @@ class UsageManager: ObservableObject {
         UserDefaults.standard.synchronize()
     }
 
-    func saveSessionCookie(_ cookie: String) {
-        NSLog("ClaudeUsage: Saving cookie, length: \(cookie.count)")
-        sessionCookie = cookie
-        UserDefaults.standard.set(cookie, forKey: "claude_session_cookie")
-        UserDefaults.standard.synchronize()
-        NSLog("ClaudeUsage: Cookie saved successfully")
+    // MARK: Subscription CRUD
+
+    func addSubscription(name: String, cookie: String) {
+        guard subscriptions.count < UsageManager.maxSubscriptions else { return }
+        let trimmedName = name.trimmingCharacters(in: .whitespaces)
+        let finalName = trimmedName.isEmpty ? "Subscription \(subscriptions.count + 1)" : trimmedName
+        let sub = Subscription(name: finalName, cookie: cookie)
+        subscriptions.append(sub)
+        saveSubscriptions()
+        fetchUsage(for: sub.id)
     }
 
-    func clearSessionCookie() {
-        NSLog("ClaudeUsage: Clearing cookie")
-        sessionCookie = ""
-        UserDefaults.standard.removeObject(forKey: "claude_session_cookie")
-        UserDefaults.standard.synchronize()
-
-        // Reset all data
-        sessionUsage = 0
-        weeklyUsage = 0
-        weeklySonnetUsage = 0
-        sessionResetsAt = nil
-        weeklyResetsAt = nil
-        weeklySonnetResetsAt = nil
-        hasFetchedData = false
-        hasWeeklySonnet = false
-        errorMessage = nil
-        lastNotifiedThreshold = 0
-        UserDefaults.standard.set(0, forKey: "last_notified_threshold")
-
-        // Update status bar to show 0%
-        delegate?.updateStatusIcon(percentage: 0)
-
-        NSLog("ClaudeUsage: Cookie cleared, data reset")
+    func removeSubscription(id: UUID) {
+        subscriptions.removeAll(where: { $0.id == id })
+        saveSubscriptions()
+        updateStatusBar()
     }
 
-    func fetchOrganizationId(completion: @escaping (String?) -> Void) {
+    func updateSubscription(id: UUID, name: String? = nil, cookie: String? = nil) {
+        guard let idx = subscriptions.firstIndex(where: { $0.id == id }) else { return }
+        if let name = name {
+            let trimmedName = name.trimmingCharacters(in: .whitespaces)
+            if !trimmedName.isEmpty {
+                subscriptions[idx].name = trimmedName
+            }
+        }
+        if let cookie = cookie {
+            subscriptions[idx].cookie = cookie
+            subscriptions[idx].hasFetchedData = false
+            subscriptions[idx].errorMessage = nil
+        }
+        saveSubscriptions()
+    }
+
+    // MARK: Fetching
+
+    func fetchUsage() {
+        guard !subscriptions.isEmpty else {
+            updateStatusBar()
+            return
+        }
+        for subscription in subscriptions {
+            fetchUsage(for: subscription.id)
+        }
+    }
+
+    func fetchUsage(for subscriptionId: UUID) {
+        guard let idx = subscriptions.firstIndex(where: { $0.id == subscriptionId }) else { return }
+        guard !subscriptions[idx].cookie.isEmpty else {
+            subscriptions[idx].errorMessage = "Session cookie not set"
+            updateStatusBar()
+            return
+        }
+
+        subscriptions[idx].isLoading = true
+        subscriptions[idx].errorMessage = nil
+
+        let cookie = subscriptions[idx].cookie
+
+        fetchOrganizationId(cookie: cookie) { [weak self] orgId in
+            guard let self = self else { return }
+            guard let orgId = orgId else {
+                DispatchQueue.main.async {
+                    if let idx = self.subscriptions.firstIndex(where: { $0.id == subscriptionId }) {
+                        self.subscriptions[idx].errorMessage = "Could not get org ID from cookie"
+                        self.subscriptions[idx].isLoading = false
+                    }
+                }
+                return
+            }
+            self.fetchUsageWithOrgId(orgId, cookie: cookie, subscriptionId: subscriptionId)
+        }
+    }
+
+    func fetchOrganizationId(cookie: String, completion: @escaping (String?) -> Void) {
         // Get org ID from the lastActiveOrg cookie value
-        let cookieParts = sessionCookie.components(separatedBy: ";")
+        let cookieParts = cookie.components(separatedBy: ";")
         for part in cookieParts {
             let trimmed = part.trimmingCharacters(in: .whitespaces)
             if trimmed.hasPrefix("lastActiveOrg=") {
@@ -416,7 +559,7 @@ class UsageManager: ObservableObject {
 
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
-        request.setValue("sessionKey=\(sessionCookie)", forHTTPHeaderField: "Cookie")
+        request.setValue("sessionKey=\(cookie)", forHTTPHeaderField: "Cookie")
 
         NSLog("📡 Fetching bootstrap to get org ID...")
 
@@ -434,39 +577,15 @@ class UsageManager: ObservableObject {
         }.resume()
     }
 
-    func fetchUsage() {
-        guard !sessionCookie.isEmpty else {
-            DispatchQueue.main.async {
-                self.errorMessage = "Session cookie not set"
-                self.updateStatusBar()
-            }
-            return
-        }
-
-        isLoading = true
-        errorMessage = nil
-
-        // Extract org ID from cookie
-        fetchOrganizationId { [weak self] orgId in
-            guard let self = self, let orgId = orgId else {
-                DispatchQueue.main.async {
-                    self?.errorMessage = "Could not get org ID from cookie"
-                    self?.isLoading = false
-                }
-                return
-            }
-
-            self.fetchUsageWithOrgId(orgId)
-        }
-    }
-
-    func fetchUsageWithOrgId(_ orgId: String) {
+    func fetchUsageWithOrgId(_ orgId: String, cookie: String, subscriptionId: UUID) {
         let urlString = "https://claude.ai/api/organizations/\(orgId)/usage"
 
         guard let url = URL(string: urlString) else {
             DispatchQueue.main.async {
-                self.errorMessage = "Invalid URL"
-                self.isLoading = false
+                if let idx = self.subscriptions.firstIndex(where: { $0.id == subscriptionId }) {
+                    self.subscriptions[idx].errorMessage = "Invalid URL"
+                    self.subscriptions[idx].isLoading = false
+                }
             }
             return
         }
@@ -475,7 +594,7 @@ class UsageManager: ObservableObject {
         request.httpMethod = "GET"
 
         // Use the full cookie string (user provides all cookies, not just sessionKey)
-        request.setValue(sessionCookie, forHTTPHeaderField: "Cookie")
+        request.setValue(cookie, forHTTPHeaderField: "Cookie")
         request.setValue("*/*", forHTTPHeaderField: "Accept")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("https://claude.ai", forHTTPHeaderField: "Origin")
@@ -487,18 +606,21 @@ class UsageManager: ObservableObject {
 
         URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             DispatchQueue.main.async {
-                self?.isLoading = false
+                guard let self = self else { return }
+                guard let idx = self.subscriptions.firstIndex(where: { $0.id == subscriptionId }) else { return }
+
+                self.subscriptions[idx].isLoading = false
 
                 if let error = error {
                     NSLog("❌ Error: \(error.localizedDescription)")
-                    self?.errorMessage = "Network error"
-                    self?.updateStatusBar()
+                    self.subscriptions[idx].errorMessage = "Network error"
+                    self.updateStatusBar()
                     return
                 }
 
                 guard let httpResponse = response as? HTTPURLResponse else {
-                    self?.errorMessage = "Invalid response"
-                    self?.updateStatusBar()
+                    self.subscriptions[idx].errorMessage = "Invalid response"
+                    self.updateStatusBar()
                     return
                 }
 
@@ -509,24 +631,26 @@ class UsageManager: ObservableObject {
                 }
 
                 if httpResponse.statusCode == 200, let data = data {
-                    self?.parseUsageData(data)
+                    self.parseUsageData(data, subscriptionId: subscriptionId)
                 } else {
-                    self?.errorMessage = "HTTP \(httpResponse.statusCode)"
+                    self.subscriptions[idx].errorMessage = "HTTP \(httpResponse.statusCode)"
                 }
 
-                self?.updateStatusBar()
+                self.updateStatusBar()
             }
         }.resume()
     }
 
-    func parseUsageData(_ data: Data) {
+    func parseUsageData(_ data: Data, subscriptionId: UUID) {
+        guard let idx = subscriptions.firstIndex(where: { $0.id == subscriptionId }) else { return }
+
         do {
             guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                errorMessage = "Invalid JSON"
+                subscriptions[idx].errorMessage = "Invalid JSON"
                 return
             }
 
-            NSLog("📊 Parsing usage data...")
+            NSLog("📊 Parsing usage data for '\(subscriptions[idx].name)'...")
 
             let iso8601Formatter = ISO8601DateFormatter()
             iso8601Formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -534,13 +658,13 @@ class UsageManager: ObservableObject {
             // Parse the actual claude.ai response format
             if let fiveHour = json["five_hour"] as? [String: Any] {
                 if let sessionUtil = fiveHour["utilization"] as? Double {
-                    sessionUsage = Int(sessionUtil)
-                    sessionLimit = 100
+                    subscriptions[idx].sessionUsage = Int(sessionUtil)
+                    subscriptions[idx].sessionLimit = 100
                 }
                 if let resetsAtString = fiveHour["resets_at"] as? String {
                     NSLog("🕐 Session resets_at string: \(resetsAtString)")
                     if let resetsAt = iso8601Formatter.date(from: resetsAtString) {
-                        sessionResetsAt = resetsAt
+                        subscriptions[idx].sessionResetsAt = resetsAt
                         NSLog("✅ Parsed session reset time: \(resetsAt)")
                     } else {
                         NSLog("❌ Failed to parse session reset time")
@@ -550,13 +674,13 @@ class UsageManager: ObservableObject {
 
             if let sevenDay = json["seven_day"] as? [String: Any] {
                 if let weeklyUtil = sevenDay["utilization"] as? Double {
-                    weeklyUsage = Int(weeklyUtil)
-                    weeklyLimit = 100
+                    subscriptions[idx].weeklyUsage = Int(weeklyUtil)
+                    subscriptions[idx].weeklyLimit = 100
                 }
                 if let resetsAtString = sevenDay["resets_at"] as? String {
                     NSLog("🕐 Weekly resets_at string: \(resetsAtString)")
                     if let resetsAt = iso8601Formatter.date(from: resetsAtString) {
-                        weeklyResetsAt = resetsAt
+                        subscriptions[idx].weeklyResetsAt = resetsAt
                         NSLog("✅ Parsed weekly reset time: \(resetsAt)")
                     } else {
                         NSLog("❌ Failed to parse weekly reset time")
@@ -566,83 +690,90 @@ class UsageManager: ObservableObject {
 
             // Check for seven_day_sonnet (Pro plan feature)
             if let sevenDaySonnet = json["seven_day_sonnet"] as? [String: Any] {
-                hasWeeklySonnet = true
+                subscriptions[idx].hasWeeklySonnet = true
                 if let sonnetUtil = sevenDaySonnet["utilization"] as? Double {
-                    weeklySonnetUsage = Int(sonnetUtil)
-                    weeklySonnetLimit = 100
+                    subscriptions[idx].weeklySonnetUsage = Int(sonnetUtil)
+                    subscriptions[idx].weeklySonnetLimit = 100
                 }
                 if let resetsAtString = sevenDaySonnet["resets_at"] as? String {
                     NSLog("🕐 Weekly Sonnet resets_at string: \(resetsAtString)")
                     if let resetsAt = iso8601Formatter.date(from: resetsAtString) {
-                        weeklySonnetResetsAt = resetsAt
+                        subscriptions[idx].weeklySonnetResetsAt = resetsAt
                         NSLog("✅ Parsed weekly Sonnet reset time: \(resetsAt)")
                     } else {
                         NSLog("❌ Failed to parse weekly Sonnet reset time")
                     }
                 }
             } else {
-                hasWeeklySonnet = false
+                subscriptions[idx].hasWeeklySonnet = false
             }
 
             // Log what we found
-            NSLog("✅ Parsed: Session \(sessionUsage)%, Weekly \(weeklyUsage)%\(hasWeeklySonnet ? ", Weekly Sonnet \(weeklySonnetUsage)%" : "")")
+            NSLog("✅ Parsed [\(subscriptions[idx].name)]: Session \(subscriptions[idx].sessionUsage)%, Weekly \(subscriptions[idx].weeklyUsage)%\(subscriptions[idx].hasWeeklySonnet ? ", Weekly Sonnet \(subscriptions[idx].weeklySonnetUsage)%" : "")")
 
-            lastUpdated = Date()
-            errorMessage = nil
-            hasFetchedData = true
-
-            // Update percentage values for progress bars
-            updatePercentages()
+            subscriptions[idx].lastUpdated = Date()
+            subscriptions[idx].errorMessage = nil
+            subscriptions[idx].hasFetchedData = true
         } catch {
             NSLog("❌ Parse error: \(error.localizedDescription)")
-            errorMessage = "Parse error"
+            subscriptions[idx].errorMessage = "Parse error"
         }
     }
 
+    // MARK: Status Bar
+
     func updateStatusBar() {
-        let sessionPercent = Int((Double(sessionUsage) / Double(sessionLimit)) * 100)
+        let percentages = subscriptions
+            .filter { $0.hasFetchedData }
+            .map { Int($0.sessionPercentage * 100) }
 
-        // Update the icon color
-        delegate?.updateStatusIcon(percentage: sessionPercent)
+        delegate?.updateStatusIcon(percentages: percentages)
 
-        // Check for notification thresholds
-        checkNotificationThresholds(percentage: sessionPercent)
+        // Check notification thresholds for each subscription
+        for idx in subscriptions.indices {
+            checkNotificationThresholds(subscriptionIndex: idx)
+        }
     }
 
-    func checkNotificationThresholds(percentage: Int) {
-        NSLog("🔔 Checking notifications: percentage=\(percentage)%, enabled=\(notificationsEnabled), lastNotified=\(lastNotifiedThreshold)%")
+    // MARK: Notifications
+
+    func checkNotificationThresholds(subscriptionIndex idx: Int) {
+        guard idx < subscriptions.count else { return }
+        let percentage = Int(subscriptions[idx].sessionPercentage * 100)
+
+        NSLog("🔔 Checking notifications for '\(subscriptions[idx].name)': percentage=\(percentage)%, enabled=\(notificationsEnabled), lastNotified=\(subscriptions[idx].lastNotifiedThreshold)%")
 
         guard notificationsEnabled else {
-            NSLog("⚠️ Notifications disabled")
             return
         }
 
         let thresholds = [25, 50, 75, 90]
 
         for threshold in thresholds {
-            if percentage >= threshold && lastNotifiedThreshold < threshold {
-                NSLog("📬 Sending notification for \(threshold)% threshold")
-                sendNotification(percentage: percentage, threshold: threshold)
-                lastNotifiedThreshold = threshold
-                // Persist the threshold
-                UserDefaults.standard.set(lastNotifiedThreshold, forKey: "last_notified_threshold")
-                UserDefaults.standard.synchronize()
+            if percentage >= threshold && subscriptions[idx].lastNotifiedThreshold < threshold {
+                NSLog("📬 Sending notification for '\(subscriptions[idx].name)' at \(threshold)% threshold")
+                sendNotification(subscriptionName: subscriptions[idx].name, percentage: percentage, threshold: threshold)
+                subscriptions[idx].lastNotifiedThreshold = threshold
+                saveSubscriptions()
             }
         }
 
         // Reset if usage drops below current threshold
-        if percentage < lastNotifiedThreshold {
+        if percentage < subscriptions[idx].lastNotifiedThreshold {
             let newThreshold = thresholds.filter { $0 <= percentage }.last ?? 0
-            NSLog("🔄 Resetting notification threshold from \(lastNotifiedThreshold)% to \(newThreshold)%")
-            lastNotifiedThreshold = newThreshold
-            UserDefaults.standard.set(lastNotifiedThreshold, forKey: "last_notified_threshold")
-            UserDefaults.standard.synchronize()
+            NSLog("🔄 Resetting notification threshold for '\(subscriptions[idx].name)' from \(subscriptions[idx].lastNotifiedThreshold)% to \(newThreshold)%")
+            subscriptions[idx].lastNotifiedThreshold = newThreshold
+            saveSubscriptions()
         }
     }
 
-    func sendNotification(percentage: Int, threshold: Int) {
+    func sendNotification(subscriptionName: String, percentage: Int, threshold: Int) {
         let notification = NSUserNotification()
-        notification.title = "Claude Usage Alert"
+        if subscriptions.count > 1 {
+            notification.title = "Claude Usage Alert (\(subscriptionName))"
+        } else {
+            notification.title = "Claude Usage Alert"
+        }
         notification.informativeText = "You've reached \(percentage)% of your 5-hour session limit"
         notification.soundName = NSUserNotificationDefaultSoundName
 
@@ -654,24 +785,20 @@ class UsageManager: ObservableObject {
         NSLog("🔔 Test notification button clicked")
 
         let notification = NSUserNotification()
-        notification.title = "Claude Usage Alert"
+        if subscriptions.count > 1, let first = subscriptions.first {
+            notification.title = "Claude Usage Alert (\(first.name))"
+        } else {
+            notification.title = "Claude Usage Alert"
+        }
         notification.informativeText = "Test notification - You've reached 75% of your 5-hour session limit"
         notification.soundName = NSUserNotificationDefaultSoundName
 
         NSUserNotificationCenter.default.deliver(notification)
         NSLog("📬 Test notification sent successfully")
     }
-
-    @Published var sessionPercentage: Double = 0.0
-    @Published var weeklyPercentage: Double = 0.0
-    @Published var weeklySonnetPercentage: Double = 0.0
-
-    func updatePercentages() {
-        sessionPercentage = Double(sessionUsage) / Double(sessionLimit)
-        weeklyPercentage = Double(weeklyUsage) / Double(weeklyLimit)
-        weeklySonnetPercentage = Double(weeklySonnetUsage) / Double(weeklySonnetLimit)
-    }
 }
+
+// MARK: - Custom Text Fields
 
 // Custom NSTextField that properly handles paste
 class CustomTextField: NSTextField {
@@ -806,10 +933,275 @@ struct PasteableTextField: NSViewRepresentable {
     }
 }
 
+// MARK: - Reusable UI Components
+
+struct UsageBarView: View {
+    let label: String
+    let percentage: Double
+    let resetTime: Date?
+    let includeDate: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(label)
+                    .font(.subheadline)
+                Spacer()
+                if let resetTime = resetTime {
+                    Text("Resets \(formatResetTime(resetTime, includeDate: includeDate))")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+
+            ProgressView(value: percentage)
+                .tint(colorForPercentage(percentage))
+
+            Text("\(Int(percentage * 100))% used")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+    }
+
+    func formatResetTime(_ date: Date, includeDate: Bool = false) -> String {
+        let formatter = DateFormatter()
+        if includeDate {
+            formatter.dateFormat = "d MMM yyyy 'at' h:mm a"
+            return "on \(formatter.string(from: date))"
+        } else {
+            formatter.timeStyle = .short
+            formatter.dateStyle = .none
+            return "at \(formatter.string(from: date))"
+        }
+    }
+
+    func colorForPercentage(_ percentage: Double) -> Color {
+        if percentage < 0.7 {
+            return .green
+        } else if percentage < 0.9 {
+            return .orange
+        } else {
+            return .red
+        }
+    }
+}
+
+struct SubscriptionUsageView: View {
+    let subscription: Subscription
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            UsageBarView(
+                label: "Session (5 hour)",
+                percentage: subscription.sessionPercentage,
+                resetTime: subscription.sessionResetsAt,
+                includeDate: false
+            )
+
+            UsageBarView(
+                label: "Weekly (7 day)",
+                percentage: subscription.weeklyPercentage,
+                resetTime: subscription.weeklyResetsAt,
+                includeDate: true
+            )
+
+            if subscription.hasWeeklySonnet {
+                UsageBarView(
+                    label: "Weekly Sonnet (7 day)",
+                    percentage: subscription.weeklySonnetPercentage,
+                    resetTime: subscription.weeklySonnetResetsAt,
+                    includeDate: true
+                )
+            }
+
+            if let error = subscription.errorMessage {
+                Text(error)
+                    .font(.caption)
+                    .foregroundColor(.orange)
+            }
+        }
+    }
+}
+
+// MARK: - Manage Subscriptions View
+
+struct ManageSubscriptionsView: View {
+    @ObservedObject var usageManager: UsageManager
+    @State private var editingId: UUID?
+    @State private var editName: String = ""
+    @State private var editCookie: String = ""
+    @State private var newName: String = ""
+    @State private var newCookie: String = ""
+    @State private var showingAddForm: Bool = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            // Existing subscriptions
+            ForEach(usageManager.subscriptions) { sub in
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(colorForPercentage(sub.sessionPercentage))
+                            .frame(width: 6, height: 6)
+                        Text(sub.name)
+                            .font(.caption)
+                            .fontWeight(.medium)
+                        Spacer()
+                        if editingId != sub.id {
+                            Button(action: {
+                                editingId = sub.id
+                                editName = sub.name
+                                editCookie = sub.cookie
+                            }) {
+                                Image(systemName: "pencil")
+                                    .font(.caption2)
+                            }
+                            .buttonStyle(.borderless)
+
+                            if usageManager.subscriptions.count > 1 {
+                                Button(action: {
+                                    usageManager.removeSubscription(id: sub.id)
+                                }) {
+                                    Image(systemName: "trash")
+                                        .font(.caption2)
+                                }
+                                .buttonStyle(.borderless)
+                                .foregroundColor(.red)
+                            }
+                        }
+                    }
+
+                    // Inline edit form
+                    if editingId == sub.id {
+                        VStack(alignment: .leading, spacing: 6) {
+                            TextField("Name", text: $editName)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.caption)
+
+                            Text("Cookie:")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                            PasteableTextField(text: $editCookie, placeholder: "Paste cookie here...")
+                                .frame(height: 50)
+                                .cornerRadius(4)
+
+                            HStack(spacing: 8) {
+                                Button("Save") {
+                                    usageManager.updateSubscription(id: sub.id, name: editName, cookie: editCookie)
+                                    if editCookie != sub.cookie {
+                                        usageManager.fetchUsage(for: sub.id)
+                                    }
+                                    editingId = nil
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.small)
+
+                                Button("Cancel") {
+                                    editingId = nil
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                            }
+                        }
+                        .padding(6)
+                        .background(Color.secondary.opacity(0.05))
+                        .cornerRadius(4)
+                    }
+                }
+
+                if sub.id != usageManager.subscriptions.last?.id {
+                    Divider()
+                }
+            }
+
+            // Add new subscription
+            if usageManager.subscriptions.count < UsageManager.maxSubscriptions {
+                Divider()
+
+                if showingAddForm {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Add Subscription")
+                            .font(.caption)
+                            .fontWeight(.semibold)
+
+                        TextField("Name (e.g. Work, Personal)", text: $newName)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.caption)
+
+                        Text("How to get your session cookie:")
+                            .font(.caption)
+                            .fontWeight(.semibold)
+
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("1. Go to Settings > Usage on claude.ai")
+                            Text("2. Press F12 (or Cmd+Option+I)")
+                            Text("3. Go to Network tab")
+                            Text("4. Refresh page, click 'usage' request")
+                            Text("5. Find 'Cookie' in Request Headers")
+                            Text("6. Copy full cookie value\n   (starts with anthropic-device-id=...)")
+                        }
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+
+                        Text("Paste full cookie string:")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                        PasteableTextField(text: $newCookie, placeholder: "Paste cookie here...")
+                            .frame(height: 60)
+                            .cornerRadius(4)
+
+                        HStack(spacing: 8) {
+                            Button("Save & Fetch") {
+                                if !newCookie.isEmpty {
+                                    usageManager.addSubscription(name: newName, cookie: newCookie)
+                                    newName = ""
+                                    newCookie = ""
+                                    showingAddForm = false
+                                }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+
+                            Button("Cancel") {
+                                newName = ""
+                                newCookie = ""
+                                showingAddForm = false
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        }
+                    }
+                } else {
+                    Button(action: { showingAddForm = true }) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "plus.circle")
+                                .font(.caption)
+                            Text("Add Subscription")
+                                .font(.caption)
+                        }
+                    }
+                    .buttonStyle(.borderless)
+                }
+            }
+        }
+    }
+
+    func colorForPercentage(_ percentage: Double) -> Color {
+        if percentage < 0.7 {
+            return .green
+        } else if percentage < 0.9 {
+            return .orange
+        } else {
+            return .red
+        }
+    }
+}
+
+// MARK: - Main Usage View
+
 struct UsageView: View {
     @ObservedObject var usageManager: UsageManager
-    @State private var sessionCookieInput: String = ""
-    @State private var showingCookieInput: Bool = false
+    @State private var showingSubscriptions: Bool = false
     @State private var showingSettings: Bool = false
 
     var body: some View {
@@ -818,165 +1210,100 @@ struct UsageView: View {
                 .font(.headline)
                 .padding(.bottom, 4)
 
-            if let error = usageManager.errorMessage {
-                Text(error)
-                    .font(.caption)
-                    .foregroundColor(.orange)
-                    .padding(.bottom, 8)
-            }
-
-            // Only show usage if data has been fetched
-            if !usageManager.hasFetchedData {
-                Text("👋 Welcome! Set your session cookie below to get started.")
+            // Empty state
+            if usageManager.subscriptions.isEmpty {
+                Text("Welcome! Add a subscription below to get started.")
                     .font(.subheadline)
                     .foregroundColor(.secondary)
                     .padding(.vertical, 8)
             }
-
-            // Session Usage
-            if usageManager.hasFetchedData {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text("Session (5 hour)")
+            // Single subscription — same look as original
+            else if usageManager.subscriptions.count == 1 {
+                let sub = usageManager.subscriptions[0]
+                if !sub.hasFetchedData && sub.errorMessage == nil && !sub.isLoading {
+                    Text("Welcome! Set your session cookie below to get started.")
                         .font(.subheadline)
-                    Spacer()
-                    if let resetTime = usageManager.sessionResetsAt {
-                        Text("Resets \(formatResetTime(resetTime))")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
+                        .foregroundColor(.secondary)
+                        .padding(.vertical, 8)
+                } else if sub.hasFetchedData {
+                    SubscriptionUsageView(subscription: sub)
+                } else if let error = sub.errorMessage {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                        .padding(.bottom, 8)
                 }
-
-                ProgressView(value: usageManager.sessionPercentage)
-                    .tint(colorForPercentage(usageManager.sessionPercentage))
-
-                Text("\(Int(usageManager.sessionPercentage * 100))% used")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-
-            // Weekly Usage
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text("Weekly (7 day)")
-                        .font(.subheadline)
-                    Spacer()
-                    if let resetTime = usageManager.weeklyResetsAt {
-                        Text("Resets \(formatResetTime(resetTime, includeDate: true))")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                }
-
-                ProgressView(value: usageManager.weeklyPercentage)
-                    .tint(colorForPercentage(usageManager.weeklyPercentage))
-
-                Text("\(Int(usageManager.weeklyPercentage * 100))% used")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-
-            // Weekly Sonnet Usage (only show if available)
-            if usageManager.hasWeeklySonnet && usageManager.hasFetchedData {
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text("Weekly Sonnet (7 day)")
-                            .font(.subheadline)
-                        Spacer()
-                        if let resetTime = usageManager.weeklySonnetResetsAt {
-                            Text("Resets \(formatResetTime(resetTime, includeDate: true))")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                    }
-
-                    ProgressView(value: usageManager.weeklySonnetPercentage)
-                        .tint(colorForPercentage(usageManager.weeklySonnetPercentage))
-
-                    Text("\(Int(usageManager.weeklySonnetPercentage * 100))% used")
+                if sub.isLoading {
+                    Text("Loading...")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
             }
-            }
-
-            if usageManager.hasFetchedData {
-            Divider()
-
-            HStack {
-                Text("Last updated: \(formatTime(usageManager.lastUpdated))")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                Spacer()
-                Button("Refresh") {
-                    usageManager.fetchUsage()
-                }
-                .buttonStyle(.borderless)
-                .font(.caption)
-            }
-            }
-
-            Button(showingCookieInput ? "Hide Cookie" : "Set Session Cookie") {
-                showingCookieInput.toggle()
-            }
-            .buttonStyle(.borderless)
-            .font(.caption)
-
-            if showingCookieInput {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("How to get your session cookie:")
-                        .font(.caption)
-                        .fontWeight(.semibold)
-
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("1. Go to Settings > Usage on claude.ai")
-                        Text("2. Press F12 (or Cmd+Option+I)")
-                        Text("3. Go to Network tab")
-                        Text("4. Refresh page, click 'usage' request")
-                        Text("5. Find 'Cookie' in Request Headers")
-                        Text("6. Copy full cookie value\n   (starts with anthropic-device-id=...)")
-                    }
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
-
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Paste full cookie string:")
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                        VStack(spacing: 4) {
-                            PasteableTextField(text: $sessionCookieInput, placeholder: "Paste cookie here...")
-                                .frame(height: 60)
-                                .cornerRadius(4)
-
-                            HStack(spacing: 8) {
-                                Button("Save Cookie & Fetch") {
-                                    NSLog("ClaudeUsage: Save clicked, input length: \(sessionCookieInput.count)")
-                                    if sessionCookieInput.isEmpty {
-                                        usageManager.errorMessage = "Cookie field is empty!"
-                                    } else {
-                                        usageManager.saveSessionCookie(sessionCookieInput)
-                                        usageManager.fetchUsage()
-                                        usageManager.errorMessage = "Cookie saved, fetching..."
-                                    }
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .controlSize(.small)
-
-                                if usageManager.hasFetchedData {
-                                    Button("Clear Cookie") {
-                                        sessionCookieInput = ""
-                                        usageManager.clearSessionCookie()
-                                    }
-                                    .buttonStyle(.bordered)
+            // Multiple subscriptions — collapsible sections
+            else {
+                ForEach(usageManager.subscriptions) { sub in
+                    DisclosureGroup {
+                        if sub.hasFetchedData {
+                            SubscriptionUsageView(subscription: sub)
+                                .padding(.top, 4)
+                        } else if sub.isLoading {
+                            Text("Loading...")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        } else if let error = sub.errorMessage {
+                            Text(error)
+                                .font(.caption)
+                                .foregroundColor(.orange)
+                        }
+                    } label: {
+                        HStack {
+                            Text(sub.name)
+                                .font(.subheadline)
+                                .fontWeight(.medium)
+                            Spacer()
+                            if sub.hasFetchedData {
+                                Text("\(Int(sub.sessionPercentage * 100))%")
+                                    .font(.caption)
+                                    .fontWeight(.medium)
+                                    .foregroundColor(colorForPercentage(sub.sessionPercentage))
+                            } else if sub.isLoading {
+                                ProgressView()
                                     .controlSize(.small)
-                                }
                             }
                         }
                     }
                 }
-                .padding(8)
-                .background(Color.secondary.opacity(0.1))
-                .cornerRadius(6)
+            }
+
+            // Last updated + refresh
+            if usageManager.hasFetchedData {
+                Divider()
+
+                HStack {
+                    Text("Last updated: \(formatTime(usageManager.lastUpdated))")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Spacer()
+                    Button("Refresh") {
+                        usageManager.fetchUsage()
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+                }
+            }
+
+            // Manage Subscriptions
+            Button(showingSubscriptions ? "Hide Subscriptions" : "Manage Subscriptions") {
+                showingSubscriptions.toggle()
+            }
+            .buttonStyle(.borderless)
+            .font(.caption)
+
+            if showingSubscriptions {
+                ManageSubscriptionsView(usageManager: usageManager)
+                    .padding(8)
+                    .background(Color.secondary.opacity(0.1))
+                    .cornerRadius(6)
             }
 
             // Support Section
@@ -1089,40 +1416,12 @@ struct UsageView: View {
         }
         .padding()
         .frame(width: 360)
-        .onAppear {
-            // Load saved cookie when view appears
-            if let savedCookie = UserDefaults.standard.string(forKey: "claude_session_cookie") {
-                sessionCookieInput = String(savedCookie.prefix(20)) + "..."
-            }
-            // Force refresh to ensure progress bars show colors
-            usageManager.updatePercentages()
-        }
-    }
-
-    func formatNumber(_ number: Int) -> String {
-        let formatter = NumberFormatter()
-        formatter.numberStyle = .decimal
-        return formatter.string(from: NSNumber(value: number)) ?? "\(number)"
     }
 
     func formatTime(_ date: Date) -> String {
         let formatter = DateFormatter()
         formatter.timeStyle = .short
         return formatter.string(from: date)
-    }
-
-    func formatResetTime(_ date: Date, includeDate: Bool = false) -> String {
-        let formatter = DateFormatter()
-
-        if includeDate {
-            // Format: "on 31 Jan 2026 at 7:59 AM"
-            formatter.dateFormat = "d MMM yyyy 'at' h:mm a"
-            return "on \(formatter.string(from: date))"
-        } else {
-            formatter.timeStyle = .short
-            formatter.dateStyle = .none
-            return "at \(formatter.string(from: date))"
-        }
     }
 
     func colorForPercentage(_ percentage: Double) -> Color {
@@ -1134,5 +1433,4 @@ struct UsageView: View {
             return .red
         }
     }
-
 }
