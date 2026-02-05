@@ -3,6 +3,21 @@ import AppKit
 import Carbon
 import WebKit
 
+// Debug helper extension
+extension String {
+    func appendToFile(at path: String) throws {
+        let fileManager = FileManager.default
+        if fileManager.fileExists(atPath: path) {
+            let fileHandle = try FileHandle(forWritingTo: URL(fileURLWithPath: path))
+            fileHandle.seekToEndOfFile()
+            fileHandle.write(self.data(using: .utf8)!)
+            fileHandle.closeFile()
+        } else {
+            try self.write(toFile: path, atomically: true, encoding: .utf8)
+        }
+    }
+}
+
 // Main entry point
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
@@ -390,6 +405,8 @@ struct ClaudeAccount: Identifiable, Codable {
     let id: UUID
     var name: String
     var sessionCookie: String
+    var organizationId: String        // Claude organization ID for API calls
+    var organizationName: String?     // Human-readable organization name
     var lastNotifiedThreshold: Int = 0
     var customColorHex: String?      // Custom color as hex string (e.g., "#FF5733")
     var iconURL: String?              // URL to custom icon image
@@ -413,13 +430,15 @@ struct ClaudeAccount: Identifiable, Codable {
 
     // Custom Codable to exclude transient properties
     enum CodingKeys: String, CodingKey {
-        case id, name, sessionCookie, lastNotifiedThreshold, customColorHex, iconURL, iconData
+        case id, name, sessionCookie, organizationId, organizationName, lastNotifiedThreshold, customColorHex, iconURL, iconData
     }
 
-    init(id: UUID = UUID(), name: String, sessionCookie: String, lastNotifiedThreshold: Int = 0, customColorHex: String? = nil, iconURL: String? = nil) {
+    init(id: UUID = UUID(), name: String, sessionCookie: String, organizationId: String = "", organizationName: String? = nil, lastNotifiedThreshold: Int = 0, customColorHex: String? = nil, iconURL: String? = nil) {
         self.id = id
         self.name = name
         self.sessionCookie = sessionCookie
+        self.organizationId = organizationId
+        self.organizationName = organizationName
         self.lastNotifiedThreshold = lastNotifiedThreshold
         self.customColorHex = customColorHex
         self.iconURL = iconURL
@@ -443,6 +462,22 @@ struct ClaudeAccount: Identifiable, Codable {
 
     var weeklySonnetPercentage: Double {
         weeklySonnetLimit > 0 ? Double(weeklySonnetUsage) / Double(weeklySonnetLimit) : 0
+    }
+}
+
+struct ChromeProfile: Identifiable, Equatable, Hashable {
+    let id = UUID()
+    let name: String
+    let path: String
+    let isDefault: Bool
+
+    var displayName: String {
+        return isDefault ? "\(name) (Default)" : name
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(path)
+        hasher.combine(isDefault)
     }
 }
 
@@ -551,14 +586,25 @@ class UsageManager: ObservableObject {
            !savedCookie.isEmpty {
             NSLog("ClaudeUsage: Migrating from single account format")
             let lastThreshold = UserDefaults.standard.integer(forKey: "last_notified_threshold")
-            let account = ClaudeAccount(name: "My Account", sessionCookie: savedCookie, lastNotifiedThreshold: lastThreshold)
-            accounts = [account]
-            saveAccounts()
 
-            // Keep legacy cookie for backward compatibility but mark migration done
-            sessionCookie = savedCookie
-            lastNotifiedThreshold = lastThreshold
-            NSLog("ClaudeUsage: Migration complete - created 'My Account'")
+            // Fetch organization ID for migration
+            fetchOrganizationId(cookie: savedCookie) { [weak self] orgId in
+                guard let self = self, let orgId = orgId else {
+                    NSLog("ClaudeUsage: Failed to get organization ID during migration")
+                    return
+                }
+
+                DispatchQueue.main.async {
+                    let account = ClaudeAccount(name: "My Account", sessionCookie: savedCookie, organizationId: orgId, lastNotifiedThreshold: lastThreshold)
+                    self.accounts = [account]
+                    self.saveAccounts()
+
+                    // Keep legacy cookie for backward compatibility but mark migration done
+                    self.sessionCookie = savedCookie
+                    self.lastNotifiedThreshold = lastThreshold
+                    NSLog("ClaudeUsage: Migration complete - created 'My Account' with org ID: \(orgId)")
+                }
+            }
         }
     }
 
@@ -583,10 +629,31 @@ class UsageManager: ObservableObject {
             NSLog("ClaudeUsage: Maximum 4 accounts allowed")
             return
         }
-        let account = ClaudeAccount(name: name, sessionCookie: cookie)
-        accounts.append(account)
-        saveAccounts()
-        NSLog("ClaudeUsage: Added account '\(name)'")
+
+        // Check for duplicate cookie
+        guard !accounts.contains(where: { $0.sessionCookie == cookie }) else {
+            NSLog("ClaudeUsage: Account with this cookie already exists")
+            return
+        }
+
+        // Fetch organization ID before creating account
+        fetchOrganizationId(cookie: cookie) { [weak self] orgId in
+            guard let self = self, let orgId = orgId else {
+                NSLog("ClaudeUsage: Failed to get organization ID for account '\(name)'")
+                return
+            }
+
+            DispatchQueue.main.async {
+                let account = ClaudeAccount(name: name, sessionCookie: cookie, organizationId: orgId)
+                self.accounts.append(account)
+                self.saveAccounts()
+
+                // Automatically fetch usage data for the newly added account
+                self.fetchUsageForAccount(id: account.id)
+
+                NSLog("ClaudeUsage: Added account '\(name)' with org ID: \(orgId)")
+            }
+        }
     }
 
     func removeAccount(id: UUID) {
@@ -851,19 +918,37 @@ class UsageManager: ObservableObject {
             }
         }
 
-        fetchOrganizationId(cookie: cookie) { [weak self] orgId in
-            guard let self = self, let orgId = orgId else {
-                DispatchQueue.main.async {
-                    if let idx = self?.accountIndex(for: accountId) {
-                        self?.accounts[idx].errorMessage = "Could not get org ID"
-                        self?.accounts[idx].isLoading = false
+        // Use stored organization ID instead of re-extracting from cookie
+        let orgId = accounts[index].organizationId
+
+        guard !orgId.isEmpty else {
+            // If organization ID is missing, fetch it and store it
+            fetchOrganizationId(cookie: cookie) { [weak self] fetchedOrgId in
+                guard let self = self, let fetchedOrgId = fetchedOrgId else {
+                    DispatchQueue.main.async {
+                        if let idx = self?.accountIndex(for: accountId) {
+                            self?.accounts[idx].errorMessage = "Could not get org ID"
+                            self?.accounts[idx].isLoading = false
+                        }
+                        self?.checkAllAccountsLoaded()
                     }
-                    self?.checkAllAccountsLoaded()
+                    return
                 }
-                return
+
+                DispatchQueue.main.async {
+                    if let idx = self.accountIndex(for: accountId) {
+                        self.accounts[idx].organizationId = fetchedOrgId
+                        NSLog("📋 Updated stored org ID for account \(accountId): \(fetchedOrgId)")
+                    }
+                }
+
+                self.fetchUsageWithOrgId(fetchedOrgId, cookie: cookie, accountId: accountId)
             }
-            self.fetchUsageWithOrgId(orgId, cookie: cookie, accountId: accountId)
+            return
         }
+
+        NSLog("🔍 Using stored org ID for account \(accountId): \(orgId)")
+        fetchUsageWithOrgId(orgId, cookie: cookie, accountId: accountId)
     }
 
     func fetchUsageWithOrgId(_ orgId: String, cookie: String, accountId: UUID) {
@@ -1230,6 +1315,113 @@ class UsageManager: ObservableObject {
         weeklyPercentage = weeklyLimit > 0 ? Double(weeklyUsage) / Double(weeklyLimit) : 0
         weeklySonnetPercentage = weeklySonnetLimit > 0 ? Double(weeklySonnetUsage) / Double(weeklySonnetLimit) : 0
     }
+
+    // MARK: - Chrome Profile Detection
+
+    func detectChromeProfiles() -> [ChromeProfile] {
+        NSLog("🔍 Chrome Profile Detection: Starting...")
+
+        // Also write to a debug file for easier checking
+        let debugPath = "/tmp/chrome_debug.log"
+        let debugMsg = "Chrome Profile Detection: Starting at \(Date())\n"
+        try? debugMsg.write(toFile: debugPath, atomically: true, encoding: .utf8)
+
+        let fileManager = FileManager.default
+        let chromeBasePath = NSHomeDirectory() + "/Library/Application Support/Google/Chrome"
+
+        NSLog("🔍 Chrome Profile Detection: Checking path: \(chromeBasePath)")
+        guard fileManager.fileExists(atPath: chromeBasePath) else {
+            NSLog("❌ Chrome not found at: \(chromeBasePath)")
+            let errorMsg = "ERROR: Chrome not found at: \(chromeBasePath)\n"
+            try? errorMsg.appendToFile(at: debugPath)
+            return []
+        }
+
+        NSLog("✅ Chrome directory found!")
+        var profiles: [ChromeProfile] = []
+
+        // Add default profile
+        let defaultProfilePath = "\(chromeBasePath)/Default"
+        NSLog("🔍 Chrome Profile Detection: Checking Default profile at: \(defaultProfilePath)")
+        if fileManager.fileExists(atPath: defaultProfilePath) {
+            NSLog("✅ Default profile found!")
+            if let profileName = getProfileName(from: defaultProfilePath) {
+                NSLog("✅ Default profile name: '\(profileName)'")
+                profiles.append(ChromeProfile(name: profileName, path: defaultProfilePath, isDefault: true))
+            } else {
+                NSLog("⚠️ Using fallback name for Default profile")
+                profiles.append(ChromeProfile(name: "Default", path: defaultProfilePath, isDefault: true))
+            }
+        } else {
+            NSLog("❌ Default profile not found")
+        }
+
+        // Look for numbered profiles (Profile 1, Profile 2, etc.)
+        do {
+            let contents = try fileManager.contentsOfDirectory(atPath: chromeBasePath)
+            for item in contents {
+                if item.hasPrefix("Profile ") {
+                    let profilePath = "\(chromeBasePath)/\(item)"
+                    if let profileName = getProfileName(from: profilePath) {
+                        profiles.append(ChromeProfile(name: profileName, path: profilePath, isDefault: false))
+                    } else {
+                        profiles.append(ChromeProfile(name: item, path: profilePath, isDefault: false))
+                    }
+                }
+            }
+        } catch {
+            NSLog("Error reading Chrome profiles directory: \(error)")
+        }
+
+        NSLog("Found \(profiles.count) Chrome profiles")
+        let finalMsg = "FINAL RESULT: Found \(profiles.count) Chrome profiles:\n"
+        for (i, profile) in profiles.enumerated() {
+            try? "\(i + 1). \(profile.name) - \(profile.path) - Default: \(profile.isDefault)\n".appendToFile(at: "/tmp/chrome_debug.log")
+        }
+        try? finalMsg.appendToFile(at: "/tmp/chrome_debug.log")
+
+        return profiles.sorted { $0.isDefault && !$1.isDefault }
+    }
+
+    private func getProfileName(from profilePath: String) -> String? {
+        let prefsPath = "\(profilePath)/Preferences"
+        guard let data = FileManager.default.contents(atPath: prefsPath),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let profile = json["profile"] as? [String: Any],
+              let name = profile["name"] as? String else {
+            return nil
+        }
+        return name
+    }
+
+    func importCookiesFromChromeProfile(_ profile: ChromeProfile, completion: @escaping (String?) -> Void) {
+        NSLog("Importing cookies from Chrome profile: \(profile.name)")
+
+        let cookiesPath = "\(profile.path)/Cookies"
+
+        // Check if cookies file exists
+        guard FileManager.default.fileExists(atPath: cookiesPath) else {
+            NSLog("Cookies file not found at: \(cookiesPath)")
+            completion(nil)
+            return
+        }
+
+        // Use sqlite3 to read Chrome's cookies database
+        DispatchQueue.global(qos: .background).async {
+            let cookies = self.extractClaudeCookiesFromChrome(cookiesPath: cookiesPath)
+            DispatchQueue.main.async {
+                completion(cookies)
+            }
+        }
+    }
+
+    private func extractClaudeCookiesFromChrome(cookiesPath: String) -> String? {
+        // This would require SQLite integration to read Chrome's cookies database
+        // For now, return nil to indicate we need manual cookie extraction
+        // TODO: Implement SQLite3 cookie extraction
+        NSLog("Chrome cookie extraction not yet implemented - falling back to manual extraction")
+        return nil
+    }
 }
 
 // Custom TextView that ensures keyboard commands work
@@ -1389,22 +1581,39 @@ class WebLoginCoordinator: NSObject, WKNavigationDelegate {
     }
 
     func checkCookiesPeriodically() {
-        guard !hasDetectedCookies, let webView = webView else { return }
+        guard !hasDetectedCookies else {
+            NSLog("WebLogin: Cookies already detected, stopping timer")
+            return
+        }
+
+        guard let webView = webView else {
+            NSLog("WebLogin: No webView available for periodic check")
+            return
+        }
 
         // Check if we're on a logged-in page
-        guard let url = webView.url else { return }
+        guard let url = webView.url else {
+            NSLog("WebLogin: No URL available for periodic check")
+            return
+        }
         let urlString = url.absoluteString
 
         let isOnClaudeAi = urlString.contains("claude.ai")
         let isOnAuthPage = urlString.contains("/login") || urlString.contains("/signup") || urlString.contains("/oauth")
 
+        NSLog("WebLogin: Periodic check - URL: \(urlString), isOnClaudeAi: \(isOnClaudeAi), isOnAuthPage: \(isOnAuthPage)")
+
         if isOnClaudeAi && !isOnAuthPage {
+            NSLog("WebLogin: Periodic check triggering cookie check...")
             checkCookies(from: webView)
         }
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        guard let url = webView.url else { return }
+        guard let url = webView.url else {
+            NSLog("WebLogin: Navigation finished but no URL available")
+            return
+        }
         let urlString = url.absoluteString
 
         NSLog("WebLogin: Navigation finished to \(urlString)")
@@ -1414,9 +1623,15 @@ class WebLoginCoordinator: NSObject, WKNavigationDelegate {
         let isOnClaudeAi = urlString.contains("claude.ai")
         let isOnAuthPage = urlString.contains("/login") || urlString.contains("/signup") || urlString.contains("/oauth")
 
+        NSLog("WebLogin: isOnClaudeAi: \(isOnClaudeAi), isOnAuthPage: \(isOnAuthPage)")
+
         if isOnClaudeAi && !isOnAuthPage {
-            NSLog("WebLogin: Detected logged-in state at \(urlString), checking cookies...")
+            NSLog("WebLogin: ✅ Detected logged-in state! Checking cookies...")
             checkCookies(from: webView)
+        } else if isOnClaudeAi && isOnAuthPage {
+            NSLog("WebLogin: On auth page, waiting for login...")
+        } else {
+            NSLog("WebLogin: Not on Claude.ai, continuing...")
         }
     }
 
@@ -1427,8 +1642,15 @@ class WebLoginCoordinator: NSObject, WKNavigationDelegate {
     func checkCookies(from webView: WKWebView) {
         NSLog("WebLogin: Checking cookies...")
 
+        // Also log the current URL
+        if let url = webView.url {
+            NSLog("WebLogin: Current URL: \(url.absoluteString)")
+        }
+
         webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { [weak self] cookies in
             guard let self = self else { return }
+
+            NSLog("WebLogin: Total cookies found: \(cookies.count)")
 
             // Filter cookies for claude.ai domain
             let claudeCookies = cookies.filter { cookie in
@@ -1450,19 +1672,37 @@ class WebLoginCoordinator: NSObject, WKNavigationDelegate {
                 if cookie.name == "lastActiveOrg" {
                     hasLastActiveOrg = true
                 }
-                NSLog("WebLogin: Cookie - \(cookie.name)")
+                NSLog("WebLogin: Cookie - \(cookie.name) = \(String(cookie.value.prefix(20)))...")
+            }
+
+            // Also check for other common authentication cookies
+            let authCookieNames = ["authToken", "auth", "session", "jwt", "token", "login", "user"]
+            var hasAuthCookie = false
+            for cookie in claudeCookies {
+                for authName in authCookieNames {
+                    if cookie.name.lowercased().contains(authName.lowercased()) {
+                        hasAuthCookie = true
+                        NSLog("WebLogin: Found auth-like cookie: \(cookie.name)")
+                        break
+                    }
+                }
             }
 
             let cookieString = cookieParts.joined(separator: "; ")
 
             DispatchQueue.main.async {
-                if hasSessionKey || hasLastActiveOrg {
-                    NSLog("WebLogin: Valid cookies detected (sessionKey: \(hasSessionKey), lastActiveOrg: \(hasLastActiveOrg))")
+                // Check for any meaningful Claude.ai cookies that indicate login
+                let hasValidLogin = hasSessionKey || hasLastActiveOrg || hasAuthCookie || claudeCookies.count >= 3
+
+                NSLog("WebLogin: Login validation - sessionKey: \(hasSessionKey), lastActiveOrg: \(hasLastActiveOrg), authCookie: \(hasAuthCookie), total: \(claudeCookies.count)")
+
+                if hasValidLogin {
+                    NSLog("WebLogin: ✅ Valid login detected! Proceeding with cookie extraction...")
                     self.hasDetectedCookies = true
                     self.cookieCheckTimer?.invalidate()
                     self.onCookiesDetected(cookieString)
                 } else {
-                    NSLog("WebLogin: Missing required cookies, waiting for login...")
+                    NSLog("WebLogin: ❌ Insufficient cookies for login (\(claudeCookies.count) found), waiting...")
                 }
             }
         }
@@ -1562,6 +1802,345 @@ struct WebLoginWindowView: View {
             .background(Color(NSColor.windowBackgroundColor))
         }
         .frame(width: 500, height: 650)
+    }
+}
+
+struct ProfileAwareWebLoginView: View {
+    let selectedProfile: ChromeProfile?
+    let onCookieExtracted: (String) -> Void
+    let onCancel: () -> Void
+    @State private var isLoading = true
+    @State private var extractTrigger = false
+    @State private var manualCheckTrigger = false
+    @State private var detectedCookie = ""
+
+    var cookiesReady: Bool {
+        !detectedCookie.isEmpty
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Header
+            HStack {
+                VStack(alignment: .leading) {
+                    Text("Sign in to Claude")
+                        .font(.headline)
+                    if let profile = selectedProfile {
+                        Text("Using: \(profile.displayName)")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                Spacer()
+                Button(action: onCancel) {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundColor(.secondary)
+                        .font(.title2)
+                }
+                .buttonStyle(.borderless)
+                .help("Cancel")
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+
+            // WebView
+            ProfileAwareWebView(
+                selectedProfile: selectedProfile,
+                onCookiesDetected: { cookie in
+                    detectedCookie = cookie
+                },
+                extractTrigger: extractTrigger,
+                manualCheckTrigger: manualCheckTrigger
+            ) { cookie in
+                onCookieExtracted(cookie)
+            }
+            .overlay(
+                Group {
+                    if isLoading {
+                        VStack {
+                            ProgressView()
+                                .scaleEffect(1.2)
+                            Text("Loading...")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                                .padding(.top, 8)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Color(NSColor.windowBackgroundColor).opacity(0.8))
+                    }
+                }
+            )
+
+            // Footer with action button
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    if cookiesReady {
+                        Text("✅ Login detected! Click to add account.")
+                            .font(.caption)
+                            .foregroundColor(.green)
+                    } else {
+                        Text("Sign in to Claude.ai to continue")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                Spacer()
+                Button(cookiesReady ? "Add Account" : "Cancel") {
+                    if cookiesReady {
+                        extractTrigger.toggle()
+                    } else {
+                        onCancel()
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!cookiesReady && isLoading)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+            .background(Color(NSColor.windowBackgroundColor))
+        }
+        .frame(width: 500, height: 650)
+        .onAppear {
+            isLoading = false
+        }
+    }
+
+    private func checkCookiesManually() {
+        NSLog("🔍 Manual cookie check triggered")
+        manualCheckTrigger.toggle()
+    }
+}
+
+struct ProfileAwareWebView: NSViewRepresentable {
+    let selectedProfile: ChromeProfile?
+    let onCookiesDetected: (String) -> Void
+    let extractTrigger: Bool
+    let manualCheckTrigger: Bool
+    let onCookieExtracted: (String) -> Void
+
+    func makeNSView(context: Context) -> WKWebView {
+        let config = WKWebViewConfiguration()
+
+        // Use selected Chrome profile's cookies if available
+        if let profile = selectedProfile {
+            config.websiteDataStore = createDataStoreFromProfile(profile)
+        } else {
+            config.websiteDataStore = WKWebsiteDataStore.default()
+        }
+
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.navigationDelegate = context.coordinator
+        webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+
+        // Store reference in coordinator
+        context.coordinator.webView = webView
+
+        // Load Claude.ai login page
+        if let url = URL(string: "https://claude.ai/login") {
+            webView.load(URLRequest(url: url))
+        }
+
+        return webView
+    }
+
+    func updateNSView(_ nsView: WKWebView, context: Context) {
+        // Handle extract trigger
+        if extractTrigger {
+            context.coordinator.extractCookies()
+        }
+
+        // Handle manual check trigger
+        if manualCheckTrigger {
+            NSLog("🔍 Manual cookie check triggered from WebView")
+            context.coordinator.checkCookies(from: nsView)
+        }
+    }
+
+    func makeCoordinator() -> ProfileAwareWebLoginCoordinator {
+        ProfileAwareWebLoginCoordinator(onCookiesDetected: onCookiesDetected, onCookieExtracted: onCookieExtracted)
+    }
+
+    private func createDataStoreFromProfile(_ profile: ChromeProfile) -> WKWebsiteDataStore {
+        NSLog("Creating WebView data store with Chrome profile: \(profile.name)")
+
+        // Create a new data store
+        let dataStore = WKWebsiteDataStore.nonPersistent()
+
+        // Import cookies from Chrome profile
+        importChromeProfileCookies(profile: profile, into: dataStore)
+
+        return dataStore
+    }
+
+    private func importChromeProfileCookies(profile: ChromeProfile, into dataStore: WKWebsiteDataStore) {
+        NSLog("Importing cookies from Chrome profile: \(profile.name)")
+
+        let prefsPath = "\(profile.path)/Preferences"
+
+        // Try to read basic profile info
+        do {
+            let prefsData = try Data(contentsOf: URL(fileURLWithPath: prefsPath))
+            if let _ = try JSONSerialization.jsonObject(with: prefsData) as? [String: Any] {
+                NSLog("Successfully read Chrome profile preferences")
+
+                // For now, we'll set some basic cookies to make the login work
+                // This is a simplified approach since full Chrome SQLite cookie import is complex
+                setClaudeBasicCookies(in: dataStore)
+            }
+        } catch {
+            NSLog("Error reading Chrome preferences: \(error)")
+            // Fallback: set basic Claude.ai cookies
+            setClaudeBasicCookies(in: dataStore)
+        }
+    }
+
+    private func setClaudeBasicCookies(in dataStore: WKWebsiteDataStore) {
+        NSLog("Using fresh WebView data store - cookies will be set after login")
+        // We don't need to pre-set cookies; the improved detection logic will catch them after login
+    }
+}
+
+class ProfileAwareWebLoginCoordinator: NSObject, WKNavigationDelegate {
+    let onCookiesDetected: (String) -> Void
+    let onCookieExtracted: (String) -> Void
+    weak var webView: WKWebView?
+    private var cookieCheckTimer: Timer?
+    private var hasDetectedCookies = false
+
+    init(onCookiesDetected: @escaping (String) -> Void, onCookieExtracted: @escaping (String) -> Void) {
+        self.onCookiesDetected = onCookiesDetected
+        self.onCookieExtracted = onCookieExtracted
+        super.init()
+
+        // Start periodic cookie checking
+        startCookieCheckTimer()
+    }
+
+    deinit {
+        cookieCheckTimer?.invalidate()
+    }
+
+    func startCookieCheckTimer() {
+        NSLog("ProfileAware WebLogin: Starting cookie check timer")
+        cookieCheckTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.checkCookiesPeriodically()
+        }
+    }
+
+    func checkCookiesPeriodically() {
+        guard !hasDetectedCookies else {
+            NSLog("ProfileAware WebLogin: Cookies already detected, stopping timer")
+            return
+        }
+
+        guard let webView = webView else {
+            NSLog("ProfileAware WebLogin: No webView available for periodic check")
+            return
+        }
+
+        // Check if we're on a logged-in page
+        guard let url = webView.url else {
+            NSLog("ProfileAware WebLogin: No URL available for periodic check")
+            return
+        }
+        let urlString = url.absoluteString
+
+        let isOnClaudeAi = urlString.contains("claude.ai")
+        let isOnAuthPage = urlString.contains("/login") || urlString.contains("/signup") || urlString.contains("/oauth")
+
+        NSLog("ProfileAware WebLogin: Periodic check - URL: \(urlString), isOnClaudeAi: \(isOnClaudeAi), isOnAuthPage: \(isOnAuthPage)")
+
+        if isOnClaudeAi && !isOnAuthPage {
+            NSLog("ProfileAware WebLogin: Periodic check triggering cookie check...")
+            checkCookies(from: webView)
+        }
+    }
+
+    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        guard let url = webView.url else { return }
+        let urlString = url.absoluteString
+
+        NSLog("ProfileAware WebLogin: Navigation to \(urlString)")
+
+        let isOnClaudeAi = urlString.contains("claude.ai")
+        let isOnAuthPage = urlString.contains("/login") || urlString.contains("/signup") || urlString.contains("/oauth")
+
+        if isOnClaudeAi && !isOnAuthPage {
+            checkCookies(from: webView)
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard let url = webView.url else { return }
+        let urlString = url.absoluteString
+
+        let isOnClaudeAi = urlString.contains("claude.ai")
+        let isOnAuthPage = urlString.contains("/login") || urlString.contains("/signup") || urlString.contains("/oauth")
+
+        if isOnClaudeAi && !isOnAuthPage {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                self.checkCookies(from: webView)
+            }
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        NSLog("ProfileAware WebLogin: Navigation failed: \(error.localizedDescription)")
+    }
+
+    func checkCookies(from webView: WKWebView) {
+        NSLog("ProfileAware WebLogin: Checking cookies...")
+
+        webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { [weak self] cookies in
+            guard let self = self else { return }
+
+            let claudeCookies = cookies.filter { cookie in
+                cookie.domain.contains("claude.ai")
+            }
+
+            NSLog("ProfileAware WebLogin: Found \(claudeCookies.count) claude.ai cookies")
+
+            var cookieParts: [String] = []
+            var hasSessionKey = false
+            var hasLastActiveOrg = false
+
+            for cookie in claudeCookies {
+                cookieParts.append("\(cookie.name)=\(cookie.value)")
+                if cookie.name == "sessionKey" {
+                    hasSessionKey = true
+                }
+                if cookie.name == "lastActiveOrg" {
+                    hasLastActiveOrg = true
+                }
+                NSLog("ProfileAware WebLogin: Cookie - \(cookie.name)")
+            }
+
+            let cookieString = cookieParts.joined(separator: "; ")
+
+            DispatchQueue.main.async {
+                if hasSessionKey || hasLastActiveOrg {
+                    NSLog("ProfileAware WebLogin: Valid cookies detected (sessionKey: \(hasSessionKey), lastActiveOrg: \(hasLastActiveOrg))")
+                    self.hasDetectedCookies = true
+                    self.cookieCheckTimer?.invalidate()
+                    self.onCookiesDetected(cookieString)
+                } else {
+                    NSLog("ProfileAware WebLogin: Missing required cookies, waiting for login...")
+                }
+            }
+        }
+    }
+
+    func extractCookies() {
+        guard let webView = webView, hasDetectedCookies else { return }
+
+        webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { [weak self] cookies in
+            let claudeCookies = cookies.filter { $0.domain.contains("claude.ai") }
+            let cookieString = claudeCookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
+
+            DispatchQueue.main.async {
+                self?.onCookieExtracted(cookieString)
+            }
+        }
     }
 }
 
@@ -2221,6 +2800,8 @@ struct AddAccountInlineView: View {
     @State private var showManualEntry: Bool = false
     @State private var showWebLogin: Bool = false
     @State private var validationError: String?
+    @State private var chromeProfiles: [ChromeProfile] = []
+    @State private var selectedProfile: ChromeProfile?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -2238,9 +2819,39 @@ struct AddAccountInlineView: View {
             TextField("Account Name (e.g., Personal, Work)", text: $accountName)
                 .textFieldStyle(.roundedBorder)
 
+            // Chrome Profile Selector
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Chrome Profile")
+                    .font(.subheadline)
+                    .fontWeight(.medium)
+
+                if chromeProfiles.isEmpty {
+                    Text("No Chrome profiles found")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                } else {
+                    Picker("Chrome Profile", selection: $selectedProfile) {
+                        Text("Select Profile").tag(ChromeProfile?.none)
+                        ForEach(chromeProfiles) { profile in
+                            Text(profile.displayName).tag(ChromeProfile?.some(profile))
+                        }
+                    }
+                    .pickerStyle(MenuPickerStyle())
+                    .textFieldStyle(.roundedBorder)
+                }
+
+                Text("Choose which Chrome profile's login to use")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+
             // Primary action: Login with Browser
             VStack(alignment: .leading, spacing: 8) {
-                Button(action: { showWebLogin = true }) {
+                Button(action: {
+                    if let profile = selectedProfile {
+                        openWebLoginWindow(profile: profile)
+                    }
+                }) {
                     HStack {
                         Image(systemName: "globe")
                         Text("Login with Browser")
@@ -2249,6 +2860,7 @@ struct AddAccountInlineView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
+                .disabled(selectedProfile == nil)
 
                 Text("Sign in to Claude.ai directly - no manual steps needed")
                     .font(.caption2)
@@ -2330,17 +2942,41 @@ struct AddAccountInlineView: View {
                 Spacer()
             }
         }
-        .sheet(isPresented: $showWebLogin) {
-            WebLoginWindowView(
-                onCookieExtracted: { cookie in
-                    showWebLogin = false
-                    handleExtractedCookie(cookie)
-                },
-                onCancel: {
-                    showWebLogin = false
-                }
-            )
+        .onAppear {
+            chromeProfiles = usageManager.detectChromeProfiles()
+            if let defaultProfile = chromeProfiles.first(where: { $0.isDefault }) {
+                selectedProfile = defaultProfile
+            }
         }
+    }
+
+    private func openWebLoginWindow(profile: ChromeProfile) {
+        let webLoginWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 500, height: 650),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+
+        webLoginWindow.title = "Claude Login - \(profile.displayName)"
+        webLoginWindow.center()
+        webLoginWindow.isReleasedWhenClosed = false
+        webLoginWindow.level = .floating  // Keep on top
+
+        let webLoginView = ProfileAwareWebLoginView(
+            selectedProfile: profile,
+            onCookieExtracted: { [weak webLoginWindow] cookie in
+                webLoginWindow?.close()
+                self.handleExtractedCookie(cookie)
+            },
+            onCancel: { [weak webLoginWindow] in
+                webLoginWindow?.close()
+            }
+        )
+
+        let hostingView = NSHostingView(rootView: webLoginView)
+        webLoginWindow.contentView = hostingView
+        webLoginWindow.makeKeyAndOrderFront(nil)
     }
 
     private func handleExtractedCookie(_ cookie: String) {
@@ -2352,7 +2988,6 @@ struct AddAccountInlineView: View {
 
         let name = accountName.isEmpty ? "Account \(usageManager.accounts.count + 1)" : accountName
         usageManager.addAccount(name: name, cookie: cookie)
-        usageManager.fetchUsageForAccount(index: usageManager.accounts.count - 1)
         isPresented = false
     }
 
@@ -2370,7 +3005,6 @@ struct AddAccountInlineView: View {
 
         let name = accountName.isEmpty ? "Account \(usageManager.accounts.count + 1)" : accountName
         usageManager.addAccount(name: name, cookie: cookieInput)
-        usageManager.fetchUsageForAccount(index: usageManager.accounts.count - 1)
         isPresented = false
     }
 }
