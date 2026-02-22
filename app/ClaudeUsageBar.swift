@@ -7,8 +7,9 @@ import Security
 struct KeychainHelper {
     private static let service = "com.claude.usagebar"
 
-    static func save(_ value: String, forKey key: String) {
-        guard let data = value.data(using: .utf8) else { return }
+    @discardableResult
+    static func save(_ value: String, forKey key: String) -> Bool {
+        guard let data = value.data(using: .utf8) else { return false }
 
         let query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
@@ -25,11 +26,14 @@ struct KeychainHelper {
             if addStatus != errSecSuccess {
                 let addDesc = SecCopyErrorMessageString(addStatus, nil) as String? ?? "unknown"
                 NSLog("ClaudeUsage: Keychain add failed for key '\(key)': \(addStatus) – \(addDesc)")
+                return false
             }
         } else if updateStatus != errSecSuccess {
             let updateDesc = SecCopyErrorMessageString(updateStatus, nil) as String? ?? "unknown"
             NSLog("ClaudeUsage: Keychain update failed for key '\(key)': \(updateStatus) – \(updateDesc)")
+            return false
         }
+        return true
     }
 
     static func load(forKey key: String) -> String? {
@@ -397,10 +401,13 @@ class UsageManager: ObservableObject {
         } else if let legacyCookie = UserDefaults.standard.string(forKey: "claude_session_cookie") {
             // Migrate from UserDefaults to Keychain on first launch after update
             NSLog("ClaudeUsage: Migrating cookie from UserDefaults to Keychain")
-            KeychainHelper.save(legacyCookie, forKey: "session_cookie")
-            UserDefaults.standard.removeObject(forKey: "claude_session_cookie")
-            UserDefaults.standard.synchronize()
-            sessionCookie = legacyCookie
+            if KeychainHelper.save(legacyCookie, forKey: "session_cookie") {
+                UserDefaults.standard.removeObject(forKey: "claude_session_cookie")
+                sessionCookie = legacyCookie
+            } else {
+                NSLog("ClaudeUsage: Migration failed — cookie retained in UserDefaults")
+                sessionCookie = legacyCookie
+            }
         }
     }
 
@@ -431,8 +438,9 @@ class UsageManager: ObservableObject {
     func saveSessionCookie(_ cookie: String) {
         NSLog("ClaudeUsage: Saving cookie, length: \(cookie.count)")
         sessionCookie = cookie
-        KeychainHelper.save(cookie, forKey: "session_cookie")
-        NSLog("ClaudeUsage: Cookie saved to Keychain successfully")
+        if KeychainHelper.save(cookie, forKey: "session_cookie") {
+            NSLog("ClaudeUsage: Cookie saved to Keychain successfully")
+        }
     }
 
     func clearSessionCookie() {
