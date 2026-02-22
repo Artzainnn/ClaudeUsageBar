@@ -1154,8 +1154,8 @@ struct UsageView: View {
         .padding()
         .frame(width: 360)
         .onAppear {
-            // Load saved cookie when view appears
-            if let savedCookie = UserDefaults.standard.string(forKey: "claude_session_cookie") {
+            // Show hint text if a cookie is already saved
+            if let savedCookie = KeychainHelper.load(forKey: "session_cookie") {
                 sessionCookieInput = String(savedCookie.prefix(20)) + "..."
             }
             // Force refresh to ensure progress bars show colors
