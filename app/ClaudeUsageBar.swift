@@ -2,6 +2,56 @@ import SwiftUI
 import AppKit
 import WebKit
 import Carbon
+import Security
+
+struct KeychainHelper {
+    private static let service = "com.claude.usagebar"
+
+    static func save(_ value: String, forKey key: String) {
+        guard let data = value.data(using: .utf8) else { return }
+
+        // Try updating an existing item first
+        let query: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: service,
+            kSecAttrAccount: key
+        ]
+        let attributes: [CFString: Any] = [kSecValueData: data]
+        let updateStatus = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+
+        if updateStatus == errSecItemNotFound {
+            // Item doesn't exist yet — add it
+            var addQuery = query
+            addQuery[kSecValueData] = data
+            SecItemAdd(addQuery as CFDictionary, nil)
+        }
+    }
+
+    static func load(forKey key: String) -> String? {
+        let query: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: service,
+            kSecAttrAccount: key,
+            kSecReturnData: true,
+            kSecMatchLimit: kSecMatchLimitOne
+        ]
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess,
+              let data = result as? Data,
+              let value = String(data: data, encoding: .utf8) else { return nil }
+        return value
+    }
+
+    static func delete(forKey key: String) {
+        let query: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: service,
+            kSecAttrAccount: key
+        ]
+        SecItemDelete(query as CFDictionary)
+    }
+}
 
 // Main entry point
 class AppDelegate: NSObject, NSApplicationDelegate {
