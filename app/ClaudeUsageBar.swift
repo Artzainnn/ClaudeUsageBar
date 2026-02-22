@@ -23,10 +23,12 @@ struct KeychainHelper {
             addQuery[kSecValueData] = data
             let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
             if addStatus != errSecSuccess {
-                NSLog("ClaudeUsage: Keychain add failed for key '\(key)': \(addStatus)")
+                let addDesc = SecCopyErrorMessageString(addStatus, nil) as String? ?? "unknown"
+                NSLog("ClaudeUsage: Keychain add failed for key '\(key)': \(addStatus) – \(addDesc)")
             }
         } else if updateStatus != errSecSuccess {
-            NSLog("ClaudeUsage: Keychain update failed for key '\(key)': \(updateStatus)")
+            let updateDesc = SecCopyErrorMessageString(updateStatus, nil) as String? ?? "unknown"
+            NSLog("ClaudeUsage: Keychain update failed for key '\(key)': \(updateStatus) – \(updateDesc)")
         }
     }
 
@@ -54,7 +56,8 @@ struct KeychainHelper {
         ]
         let status = SecItemDelete(query as CFDictionary)
         if status != errSecSuccess && status != errSecItemNotFound {
-            NSLog("ClaudeUsage: Keychain delete failed for key '\(key)': \(status)")
+            let deleteDesc = SecCopyErrorMessageString(status, nil) as String? ?? "unknown"
+            NSLog("ClaudeUsage: Keychain delete failed for key '\(key)': \(status) – \(deleteDesc)")
         }
     }
 }
