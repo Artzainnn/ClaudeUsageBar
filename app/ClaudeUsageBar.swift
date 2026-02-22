@@ -392,8 +392,15 @@ class UsageManager: ObservableObject {
     }
 
     func loadSessionCookie() {
-        if let savedCookie = UserDefaults.standard.string(forKey: "claude_session_cookie") {
-            sessionCookie = savedCookie
+        if let cookie = KeychainHelper.load(forKey: "session_cookie") {
+            sessionCookie = cookie
+        } else if let legacyCookie = UserDefaults.standard.string(forKey: "claude_session_cookie") {
+            // Migrate from UserDefaults to Keychain on first launch after update
+            NSLog("ClaudeUsage: Migrating cookie from UserDefaults to Keychain")
+            KeychainHelper.save(legacyCookie, forKey: "session_cookie")
+            UserDefaults.standard.removeObject(forKey: "claude_session_cookie")
+            UserDefaults.standard.synchronize()
+            sessionCookie = legacyCookie
         }
     }
 
@@ -424,16 +431,14 @@ class UsageManager: ObservableObject {
     func saveSessionCookie(_ cookie: String) {
         NSLog("ClaudeUsage: Saving cookie, length: \(cookie.count)")
         sessionCookie = cookie
-        UserDefaults.standard.set(cookie, forKey: "claude_session_cookie")
-        UserDefaults.standard.synchronize()
-        NSLog("ClaudeUsage: Cookie saved successfully")
+        KeychainHelper.save(cookie, forKey: "session_cookie")
+        NSLog("ClaudeUsage: Cookie saved to Keychain successfully")
     }
 
     func clearSessionCookie() {
         NSLog("ClaudeUsage: Clearing cookie")
         sessionCookie = ""
-        UserDefaults.standard.removeObject(forKey: "claude_session_cookie")
-        UserDefaults.standard.synchronize()
+        KeychainHelper.delete(forKey: "session_cookie")
 
         // Reset all data
         sessionUsage = 0
