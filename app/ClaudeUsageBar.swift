@@ -10,7 +10,6 @@ struct KeychainHelper {
     static func save(_ value: String, forKey key: String) {
         guard let data = value.data(using: .utf8) else { return }
 
-        // Try updating an existing item first
         let query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
@@ -20,10 +19,14 @@ struct KeychainHelper {
         let updateStatus = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
 
         if updateStatus == errSecItemNotFound {
-            // Item doesn't exist yet — add it
             var addQuery = query
             addQuery[kSecValueData] = data
-            SecItemAdd(addQuery as CFDictionary, nil)
+            let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+            if addStatus != errSecSuccess {
+                NSLog("ClaudeUsage: Keychain add failed for key '\(key)': \(addStatus)")
+            }
+        } else if updateStatus != errSecSuccess {
+            NSLog("ClaudeUsage: Keychain update failed for key '\(key)': \(updateStatus)")
         }
     }
 
@@ -49,7 +52,10 @@ struct KeychainHelper {
             kSecAttrService: service,
             kSecAttrAccount: key
         ]
-        SecItemDelete(query as CFDictionary)
+        let status = SecItemDelete(query as CFDictionary)
+        if status != errSecSuccess && status != errSecItemNotFound {
+            NSLog("ClaudeUsage: Keychain delete failed for key '\(key)': \(status)")
+        }
     }
 }
 
