@@ -20,7 +20,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         if let button = statusItem.button {
             // Create Claude logo as initial icon
-            updateStatusIcon(percentage: 0)
+            updateStatusIcon(sessionPercent: 0, weeklyPercent: 0, showWeekly: false)
             button.action = #selector(handleClick)
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
             button.target = self
@@ -35,9 +35,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Create popover
         popover = NSPopover()
-        popover.contentSize = NSSize(width: 320, height: 260)
         popover.behavior = .transient
-        popover.contentViewController = NSHostingController(rootView: UsageView(usageManager: usageManager))
+        let hostingController = NSHostingController(rootView: UsageView(usageManager: usageManager))
+        if #available(macOS 13.0, *) {
+            hostingController.sizingOptions = .preferredContentSize
+        }
+        popover.contentViewController = hostingController
 
         // Fetch initial data
         usageManager.fetchUsage()
@@ -194,6 +197,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
 
+            // Activate app and make popover key window to get proper tint colors
+            NSApp.activate(ignoringOtherApps: true)
+            popover.contentViewController?.view.window?.makeKey()
+
             // Add event monitor to detect clicks outside the popover
             eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
                 if self?.popover.isShown == true {
@@ -206,21 +213,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func closePopover() {
         popover.performClose(nil)
 
-        // Remove event monitor
         if let monitor = eventMonitor {
             NSEvent.removeMonitor(monitor)
             eventMonitor = nil
         }
+
     }
 
-    func updateStatusIcon(percentage: Int) {
+    func updateStatusIcon(sessionPercent: Int, weeklyPercent: Int, showWeekly: Bool) {
         guard let button = statusItem.button else { return }
 
-        // Determine color based on percentage
+        // Determine color based on session percentage
         let color: NSColor
-        if percentage < 70 {
+        if sessionPercent < 70 {
             color = NSColor(red: 0.13, green: 0.77, blue: 0.37, alpha: 1.0) // Green
-        } else if percentage < 90 {
+        } else if sessionPercent < 90 {
             color = NSColor(red: 1.0, green: 0.8, blue: 0.0, alpha: 1.0) // Yellow
         } else {
             color = NSColor(red: 1.0, green: 0.23, blue: 0.19, alpha: 1.0) // Red
@@ -231,7 +238,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Set image and title
         button.image = sparkIcon
-        button.title = " \(percentage)%"
+        if showWeekly {
+            button.title = " \(sessionPercent)% • \(weeklyPercent)%"
+        } else {
+            button.title = " \(sessionPercent)%"
+        }
     }
 
     func createSparkIcon(color: NSColor) -> NSImage {
@@ -310,6 +321,7 @@ class UsageManager: ObservableObject {
     @Published var errorMessage: String?
     @Published var notificationsEnabled: Bool = true
     @Published var openAtLogin: Bool = false
+    @Published var showWeeklyInMenuBar: Bool = true
     @Published var hasWeeklySonnet: Bool = false
     @Published var hasFetchedData: Bool = false
     @Published var isAccessibilityEnabled: Bool = false
@@ -346,6 +358,12 @@ class UsageManager: ObservableObject {
             UserDefaults.standard.set(true, forKey: "has_set_notifications")
         }
         openAtLogin = UserDefaults.standard.bool(forKey: "open_at_login")
+        // Default showWeeklyInMenuBar to true if not previously set
+        if UserDefaults.standard.object(forKey: "show_weekly_in_menu_bar") == nil {
+            showWeeklyInMenuBar = true
+        } else {
+            showWeeklyInMenuBar = UserDefaults.standard.bool(forKey: "show_weekly_in_menu_bar")
+        }
         lastNotifiedThreshold = UserDefaults.standard.integer(forKey: "last_notified_threshold")
         // Default shortcut to enabled if not previously set
         if UserDefaults.standard.object(forKey: "shortcut_enabled") == nil {
@@ -358,6 +376,7 @@ class UsageManager: ObservableObject {
     func saveSettings() {
         UserDefaults.standard.set(notificationsEnabled, forKey: "notifications_enabled")
         UserDefaults.standard.set(openAtLogin, forKey: "open_at_login")
+        UserDefaults.standard.set(showWeeklyInMenuBar, forKey: "show_weekly_in_menu_bar")
         UserDefaults.standard.set(shortcutEnabled, forKey: "shortcut_enabled")
         UserDefaults.standard.synchronize()
     }
@@ -390,7 +409,7 @@ class UsageManager: ObservableObject {
         UserDefaults.standard.set(0, forKey: "last_notified_threshold")
 
         // Update status bar to show 0%
-        delegate?.updateStatusIcon(percentage: 0)
+        delegate?.updateStatusIcon(sessionPercent: 0, weeklyPercent: 0, showWeekly: false)
 
         NSLog("ClaudeUsage: Cookie cleared, data reset")
     }
@@ -601,9 +620,10 @@ class UsageManager: ObservableObject {
 
     func updateStatusBar() {
         let sessionPercent = Int((Double(sessionUsage) / Double(sessionLimit)) * 100)
+        let weeklyPercent = Int((Double(weeklyUsage) / Double(weeklyLimit)) * 100)
 
-        // Update the icon color
-        delegate?.updateStatusIcon(percentage: sessionPercent)
+        // Update the icon color and menu bar title
+        delegate?.updateStatusIcon(sessionPercent: sessionPercent, weeklyPercent: weeklyPercent, showWeekly: showWeeklyInMenuBar)
 
         // Check for notification thresholds
         checkNotificationThresholds(percentage: sessionPercent)
@@ -1018,6 +1038,24 @@ struct UsageView: View {
                     }
                     .toggleStyle(.checkbox)
 
+                    Toggle(isOn: Binding(
+                        get: { usageManager.showWeeklyInMenuBar },
+                        set: { newValue in
+                            usageManager.showWeeklyInMenuBar = newValue
+                            usageManager.saveSettings()
+                            usageManager.updateStatusBar()
+                        }
+                    )) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Show Weekly Usage in Menu Bar")
+                                .font(.caption)
+                            Text("Display weekly % alongside session % in the status bar")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .toggleStyle(.checkbox)
+
                     VStack(alignment: .leading, spacing: 8) {
                         Toggle(isOn: Binding(
                             get: { usageManager.notificationsEnabled },
@@ -1089,6 +1127,7 @@ struct UsageView: View {
         }
         .padding()
         .frame(width: 360)
+        .fixedSize(horizontal: false, vertical: true)
         .onAppear {
             // Load saved cookie when view appears
             if let savedCookie = UserDefaults.standard.string(forKey: "claude_session_cookie") {
