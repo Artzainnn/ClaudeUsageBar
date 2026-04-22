@@ -35,7 +35,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Create popover
         popover = NSPopover()
-        popover.contentSize = NSSize(width: 320, height: 260)
+        popover.contentSize = NSSize(width: 320, height: 450)
         popover.behavior = .transient
         popover.contentViewController = NSHostingController(rootView: UsageView(usageManager: usageManager))
 
@@ -813,6 +813,7 @@ struct UsageView: View {
     @State private var showingSettings: Bool = false
 
     var body: some View {
+        ScrollView {
         VStack(alignment: .leading, spacing: 16) {
             Text("Claude Usage")
                 .font(.headline)
@@ -1088,6 +1089,7 @@ struct UsageView: View {
             }
         }
         .padding()
+        }
         .frame(width: 360)
         .onAppear {
             // Load saved cookie when view appears
