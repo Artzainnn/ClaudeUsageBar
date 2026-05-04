@@ -52,13 +52,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func setupKeyboardShortcut() {
-        // Check Accessibility permissions
-        checkAccessibilityPermissions()
-
-        // Only register if user has the shortcut enabled
-        if usageManager.shortcutEnabled {
-            registerGlobalHotKey()
+        // Only check permissions and register hotkey if user has the shortcut enabled
+        guard usageManager.shortcutEnabled else {
+            NSLog("ℹ️ Shortcut disabled — skipping accessibility check")
+            return
         }
+        checkAccessibilityPermissions()
+        registerGlobalHotKey()
     }
 
     func setShortcutEnabled(_ enabled: Bool) {
@@ -70,28 +70,36 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func checkAccessibilityPermissions() {
-        // Check if app has Accessibility permissions
         let trusted = AXIsProcessTrusted()
 
-        if !trusted {
-            NSLog("⚠️ Accessibility permissions not granted")
-            // Show alert to guide user
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                let alert = NSAlert()
-                alert.messageText = "Accessibility Permission Required"
-                alert.informativeText = "ClaudeUsageBar needs Accessibility permission to use the Cmd+U keyboard shortcut.\n\nPlease enable it in:\nSystem Settings → Privacy & Security → Accessibility"
-                alert.alertStyle = .informational
-                alert.addButton(withTitle: "Open System Settings")
-                alert.addButton(withTitle: "Skip for Now")
-
-                let response = alert.runModal()
-                if response == .alertFirstButtonReturn {
-                    // Open System Settings
-                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
-                }
-            }
-        } else {
+        guard !trusted else {
             NSLog("✅ Accessibility permissions granted")
+            return
+        }
+        NSLog("⚠️ Accessibility permissions not granted")
+
+        if UserDefaults.standard.bool(forKey: "accessibility_alert_dismissed") {
+            NSLog("ℹ️ User previously dismissed accessibility alert — skipping")
+            return
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            let alert = NSAlert()
+            alert.messageText = "Accessibility Permission Required"
+            alert.informativeText = "ClaudeUsageBar needs Accessibility permission to use the Cmd+U keyboard shortcut.\n\nPlease enable it in:\nSystem Settings → Privacy & Security → Accessibility"
+            alert.alertStyle = .informational
+            alert.addButton(withTitle: "Open System Settings")
+            alert.addButton(withTitle: "Skip for Now")
+            alert.showsSuppressionButton = true
+            alert.suppressionButton?.title = "Don't ask again"
+
+            let response = alert.runModal()
+            if alert.suppressionButton?.state == .on {
+                UserDefaults.standard.set(true, forKey: "accessibility_alert_dismissed")
+            }
+            if response == .alertFirstButtonReturn {
+                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+            }
         }
     }
 
