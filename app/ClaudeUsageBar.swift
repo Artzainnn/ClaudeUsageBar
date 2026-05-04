@@ -2,11 +2,20 @@ import SwiftUI
 import AppKit
 import WebKit
 import Carbon
+import Security
+
+/// NSPanel with .nonactivatingPanel style mask doesn't accept key window status by
+/// default, which breaks text input in embedded NSTextView (used by the manual
+/// cookie paste flow). Override so clicks inside the panel can drive focus.
+final class KeyAcceptingPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+}
 
 // Main entry point
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
-    var popover: NSPopover!
+    var popupPanel: NSPanel?
+    var hostingView: NSHostingView<UsageView>?
     var usageManager: UsageManager!
     var eventMonitor: Any?
     var hotKeyRef: EventHotKeyRef?
@@ -33,11 +42,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Initialize usage manager
         usageManager = UsageManager(statusItem: statusItem, delegate: self)
 
-        // Create popover
-        popover = NSPopover()
-        popover.contentSize = NSSize(width: 320, height: 260)
-        popover.behavior = .transient
-        popover.contentViewController = NSHostingController(rootView: UsageView(usageManager: usageManager))
+        // Create floating panel (replaces NSPopover for a no-arrow rectangular look)
+        buildPopupPanel()
 
         // Fetch initial data
         usageManager.fetchUsage()
@@ -165,8 +171,47 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApplication.shared.terminate(nil)
     }
 
+    func buildPopupPanel() {
+        let panel = KeyAcceptingPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 400, height: 200),
+            styleMask: [.nonactivatingPanel, .borderless],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isReleasedWhenClosed = false
+        panel.level = .popUpMenu
+        panel.hasShadow = true
+        panel.backgroundColor = .clear
+        panel.isOpaque = false
+        panel.hidesOnDeactivate = false
+        panel.isFloatingPanel = true
+        panel.animationBehavior = .utilityWindow
+
+        let blur = NSVisualEffectView()
+        blur.material = .menu
+        blur.blendingMode = .behindWindow
+        blur.state = .active
+        blur.wantsLayer = true
+        blur.layer?.cornerRadius = 12
+        blur.layer?.masksToBounds = true
+
+        let hosting = NSHostingView(rootView: UsageView(usageManager: usageManager))
+        hosting.translatesAutoresizingMaskIntoConstraints = false
+        blur.addSubview(hosting)
+        NSLayoutConstraint.activate([
+            hosting.leadingAnchor.constraint(equalTo: blur.leadingAnchor),
+            hosting.trailingAnchor.constraint(equalTo: blur.trailingAnchor),
+            hosting.topAnchor.constraint(equalTo: blur.topAnchor),
+            hosting.bottomAnchor.constraint(equalTo: blur.bottomAnchor)
+        ])
+
+        panel.contentView = blur
+        self.popupPanel = panel
+        self.hostingView = hosting
+    }
+
     @objc func togglePopover() {
-        if popover.isShown {
+        if popupPanel?.isVisible == true {
             closePopover()
         } else {
             openPopover()
@@ -194,27 +239,46 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func openPopover() {
-        if let button = statusItem.button {
-            // Force UI refresh by updating percentages
-            DispatchQueue.main.async {
-                self.usageManager.updatePercentages()
-            }
+        guard let button = statusItem.button,
+              let buttonWindow = button.window,
+              let panel = popupPanel,
+              let hosting = hostingView else { return }
 
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        // Defensive: never leave a stale global monitor attached.
+        if let monitor = eventMonitor {
+            NSEvent.removeMonitor(monitor)
+            eventMonitor = nil
+        }
 
-            // Add event monitor to detect clicks outside the popover
-            eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
-                if self?.popover.isShown == true {
-                    self?.closePopover()
-                }
-            }
+        usageManager.updatePercentages()
+
+        // Resize panel to fit current SwiftUI content
+        let target = hosting.fittingSize
+        if target.width > 0 && target.height > 0 {
+            panel.setContentSize(target)
+        }
+
+        // Position panel right under the status item button, centered horizontally
+        let buttonFrameInWindow = button.convert(button.bounds, to: nil)
+        let buttonFrameOnScreen = buttonWindow.convertToScreen(buttonFrameInWindow)
+        let panelW = panel.frame.width
+        let panelH = panel.frame.height
+        var x = buttonFrameOnScreen.midX - panelW / 2
+        var y = buttonFrameOnScreen.minY - panelH - 4
+        if let visible = buttonWindow.screen?.visibleFrame {
+            x = min(max(x, visible.minX + 4), visible.maxX - panelW - 4)
+            y = max(y, visible.minY + 4)
+        }
+        panel.setFrameOrigin(NSPoint(x: x, y: y))
+        panel.orderFrontRegardless()
+
+        eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            self?.closePopover()
         }
     }
 
     func closePopover() {
-        popover.performClose(nil)
-
-        // Remove event monitor
+        popupPanel?.orderOut(nil)
         if let monitor = eventMonitor {
             NSEvent.removeMonitor(monitor)
             eventMonitor = nil
@@ -303,6 +367,73 @@ struct Main {
     }
 }
 
+enum CookieKeychain {
+    private static let service = "com.claudeusagebar.cookie"
+    private static let account = "claude_session"
+
+    @discardableResult
+    static func save(_ cookie: String) -> Bool {
+        let data = Data(cookie.utf8)
+        let baseQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+        // Try update first, fall back to add
+        let updateAttrs: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        ]
+        let updateStatus = SecItemUpdate(baseQuery as CFDictionary, updateAttrs as CFDictionary)
+        if updateStatus == errSecSuccess { return true }
+        if updateStatus != errSecItemNotFound {
+            NSLog("ClaudeUsage: Keychain update failed status=\(updateStatus)")
+        }
+        var addAttrs = baseQuery
+        addAttrs[kSecValueData as String] = data
+        addAttrs[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        let addStatus = SecItemAdd(addAttrs as CFDictionary, nil)
+        if addStatus != errSecSuccess {
+            NSLog("ClaudeUsage: Keychain add failed status=\(addStatus)")
+            return false
+        }
+        return true
+    }
+
+    static func read() -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        if status == errSecItemNotFound { return nil }
+        if status != errSecSuccess {
+            NSLog("ClaudeUsage: Keychain read failed status=\(status)")
+            return nil
+        }
+        guard let data = result as? Data, let cookie = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        return cookie
+    }
+
+    static func delete() {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+        let status = SecItemDelete(query as CFDictionary)
+        if status != errSecSuccess && status != errSecItemNotFound {
+            NSLog("ClaudeUsage: Keychain delete failed status=\(status)")
+        }
+    }
+}
+
 class UsageManager: ObservableObject {
     @Published var sessionUsage: Int = 0
     @Published var sessionLimit: Int = 100
@@ -322,6 +453,7 @@ class UsageManager: ObservableObject {
     @Published var hasFetchedData: Bool = false
     @Published var isAccessibilityEnabled: Bool = false
     @Published var shortcutEnabled: Bool = true
+    @Published var sessionExpiresAt: Date?
 
     private var statusItem: NSStatusItem?
     private var sessionCookie: String = ""
@@ -341,8 +473,19 @@ class UsageManager: ObservableObject {
     }
 
     func loadSessionCookie() {
-        if let savedCookie = UserDefaults.standard.string(forKey: "claude_session_cookie") {
-            sessionCookie = savedCookie
+        if let kc = CookieKeychain.read(), !kc.isEmpty {
+            sessionCookie = kc
+        } else if let legacy = UserDefaults.standard.string(forKey: "claude_session_cookie"), !legacy.isEmpty {
+            // One-shot migration from legacy UserDefaults storage.
+            NSLog("ClaudeUsage: Migrating cookie from UserDefaults to Keychain")
+            sessionCookie = legacy
+            if CookieKeychain.save(legacy) {
+                UserDefaults.standard.removeObject(forKey: "claude_session_cookie")
+                UserDefaults.standard.synchronize()
+            }
+        }
+        if let ts = UserDefaults.standard.object(forKey: "claude_session_expires_at") as? Date {
+            sessionExpiresAt = ts
         }
     }
 
@@ -370,18 +513,37 @@ class UsageManager: ObservableObject {
         UserDefaults.standard.synchronize()
     }
 
-    func saveSessionCookie(_ cookie: String) {
+    func saveSessionCookie(_ cookie: String, expiresAt: Date? = nil) {
         NSLog("ClaudeUsage: Saving cookie, length: \(cookie.count)")
         sessionCookie = cookie
-        UserDefaults.standard.set(cookie, forKey: "claude_session_cookie")
+        if CookieKeychain.save(cookie) {
+            NSLog("ClaudeUsage: Cookie saved to Keychain")
+        } else {
+            NSLog("ClaudeUsage: Cookie save to Keychain FAILED")
+        }
+        sessionExpiresAt = expiresAt
+        if let expiresAt = expiresAt {
+            UserDefaults.standard.set(expiresAt, forKey: "claude_session_expires_at")
+        } else {
+            UserDefaults.standard.removeObject(forKey: "claude_session_expires_at")
+        }
         UserDefaults.standard.synchronize()
-        NSLog("ClaudeUsage: Cookie saved successfully")
+    }
+
+    func markSessionExpired() {
+        sessionExpiresAt = Date()
+        UserDefaults.standard.set(Date(), forKey: "claude_session_expires_at")
+        UserDefaults.standard.synchronize()
     }
 
     func clearSessionCookie() {
         NSLog("ClaudeUsage: Clearing cookie")
         sessionCookie = ""
+        sessionExpiresAt = nil
+        CookieKeychain.delete()
+        // Also wipe legacy UserDefaults entry in case migration didn't run.
         UserDefaults.standard.removeObject(forKey: "claude_session_cookie")
+        UserDefaults.standard.removeObject(forKey: "claude_session_expires_at")
         UserDefaults.standard.synchronize()
 
         // Reset all data
@@ -428,12 +590,44 @@ class UsageManager: ObservableObject {
 
         NSLog("📡 Fetching bootstrap to get org ID...")
 
-        URLSession.shared.dataTask(with: request) { data, response, error in
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            // Detect auth failure: claude.ai redirects unauthenticated requests to /login
+            // (final URL ends up on /login) and serves an HTML page rather than JSON.
+            let httpResponse = response as? HTTPURLResponse
+            let finalPath = response?.url?.path.lowercased() ?? ""
+            let contentType = (httpResponse?.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased()
+            let authFailedByStatus = (httpResponse?.statusCode == 401 || httpResponse?.statusCode == 403)
+            let authFailedByRedirect = finalPath.contains("/login")
+            let authFailedByContentType = !contentType.contains("application/json") && !contentType.isEmpty
+
+            if authFailedByStatus || authFailedByRedirect || authFailedByContentType {
+                NSLog("⚠️ Session expired during bootstrap (status=\(httpResponse?.statusCode ?? -1) finalPath=\(finalPath) contentType=\(contentType))")
+                DispatchQueue.main.async {
+                    self?.errorMessage = "Session expired — please re-sign in"
+                    self?.markSessionExpired()
+                }
+                completion(nil)
+                return
+            }
             guard let data = data,
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let account = json["account"] as? [String: Any],
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                let bodyPreview = data.flatMap { String(data: $0.prefix(200), encoding: .utf8) } ?? "<no body>"
+                NSLog("❌ Could not parse bootstrap JSON. status=\(httpResponse?.statusCode ?? -1) finalPath=\(finalPath) contentType=\(contentType) body=\(bodyPreview)")
+                DispatchQueue.main.async {
+                    self?.errorMessage = "Session expired — please re-sign in"
+                    self?.markSessionExpired()
+                }
+                completion(nil)
+                return
+            }
+            // JSON parsed but no account → treat as auth failure
+            guard let account = json["account"] as? [String: Any],
                   let lastActiveOrgId = account["lastActiveOrgId"] as? String else {
-                NSLog("❌ Could not parse org ID from bootstrap")
+                NSLog("⚠️ Bootstrap JSON missing account.lastActiveOrgId. keys=\(Array(json.keys)) body=\(String(data: data.prefix(300), encoding: .utf8) ?? "")")
+                DispatchQueue.main.async {
+                    self?.errorMessage = "Session expired — please re-sign in"
+                    self?.markSessionExpired()
+                }
                 completion(nil)
                 return
             }
@@ -458,7 +652,10 @@ class UsageManager: ObservableObject {
         fetchOrganizationId { [weak self] orgId in
             guard let self = self, let orgId = orgId else {
                 DispatchQueue.main.async {
-                    self?.errorMessage = "Could not get org ID from cookie"
+                    // Preserve a more specific error (e.g. "Session expired") set by fetchOrganizationId.
+                    if self?.errorMessage == nil {
+                        self?.errorMessage = "Could not get org ID from cookie"
+                    }
                     self?.isLoading = false
                 }
                 return
@@ -516,8 +713,18 @@ class UsageManager: ObservableObject {
                     NSLog("📦 Response: \(responseString)")
                 }
 
-                if httpResponse.statusCode == 200, let data = data {
+                let finalPath = response?.url?.path.lowercased() ?? ""
+                let contentType = (httpResponse.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased()
+                let authFailedByStatus = (httpResponse.statusCode == 401 || httpResponse.statusCode == 403)
+                let authFailedByRedirect = finalPath.contains("/login")
+                let authFailedByContentType = httpResponse.statusCode == 200 && !contentType.contains("application/json") && !contentType.isEmpty
+
+                if httpResponse.statusCode == 200, !authFailedByRedirect, !authFailedByContentType, let data = data {
                     self?.parseUsageData(data)
+                } else if authFailedByStatus || authFailedByRedirect || authFailedByContentType {
+                    NSLog("⚠️ Session expired (status=\(httpResponse.statusCode) finalPath=\(finalPath) contentType=\(contentType))")
+                    self?.errorMessage = "Session expired — please re-sign in"
+                    self?.markSessionExpired()
                 } else {
                     self?.errorMessage = "HTTP \(httpResponse.statusCode)"
                 }
@@ -814,6 +1021,284 @@ struct PasteableTextField: NSViewRepresentable {
     }
 }
 
+final class ClaudeLoginWindowController: NSWindowController, WKNavigationDelegate, WKUIDelegate, NSWindowDelegate {
+    static var current: ClaudeLoginWindowController?
+
+    private let onCookieCaptured: (String, Date?) -> Void
+    private var webView: WKWebView!
+    private var statusLabel: NSTextField!
+    private var pollTimer: Timer?
+    private var hintTimer: Timer?
+    private var captured = false
+
+    init(onCookieCaptured: @escaping (String, Date?) -> Void) {
+        self.onCookieCaptured = onCookieCaptured
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 900, height: 760),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Sign in to Claude"
+        window.center()
+        window.isReleasedWhenClosed = false
+
+        super.init(window: window)
+        window.delegate = self
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 900, height: 760))
+        container.autoresizingMask = [.width, .height]
+
+        let toolbarHeight: CGFloat = 44
+        let toolbar = NSView(frame: NSRect(x: 0, y: 760 - toolbarHeight, width: 900, height: toolbarHeight))
+        toolbar.autoresizingMask = [.width, .minYMargin]
+        toolbar.wantsLayer = true
+        toolbar.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+
+        let status = NSTextField(labelWithString: "Sign in with email — enter your email, then the 6-digit code sent to you. Window will close automatically.")
+        status.frame = NSRect(x: 16, y: 12, width: 640, height: 20)
+        status.autoresizingMask = [.width]
+        status.font = .systemFont(ofSize: 12)
+        status.textColor = .secondaryLabelColor
+        toolbar.addSubview(status)
+        self.statusLabel = status
+
+        let captureButton = NSButton(title: "I'm signed in — capture now", target: self, action: #selector(captureNow))
+        captureButton.bezelStyle = .rounded
+        captureButton.controlSize = .small
+        captureButton.frame = NSRect(x: 900 - 220, y: 8, width: 200, height: 28)
+        captureButton.autoresizingMask = [.minXMargin]
+        toolbar.addSubview(captureButton)
+
+        container.addSubview(toolbar)
+
+        let config = WKWebViewConfiguration()
+        config.websiteDataStore = .nonPersistent()
+
+        let neutralizeSSOSource = """
+        (function() {
+            try {
+                var noop = function() {};
+                var fakeId = {
+                    initialize: noop, prompt: noop, cancel: noop,
+                    disableAutoSelect: noop, renderButton: noop,
+                    storeCredential: noop, revoke: noop
+                };
+                var fakeOAuth2 = { initTokenClient: function() { return { requestAccessToken: noop }; } };
+                Object.defineProperty(window, 'google', {
+                    value: { accounts: { id: fakeId, oauth2: fakeOAuth2 } },
+                    writable: false, configurable: false
+                });
+                Object.defineProperty(window, 'AppleID', {
+                    value: { auth: { init: noop, signIn: noop } },
+                    writable: false, configurable: false
+                });
+            } catch (e) {}
+        })();
+        """
+        let earlyScript = WKUserScript(source: neutralizeSSOSource, injectionTime: .atDocumentStart, forMainFrameOnly: false)
+
+        let hideSSOSource = """
+        (function() {
+            var TERMS = ['google', 'apple', 'microsoft', 'github', 'sso', 'single sign', 'continue with'];
+            function shouldHide(el) {
+                var text = (el.textContent || '').toLowerCase();
+                var aria = (el.getAttribute && (el.getAttribute('aria-label') || '')).toLowerCase();
+                for (var i = 0; i < TERMS.length; i++) {
+                    if (text.indexOf(TERMS[i]) !== -1 || aria.indexOf(TERMS[i]) !== -1) {
+                        if (text.indexOf('email') !== -1) continue;
+                        return true;
+                    }
+                }
+                return false;
+            }
+            function sweep() {
+                var nodes = document.querySelectorAll('button, a[role="button"], a');
+                for (var i = 0; i < nodes.length; i++) {
+                    if (shouldHide(nodes[i])) {
+                        nodes[i].style.display = 'none';
+                        var p = nodes[i].parentElement;
+                        if (p && p.children.length === 1) p.style.display = 'none';
+                    }
+                }
+                document.querySelectorAll('div, span, p').forEach(function(el) {
+                    var t = (el.textContent || '').trim().toLowerCase();
+                    if (t === 'or' || t === '— or —' || t === 'or continue with') {
+                        el.style.display = 'none';
+                    }
+                });
+            }
+            sweep();
+            try {
+                var obs = new MutationObserver(sweep);
+                obs.observe(document.body, { childList: true, subtree: true });
+            } catch (e) {}
+            setInterval(sweep, 800);
+        })();
+        """
+        let userScript = WKUserScript(source: hideSSOSource, injectionTime: .atDocumentEnd, forMainFrameOnly: false)
+        let contentController = WKUserContentController()
+        contentController.addUserScript(earlyScript)
+        contentController.addUserScript(userScript)
+        config.userContentController = contentController
+
+        let webView = WKWebView(
+            frame: NSRect(x: 0, y: 0, width: 900, height: 760 - toolbarHeight),
+            configuration: config
+        )
+        webView.autoresizingMask = [.width, .height]
+        webView.navigationDelegate = self
+        webView.uiDelegate = self
+        webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+        container.addSubview(webView)
+        self.webView = webView
+
+        window.contentView = container
+
+        if let url = URL(string: "https://claude.ai/login") {
+            webView.load(URLRequest(url: url))
+        }
+
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+            self?.checkCookies(manual: false)
+        }
+        hintTimer = Timer.scheduledTimer(withTimeInterval: 180, repeats: false) { [weak self] _ in
+            DispatchQueue.main.async {
+                guard let self = self, !self.captured else { return }
+                self.statusLabel.stringValue = "Still waiting — if you're stuck, close this window and try \"Set cookie manually\" instead."
+                self.statusLabel.textColor = .systemOrange
+            }
+        }
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    deinit {
+        pollTimer?.invalidate()
+        hintTimer?.invalidate()
+    }
+
+    private func cleanup() {
+        pollTimer?.invalidate()
+        pollTimer = nil
+        hintTimer?.invalidate()
+        hintTimer = nil
+        if ClaudeLoginWindowController.current === self {
+            ClaudeLoginWindowController.current = nil
+        }
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        cleanup()
+    }
+
+    @objc private func captureNow() {
+        statusLabel.stringValue = "Capturing cookies…"
+        checkCookies(manual: true)
+    }
+
+    private static let blockedAuthRules: [(host: String, pathPrefix: String?)] = [
+        ("accounts.google.com", nil),
+        ("apis.google.com", nil),
+        ("oauth2.googleapis.com", nil),
+        ("appleid.apple.com", nil),
+        ("idmsa.apple.com", nil),
+        ("accounts.apple.com", nil),
+        ("login.microsoftonline.com", nil),
+        ("login.live.com", nil),
+        ("github.com", "/login")
+    ]
+
+    private func isBlockedAuthURL(_ url: URL?) -> Bool {
+        guard let url = url, let host = url.host?.lowercased() else { return false }
+        let path = url.path.lowercased()
+        for rule in Self.blockedAuthRules {
+            let hostMatches = (host == rule.host) || host.hasSuffix("." + rule.host)
+            guard hostMatches else { continue }
+            if let prefix = rule.pathPrefix {
+                if path.hasPrefix(prefix) { return true }
+            } else {
+                return true
+            }
+        }
+        return false
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationAction: WKNavigationAction,
+        decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+    ) {
+        if isBlockedAuthURL(navigationAction.request.url) {
+            NSLog("ClaudeUsage: Blocked SSO navigation to \(navigationAction.request.url?.absoluteString ?? "")")
+            decisionHandler(.cancel)
+            return
+        }
+        decisionHandler(.allow)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        createWebViewWith configuration: WKWebViewConfiguration,
+        for navigationAction: WKNavigationAction,
+        windowFeatures: WKWindowFeatures
+    ) -> WKWebView? {
+        if isBlockedAuthURL(navigationAction.request.url) {
+            NSLog("ClaudeUsage: Blocked SSO popup to \(navigationAction.request.url?.absoluteString ?? "")")
+            return nil
+        }
+        if navigationAction.targetFrame == nil, let url = navigationAction.request.url {
+            webView.load(URLRequest(url: url))
+        }
+        return nil
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        checkCookies(manual: false)
+    }
+
+    private func checkCookies(manual: Bool) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard !captured else { return }
+        webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { [weak self] cookies in
+            DispatchQueue.main.async {
+                guard let self = self, !self.captured else { return }
+                let claudeCookies = cookies.filter { $0.domain.contains("claude.ai") }
+                let sessionCookie = claudeCookies.first { $0.name == "sessionKey" && !$0.value.isEmpty }
+
+                guard let sessionCookie = sessionCookie else {
+                    if manual {
+                        self.statusLabel.stringValue = "No sessionKey cookie found yet — please complete sign in first."
+                    }
+                    return
+                }
+
+                let cookieString = claudeCookies
+                    .map { "\($0.name)=\($0.value)" }
+                    .joined(separator: "; ")
+
+                self.captured = true
+                self.onCookieCaptured(cookieString, sessionCookie.expiresDate)
+                self.window?.close() // triggers windowWillClose → cleanup()
+            }
+        }
+    }
+}
+
+func presentClaudeLogin(onCookie: @escaping (String, Date?) -> Void) {
+    if let existing = ClaudeLoginWindowController.current {
+        NSApp.activate(ignoringOtherApps: true)
+        existing.window?.makeKeyAndOrderFront(nil)
+        return
+    }
+    let controller = ClaudeLoginWindowController(onCookieCaptured: onCookie)
+    ClaudeLoginWindowController.current = controller
+    NSApp.activate(ignoringOtherApps: true)
+    controller.showWindow(nil)
+    controller.window?.makeKeyAndOrderFront(nil)
+}
+
 struct UsageView: View {
     @ObservedObject var usageManager: UsageManager
     @State private var sessionCookieInput: String = ""
@@ -922,9 +1407,39 @@ struct UsageView: View {
                 .buttonStyle(.borderless)
                 .font(.caption)
             }
+
+            if let expiry = usageManager.sessionExpiresAt,
+               expiry.timeIntervalSinceNow < 7 * 24 * 3600 {
+                let isExpired = expiry.timeIntervalSinceNow <= 0
+                Text(isExpired
+                     ? "⚠️ Session expired \(formatResetTime(expiry, includeDate: true)) — please re-sign in"
+                     : "⚠️ Session expires \(formatResetTime(expiry, includeDate: true))")
+                    .font(.caption2)
+                    .foregroundColor(isExpired ? .red : .orange)
+            }
             }
 
-            Button(showingCookieInput ? "Hide Cookie" : "Set Session Cookie") {
+            if usageManager.hasFetchedData {
+                Button(action: signInWithEmail) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "envelope")
+                        Text("Re-sign in")
+                    }
+                }
+                .buttonStyle(.borderless)
+                .font(.caption)
+            } else {
+                Button(action: signInWithEmail) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "envelope")
+                        Text("Sign in with email")
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+            }
+
+            Button(showingCookieInput ? "Hide manual cookie setup" : "Set cookie manually") {
                 showingCookieInput.toggle()
             }
             .buttonStyle(.borderless)
@@ -1095,15 +1610,20 @@ struct UsageView: View {
                 .cornerRadius(6)
             }
         }
-        .padding()
-        .frame(width: 360)
+        .padding(16)
+        .frame(width: 400)
         .onAppear {
-            // Load saved cookie when view appears
-            if let savedCookie = UserDefaults.standard.string(forKey: "claude_session_cookie") {
-                sessionCookieInput = String(savedCookie.prefix(20)) + "..."
-            }
             // Force refresh to ensure progress bars show colors
             usageManager.updatePercentages()
+        }
+    }
+
+    func signInWithEmail() {
+        presentClaudeLogin { cookieString, expiresAt in
+            NSLog("ClaudeUsage: Auto-captured cookie, length: \(cookieString.count), expires: \(expiresAt?.description ?? "n/a")")
+            usageManager.saveSessionCookie(cookieString, expiresAt: expiresAt)
+            usageManager.errorMessage = "Signed in, fetching..."
+            usageManager.fetchUsage()
         }
     }
 
