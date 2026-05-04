@@ -83,6 +83,12 @@ chmod +x build.sh
 
 The built app will be in `app/build/ClaudeUsageBar.app`
 
+> **Note for self-builds:** the build script falls back to ad-hoc code signing when no Developer ID certificate is available. macOS treats every rebuild as a different app identity, so on first launch after each rebuild you may see a Keychain prompt:
+>
+> > *"ClaudeUsageBar" wants to access your confidential information stored in "claude_session" in your keychain.*
+>
+> Click **Always Allow** — this is expected for self-built copies and does not happen on the official Developer ID–signed release.
+
 ## 🔧 Development
 
 ### Project Structure
