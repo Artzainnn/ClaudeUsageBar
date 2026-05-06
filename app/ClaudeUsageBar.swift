@@ -1363,7 +1363,7 @@ struct UsageView: View {
                                 .fixedSize(horizontal: false, vertical: true)
                             Text(statusContextLine(for: statusManager))
                                 .font(.system(size: 10))
-                                .foregroundColor(.secondary.opacity(0.7))
+                                .foregroundColor(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
                         }
                         Spacer()
@@ -1410,7 +1410,7 @@ struct UsageView: View {
                                     if !incident.latestUpdate.isEmpty {
                                         Text(incident.latestUpdate)
                                             .font(.caption)
-                                            .foregroundColor(.primary.opacity(0.85))
+                                            .foregroundColor(.primary)
                                             .fixedSize(horizontal: false, vertical: true)
                                             .padding(.top, 2)
                                     }
