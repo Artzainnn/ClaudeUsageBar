@@ -2,7 +2,7 @@
 
 APP_NAME="ClaudeUsageBar"
 DMG_NAME="${APP_NAME}-Installer"
-VERSION="1.0"
+VERSION="1.1"
 
 # Create a temporary directory for DMG contents
 TMP_DIR="dmg_temp"
@@ -65,6 +65,44 @@ rm -rf "$TMP_DIR"
 rm -f /tmp/dmg_setup*.applescript
 
 echo "✅ DMG created: ${DMG_NAME}.dmg"
+
+# ---------- Sign + Notarize + Staple ----------
+DEVELOPER_ID="Developer ID Application: Linkko Technology Pte Ltd (Q467HQ5432)"
+NOTARY_PROFILE="claudeusagebar-notary"
+
+# Sign the DMG itself (the .app inside was already signed in build.sh)
+echo ""
+echo "🔏 Signing DMG with Developer ID..."
+if codesign --force --sign "$DEVELOPER_ID" "${DMG_NAME}.dmg" 2>/dev/null; then
+    echo "✅ DMG signed"
+else
+    echo "⚠️  DMG signing failed (continuing — Gatekeeper may reject)"
+fi
+
+# Notarize
+echo ""
+echo "📤 Submitting to Apple notary service (this can take 5–15 min)..."
+if xcrun notarytool submit "${DMG_NAME}.dmg" --keychain-profile "$NOTARY_PROFILE" --wait 2>&1; then
+    echo "📎 Stapling notarization ticket to DMG..."
+    if xcrun stapler staple "${DMG_NAME}.dmg"; then
+        echo "✅ Notarized and stapled — ready to ship"
+    else
+        echo "⚠️  Stapling failed (DMG is notarized but ticket not embedded — users need to be online for first launch)"
+    fi
+else
+    echo ""
+    echo "⚠️  Notarization skipped or failed."
+    echo ""
+    echo "If this is your first time, run this once to set up credentials:"
+    echo ""
+    echo "  xcrun notarytool store-credentials \"$NOTARY_PROFILE\" \\"
+    echo "    --apple-id \"<your-apple-id-email>\" \\"
+    echo "    --team-id \"Q467HQ5432\" \\"
+    echo "    --password \"<app-specific-password from appleid.apple.com>\""
+    echo ""
+    echo "Then re-run this script. The DMG is signed but unnotarized — Gatekeeper will warn users."
+fi
+
 echo ""
 echo "Users can now:"
 echo "1. Download ${DMG_NAME}.dmg"

@@ -63,3 +63,7 @@ tmp/
 temp/
 .vercel
 .env*.local
+
+# Internal docs (kept local, not on public GitHub)
+NOTIFICATIONS.md
+internal-docs/

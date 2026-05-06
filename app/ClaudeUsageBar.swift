@@ -8,6 +8,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var popover: NSPopover!
     var usageManager: UsageManager!
+    var statusManager: StatusManager!
+    var updateManager: UpdateManager!
     var eventMonitor: Any?
     var hotKeyRef: EventHotKeyRef?
 
@@ -30,21 +32,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             button.isEnabled = true
         }
 
-        // Initialize usage manager
+        // Initialize managers
         usageManager = UsageManager(statusItem: statusItem, delegate: self)
+        statusManager = StatusManager()
+        updateManager = UpdateManager()
 
         // Create popover
         popover = NSPopover()
-        popover.contentSize = NSSize(width: 320, height: 260)
+        // Initial guess; SwiftUI's intrinsic size (capped at 600) will drive the actual size.
+        popover.contentSize = NSSize(width: 360, height: 320)
         popover.behavior = .transient
-        popover.contentViewController = NSHostingController(rootView: UsageView(usageManager: usageManager))
+        popover.contentViewController = NSHostingController(rootView: UsageView(
+            usageManager: usageManager,
+            statusManager: statusManager,
+            updateManager: updateManager
+        ))
 
         // Fetch initial data
         usageManager.fetchUsage()
+        statusManager.fetch()
+        updateManager.fetch()
 
         // Set up timer to refresh every 5 minutes
         Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { _ in
             self.usageManager.fetchUsage()
+            self.statusManager.fetch()
+            self.updateManager.fetch()
         }
 
         // Set up Cmd+U keyboard shortcut
@@ -673,6 +686,346 @@ class UsageManager: ObservableObject {
     }
 }
 
+// MARK: - Anthropic Service Status
+
+struct StatusIncident: Identifiable, Equatable {
+    let id: String
+    let name: String
+    let status: String           // investigating | identified | monitoring | resolved
+    let latestUpdate: String
+    let updatedAt: Date?
+    let componentIds: [String]
+}
+
+struct AffectedComponent: Identifiable, Equatable {
+    let id: String
+    let name: String
+    let status: String           // degraded_performance | partial_outage | major_outage
+}
+
+struct StatusComponent: Identifiable, Equatable {
+    let id: String
+    let name: String
+    let status: String           // operational | degraded_performance | ...
+}
+
+private let defaultTrackedComponents: [StatusComponent] = [
+    StatusComponent(id: "c-claude-ai",      name: "claude.ai",                          status: "operational"),
+    StatusComponent(id: "c-claude-console", name: "Claude Console (platform.claude.com)", status: "operational"),
+    StatusComponent(id: "c-claude-api",     name: "Claude API (api.anthropic.com)",     status: "operational"),
+    StatusComponent(id: "c-claude-code",    name: "Claude Code",                         status: "operational"),
+    StatusComponent(id: "c-claude-cowork",  name: "Claude Cowork",                       status: "operational"),
+    StatusComponent(id: "c-claude-gov",     name: "Claude for Government",              status: "operational"),
+]
+
+private let defaultTrackedComponentIdSet: Set<String> = Set(
+    defaultTrackedComponents.map { $0.id }.filter { $0 != "c-claude-gov" }
+)
+
+class StatusManager: ObservableObject {
+    @Published var indicator: String = "none"        // none | minor | major | critical (raw, global)
+    @Published var statusDescription: String = "All systems operational"
+    @Published var incidents: [StatusIncident] = []
+    @Published var affectedComponents: [AffectedComponent] = []
+    @Published var allComponents: [StatusComponent] = defaultTrackedComponents
+    @Published var selectedComponentIds: Set<String> = defaultTrackedComponentIdSet
+    @Published var lastUpdated: Date?
+    @Published var hasFetched: Bool = false
+
+    // Canonical URL (status.anthropic.com 302-redirects here)
+    private let endpoint = URL(string: "https://status.claude.com/api/v2/summary.json")!
+
+    init() {
+        if let saved = UserDefaults.standard.array(forKey: "tracked_component_ids") as? [String] {
+            selectedComponentIds = Set(saved)
+        }
+        // Clean up legacy debug pref if present
+        UserDefaults.standard.removeObject(forKey: "status_preview_mode")
+    }
+
+    func toggleComponent(_ id: String) {
+        if selectedComponentIds.contains(id) {
+            selectedComponentIds.remove(id)
+        } else {
+            selectedComponentIds.insert(id)
+        }
+        UserDefaults.standard.set(Array(selectedComponentIds), forKey: "tracked_component_ids")
+    }
+
+    func isTracked(_ id: String) -> Bool {
+        selectedComponentIds.contains(id)
+    }
+
+    // MARK: - Filtered/effective views (respect tracked components)
+
+    var filteredAffectedComponents: [AffectedComponent] {
+        affectedComponents.filter { selectedComponentIds.contains($0.id) }
+    }
+
+    var filteredIncidents: [StatusIncident] {
+        incidents.filter { incident in
+            guard !incident.componentIds.isEmpty else { return true }
+            return incident.componentIds.contains(where: { selectedComponentIds.contains($0) })
+        }
+    }
+
+    var effectiveIndicator: String {
+        let trackedComponents = allComponents.filter { selectedComponentIds.contains($0.id) }
+        let max = trackedComponents.map { severity(for: $0.status) }.max() ?? 0
+        switch max {
+        case 0:  return "none"
+        case 1:  return "minor"
+        case 2:  return "major"
+        default: return "critical"
+        }
+    }
+
+    private func severity(for componentStatus: String) -> Int {
+        switch componentStatus {
+        case "operational":          return 0
+        case "under_maintenance":    return 1
+        case "degraded_performance": return 1
+        case "partial_outage":       return 2
+        case "major_outage":         return 3
+        default:                     return 0
+        }
+    }
+
+    func fetch() {
+        let request = URLRequest(url: endpoint, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
+        URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
+            guard let self = self, let data = data else { return }
+            self.parse(data)
+        }.resume()
+    }
+
+    private func parse(_ data: Data) {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let status = json["status"] as? [String: Any],
+              let indicator = status["indicator"] as? String,
+              let desc = status["description"] as? String else {
+            return
+        }
+
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let isoNoFrac = ISO8601DateFormatter()
+        isoNoFrac.formatOptions = [.withInternetDateTime]
+
+        var parsedIncidents: [StatusIncident] = []
+        if let raw = json["incidents"] as? [[String: Any]] {
+            for inc in raw {
+                guard let id = inc["id"] as? String,
+                      let name = inc["name"] as? String,
+                      let st = inc["status"] as? String else { continue }
+                if st == "resolved" || st == "postmortem" { continue }
+                let updates = inc["incident_updates"] as? [[String: Any]] ?? []
+                let latest = (updates.first?["body"] as? String) ?? ""
+                let dateStr = (updates.first?["created_at"] as? String) ?? (inc["updated_at"] as? String)
+                let updatedAt = dateStr.flatMap { iso.date(from: $0) ?? isoNoFrac.date(from: $0) }
+                let compIds = (inc["components"] as? [[String: Any]] ?? [])
+                    .compactMap { $0["id"] as? String }
+                parsedIncidents.append(StatusIncident(
+                    id: id, name: name, status: st, latestUpdate: latest,
+                    updatedAt: updatedAt,
+                    componentIds: compIds
+                ))
+            }
+        }
+
+        var parsedAffected: [AffectedComponent] = []
+        var parsedAll: [StatusComponent] = []
+        if let raw = json["components"] as? [[String: Any]] {
+            for c in raw {
+                guard let id = c["id"] as? String,
+                      let name = c["name"] as? String,
+                      let st = c["status"] as? String else { continue }
+                parsedAll.append(StatusComponent(id: id, name: name, status: st))
+                if st != "operational" {
+                    parsedAffected.append(AffectedComponent(id: id, name: name, status: st))
+                }
+            }
+        }
+
+        DispatchQueue.main.async {
+            let isFirstFetch = !self.hasFetched
+
+            self.indicator = indicator
+            self.statusDescription = desc
+            self.incidents = parsedIncidents
+            self.affectedComponents = parsedAffected
+            if !parsedAll.isEmpty {
+                self.allComponents = parsedAll
+                // First time we see real components: track all except Claude for Government by default
+                if UserDefaults.standard.array(forKey: "tracked_component_ids") == nil {
+                    let defaultIds = parsedAll
+                        .filter { !$0.name.localizedCaseInsensitiveContains("Government") }
+                        .map { $0.id }
+                    self.selectedComponentIds = Set(defaultIds)
+                    UserDefaults.standard.set(Array(self.selectedComponentIds),
+                                              forKey: "tracked_component_ids")
+                }
+            }
+            self.lastUpdated = Date()
+            self.hasFetched = true
+
+            // Notify on transitions of EFFECTIVE (filtered) indicator
+            let effective = self.effectiveIndicator
+            let previous = UserDefaults.standard.string(forKey: "last_effective_indicator")
+            if !isFirstFetch, let previous = previous, previous != effective {
+                self.notifyStatusChange(to: effective, description: desc)
+            }
+            UserDefaults.standard.set(effective, forKey: "last_effective_indicator")
+        }
+    }
+
+    private func notifyStatusChange(to indicator: String, description: String) {
+        guard UserDefaults.standard.bool(forKey: "notifications_enabled") else { return }
+
+        let notification = NSUserNotification()
+        if indicator == "none" {
+            notification.title = "Claude is back online"
+            notification.informativeText = "All systems operational"
+        } else {
+            notification.title = "Claude status: \(description)"
+            notification.informativeText = "Visit status.anthropic.com for details"
+        }
+        notification.soundName = NSUserNotificationDefaultSoundName
+        NSUserNotificationCenter.default.deliver(notification)
+        NSLog("📬 Sent status-change notification: \(indicator)")
+    }
+}
+
+// MARK: - App Updates
+
+struct BannerButton: Equatable {
+    let label: String
+    let url: URL?         // optional — opens this URL (validated)
+    let action: String?   // "dismiss" closes the banner; nil = no extra side effect
+    let style: String?    // "primary" | "secondary" | nil
+}
+
+struct AvailableUpdate: Equatable {
+    let version: String
+    let title: String
+    let body: String
+    let buttons: [BannerButton]
+}
+
+class UpdateManager: ObservableObject {
+    @Published var available: AvailableUpdate?
+
+    private let endpoint = URL(string: "https://claudeusagebar.com/latest.json")!
+
+    var currentVersion: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
+    }
+
+    private static let allowedHostSuffixes = [
+        "github.com",
+        "claudeusagebar.com"
+    ]
+
+    static func isSafeURL(_ url: URL) -> Bool {
+        guard url.scheme == "https" else { return false }
+        guard let host = url.host?.lowercased() else { return false }
+        return allowedHostSuffixes.contains(where: { host == $0 || host.hasSuffix("." + $0) })
+    }
+
+    private static func parseButtons(from json: [String: Any]) -> [BannerButton] {
+        // Explicit `buttons` array (new schema, supports any combination)
+        if let raw = json["buttons"] as? [[String: Any]] {
+            return raw.compactMap { dict -> BannerButton? in
+                guard let label = dict["label"] as? String, !label.isEmpty else { return nil }
+                let urlStr = dict["url"] as? String
+                let url = urlStr.flatMap { URL(string: $0) }
+                if let url = url, !isSafeURL(url) { return nil }   // reject unsafe URLs
+                return BannerButton(
+                    label: label,
+                    url: url,
+                    action: dict["action"] as? String,
+                    style: dict["style"] as? String
+                )
+            }
+        }
+        // Back-compat: legacy `download_url` builds the default 2-button layout
+        if let urlStr = json["download_url"] as? String,
+           let url = URL(string: urlStr),
+           isSafeURL(url) {
+            return [
+                BannerButton(label: "Download", url: url, action: nil, style: "primary"),
+                BannerButton(label: "Later",    url: nil, action: "dismiss", style: nil)
+            ]
+        }
+        return []
+    }
+
+    func fetch() {
+        let request = URLRequest(url: endpoint, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
+        URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
+            guard let self = self,
+                  let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let version = json["version"] as? String,
+                  let title = json["title"] as? String,
+                  let body = json["description"] as? String else {
+                NSLog("⚠️ Update fetch failed or invalid payload")
+                return
+            }
+
+            let buttons = Self.parseButtons(from: json)
+
+            DispatchQueue.main.async {
+                guard self.isNewer(remote: version, than: self.currentVersion) else {
+                    self.available = nil
+                    return
+                }
+
+                let update = AvailableUpdate(version: version, title: title, body: body, buttons: buttons)
+
+                if self.available != update {
+                    self.available = update
+                    NSLog("⬆️ Update available: \(version)")
+                }
+
+                let lastNotified = UserDefaults.standard.string(forKey: "last_notified_update_version")
+                if lastNotified != version, UserDefaults.standard.bool(forKey: "notifications_enabled") {
+                    let n = NSUserNotification()
+                    n.title = "ClaudeUsageBar \(version) is available"
+                    n.informativeText = title
+                    n.soundName = NSUserNotificationDefaultSoundName
+                    NSUserNotificationCenter.default.deliver(n)
+                    UserDefaults.standard.set(version, forKey: "last_notified_update_version")
+                    NSLog("📬 Sent update notification for \(version)")
+                }
+            }
+        }.resume()
+    }
+
+    func dismissCurrent() {
+        if let v = available?.version {
+            UserDefaults.standard.set(v, forKey: "dismissed_update_version")
+        }
+        available = nil
+    }
+
+    var isCurrentDismissed: Bool {
+        guard let v = available?.version else { return false }
+        return UserDefaults.standard.string(forKey: "dismissed_update_version") == v
+    }
+
+    private func isNewer(remote: String, than current: String) -> Bool {
+        let r = remote.split(separator: ".").map { Int($0) ?? 0 }
+        let c = current.split(separator: ".").map { Int($0) ?? 0 }
+        for i in 0..<max(r.count, c.count) {
+            let a = i < r.count ? r[i] : 0
+            let b = i < c.count ? c[i] : 0
+            if a != b { return a > b }
+        }
+        return false
+    }
+}
+
 // Custom NSTextField that properly handles paste
 class CustomTextField: NSTextField {
     var onTextChange: ((String) -> Void)?
@@ -806,17 +1159,99 @@ struct PasteableTextField: NSViewRepresentable {
     }
 }
 
+private struct ContentHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 struct UsageView: View {
     @ObservedObject var usageManager: UsageManager
+    @ObservedObject var statusManager: StatusManager
+    @ObservedObject var updateManager: UpdateManager
     @State private var sessionCookieInput: String = ""
     @State private var showingCookieInput: Bool = false
     @State private var showingSettings: Bool = false
+    @State private var showingStatusDetails: Bool = false
+    @State private var measuredHeight: CGFloat = 250
+
+    private let maxPopupHeight: CGFloat = 600
 
     var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                content
+                    .padding()
+                    .background(
+                        GeometryReader { geo in
+                            Color.clear.preference(key: ContentHeightKey.self, value: geo.size.height)
+                        }
+                    )
+            }
+            .frame(width: 360, height: min(max(measuredHeight, 100), maxPopupHeight))
+            .onPreferenceChange(ContentHeightKey.self) { value in
+                guard value > 0 else { return }
+                measuredHeight = value
+            }
+            .onAppear {
+                if let savedCookie = UserDefaults.standard.string(forKey: "claude_session_cookie") {
+                    sessionCookieInput = String(savedCookie.prefix(20)) + "..."
+                }
+                usageManager.updatePercentages()
+            }
+            .onChange(of: showingSettings) { isOpen in
+                if isOpen {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                        withAnimation(.easeInOut(duration: 0.35)) {
+                            proxy.scrollTo("settings-anchor", anchor: .bottom)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    var content: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Claude Usage")
                 .font(.headline)
                 .padding(.bottom, 4)
+
+            // App update / announcement banner
+            if let update = updateManager.available, !updateManager.isCurrentDismissed {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 6) {
+                        Text("⬆️")
+                        Text("Version \(update.version) available")
+                            .font(.caption)
+                            .fontWeight(.semibold)
+                        Spacer()
+                        Button(action: { updateManager.dismissCurrent() }) {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.borderless)
+                    }
+                    Text(update.title)
+                        .font(.caption)
+                    Text(update.body)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if !update.buttons.isEmpty {
+                        HStack(spacing: 6) {
+                            ForEach(update.buttons.indices, id: \.self) { i in
+                                bannerButton(update.buttons[i])
+                            }
+                        }
+                    }
+                }
+                .padding(8)
+                .background(Color.accentColor.opacity(0.12))
+                .cornerRadius(6)
+            }
 
             if let error = usageManager.errorMessage {
                 Text(error)
@@ -900,6 +1335,135 @@ struct UsageView: View {
             }
             }
 
+            if statusManager.hasFetched {
+                Divider()
+            }
+
+            // Anthropic service status (compact; expandable on issue)
+            if statusManager.hasFetched {
+                let effective = statusManager.effectiveIndicator
+                let filteredIncidents = statusManager.filteredIncidents
+                let filteredAffected = statusManager.filteredAffectedComponents
+                let hasIssue = effective != "none"
+                    && (!filteredIncidents.isEmpty || !filteredAffected.isEmpty)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    // Compact header row
+                    HStack(alignment: .top, spacing: 6) {
+                        Circle()
+                            .fill(statusColor(for: effective))
+                            .frame(width: 8, height: 8)
+                            .padding(.top, 4)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(effective == "none"
+                                 ? "All Claude services operational"
+                                 : statusManager.statusDescription)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Text(statusContextLine(for: statusManager))
+                                .font(.system(size: 10))
+                                .foregroundColor(.secondary.opacity(0.7))
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer()
+                        if hasIssue {
+                            Button(action: { showingStatusDetails.toggle() }) {
+                                HStack(spacing: 2) {
+                                    Text(showingStatusDetails ? "Hide" : "Details")
+                                    Image(systemName: showingStatusDetails ? "chevron.up" : "chevron.down")
+                                        .font(.system(size: 8))
+                                }
+                                .font(.caption2)
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                    }
+
+                    // Expanded panel
+                    if hasIssue && showingStatusDetails {
+                        VStack(alignment: .leading, spacing: 12) {
+                            ForEach(filteredIncidents) { incident in
+                                VStack(alignment: .leading, spacing: 6) {
+                                    // Title
+                                    Text(incident.name)
+                                        .font(.system(size: 12, weight: .semibold))
+                                        .fixedSize(horizontal: false, vertical: true)
+
+                                    // Status badge + updated time
+                                    HStack(spacing: 8) {
+                                        Text(incident.status.uppercased())
+                                            .font(.system(size: 9, weight: .bold))
+                                            .foregroundColor(.white)
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 2)
+                                            .background(badgeColor(for: incident.status))
+                                            .cornerRadius(3)
+                                        if let updated = incident.updatedAt {
+                                            Text("Updated \(relativeTime(updated))")
+                                                .font(.caption2)
+                                                .foregroundColor(.secondary)
+                                        }
+                                    }
+
+                                    // Body
+                                    if !incident.latestUpdate.isEmpty {
+                                        Text(incident.latestUpdate)
+                                            .font(.caption)
+                                            .foregroundColor(.primary.opacity(0.85))
+                                            .fixedSize(horizontal: false, vertical: true)
+                                            .padding(.top, 2)
+                                    }
+                                }
+                            }
+
+                            // Affected components (when no formal incident)
+                            if filteredIncidents.isEmpty && !filteredAffected.isEmpty {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("Affected services")
+                                        .font(.caption2)
+                                        .fontWeight(.semibold)
+                                        .foregroundColor(.secondary)
+                                    ForEach(filteredAffected) { c in
+                                        HStack(spacing: 6) {
+                                            Circle()
+                                                .fill(Color.orange)
+                                                .frame(width: 5, height: 5)
+                                            Text(c.name).font(.caption2)
+                                            Spacer()
+                                            Text(componentLabel(c.status))
+                                                .font(.caption2)
+                                                .foregroundColor(.secondary)
+                                        }
+                                    }
+                                }
+                            }
+
+                            Divider()
+
+                            HStack {
+                                if let lastCheck = statusManager.lastUpdated {
+                                    Text("Checked \(relativeTime(lastCheck))")
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                }
+                                Spacer()
+                                Button(action: {
+                                    NSWorkspace.shared.open(URL(string: "https://status.claude.com")!)
+                                }) {
+                                    Text("Open status page →")
+                                        .font(.caption2)
+                                }
+                                .buttonStyle(.borderless)
+                            }
+                        }
+                        .padding(10)
+                        .background(Color.orange.opacity(0.10))
+                        .cornerRadius(6)
+                    }
+                }
+            }
+
             if usageManager.hasFetchedData {
             Divider()
 
@@ -910,6 +1474,8 @@ struct UsageView: View {
                 Spacer()
                 Button("Refresh") {
                     usageManager.fetchUsage()
+                    statusManager.fetch()
+                    updateManager.fetch()
                 }
                 .buttonStyle(.borderless)
                 .font(.caption)
@@ -1081,21 +1647,39 @@ struct UsageView: View {
                                 .fixedSize(horizontal: false, vertical: true)
                         }
                     }
+
+                    Divider()
+
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Status alerts: services to track")
+                            .font(.caption)
+                            .fontWeight(.semibold)
+                        Text("Only tick the Claude services you use. Status issues with unticked services won't be shown or trigger alerts.")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        ForEach(statusManager.allComponents) { component in
+                            Toggle(isOn: Binding(
+                                get: { statusManager.isTracked(component.id) },
+                                set: { _ in statusManager.toggleComponent(component.id) }
+                            )) {
+                                Text(component.name)
+                                    .font(.caption2)
+                            }
+                            .toggleStyle(.checkbox)
+                        }
+                    }
+
                 }
                 .padding(8)
                 .background(Color.secondary.opacity(0.1))
                 .cornerRadius(6)
+
+                // Anchor for scroll-to-bottom when Settings opens
+                Color.clear
+                    .frame(height: 1)
+                    .id("settings-anchor")
             }
-        }
-        .padding()
-        .frame(width: 360)
-        .onAppear {
-            // Load saved cookie when view appears
-            if let savedCookie = UserDefaults.standard.string(forKey: "claude_session_cookie") {
-                sessionCookieInput = String(savedCookie.prefix(20)) + "..."
-            }
-            // Force refresh to ensure progress bars show colors
-            usageManager.updatePercentages()
         }
     }
 
@@ -1132,6 +1716,110 @@ struct UsageView: View {
             return .orange
         } else {
             return .red
+        }
+    }
+
+    func statusColor(for indicator: String) -> Color {
+        switch indicator {
+        case "none":     return .green
+        case "minor":    return .yellow
+        case "major":    return .orange
+        case "critical": return .red
+        default:         return .gray
+        }
+    }
+
+    func statusLabel(for indicator: String, description: String) -> String {
+        if indicator == "none" {
+            return "Claude: all systems operational"
+        }
+        return "Claude: \(description)"
+    }
+
+    func relativeTime(_ date: Date) -> String {
+        let elapsed = Int(Date().timeIntervalSince(date))
+        if elapsed < 60 { return "just now" }
+        if elapsed < 3600 {
+            let m = elapsed / 60
+            return "\(m) min\(m == 1 ? "" : "s") ago"
+        }
+        if elapsed < 86_400 {
+            let h = elapsed / 3600
+            return "\(h) hour\(h == 1 ? "" : "s") ago"
+        }
+        let d = elapsed / 86_400
+        return "\(d) day\(d == 1 ? "" : "s") ago"
+    }
+
+    func statusContextLine(for sm: StatusManager) -> String {
+        let tracked = sm.allComponents.filter { sm.selectedComponentIds.contains($0.id) }
+        let trackedNames = tracked.prefix(4).map { shortName($0.name) }.joined(separator: ", ")
+        let extra = tracked.count > 4 ? " +\(tracked.count - 4)" : ""
+        let trackedSummary = tracked.isEmpty ? "No services tracked" : "Tracks \(trackedNames)\(extra)"
+
+        if sm.effectiveIndicator == "none" {
+            if let lastCheck = sm.lastUpdated {
+                return "\(trackedSummary) · checked \(relativeTime(lastCheck))"
+            }
+            return trackedSummary
+        }
+        let affected = sm.filteredAffectedComponents
+        if !affected.isEmpty {
+            let names = affected.prefix(3).map { shortName($0.name) }.joined(separator: ", ")
+            let more = affected.count > 3 ? " +\(affected.count - 3)" : ""
+            return "Affects: \(names)\(more)"
+        }
+        if let lastCheck = sm.lastUpdated {
+            return "Checked \(relativeTime(lastCheck))"
+        }
+        return ""
+    }
+
+    func shortName(_ raw: String) -> String {
+        if let paren = raw.range(of: " (") {
+            return String(raw[..<paren.lowerBound])
+        }
+        return raw
+    }
+
+    @ViewBuilder
+    func bannerButton(_ btn: BannerButton) -> some View {
+        let tap = {
+            if let url = btn.url {
+                NSWorkspace.shared.open(url)
+            }
+            if btn.action == "dismiss" {
+                updateManager.dismissCurrent()
+            }
+        }
+        if btn.style == "primary" {
+            Button(btn.label, action: tap)
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+        } else {
+            Button(btn.label, action: tap)
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+        }
+    }
+
+    func badgeColor(for status: String) -> Color {
+        switch status {
+        case "investigating": return Color.red.opacity(0.8)
+        case "identified":    return Color.orange
+        case "monitoring":    return Color.blue
+        case "resolved":      return Color.green
+        default:              return Color.gray
+        }
+    }
+
+    func componentLabel(_ status: String) -> String {
+        switch status {
+        case "degraded_performance": return "degraded"
+        case "partial_outage":       return "partial outage"
+        case "major_outage":         return "major outage"
+        case "under_maintenance":    return "maintenance"
+        default:                     return status
         }
     }
 
