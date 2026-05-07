@@ -1511,9 +1511,20 @@ struct UsageView: View {
 
             if showingCookieInput {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("How to get your session cookie:")
-                        .font(.caption)
-                        .fontWeight(.semibold)
+                    HStack {
+                        Text("How to get your session cookie:")
+                            .font(.caption)
+                            .fontWeight(.semibold)
+                        Spacer()
+                        Button(action: {
+                            NSWorkspace.shared.open(URL(string: "https://github.com/Artzainnn/ClaudeUsageBar/blob/main/setup-guide.png")!)
+                        }) {
+                            Text("View tutorial →")
+                                .font(.caption2)
+                                .foregroundColor(.blue)
+                        }
+                        .buttonStyle(.borderless)
+                    }
 
                     VStack(alignment: .leading, spacing: 4) {
                         Text("1. Go to Settings > Usage on claude.ai")
