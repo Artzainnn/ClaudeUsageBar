@@ -71,7 +71,12 @@ dot_clean "$APP_PATH" 2>/dev/null
 # Sign with Developer ID certificate. NEVER silently fall back to ad-hoc — that
 # fails notarization later. If real signing fails, error out loudly.
 DEVELOPER_ID="Developer ID Application: Linkko Technology Pte Ltd (Q467HQ5432)"
-if codesign --force --deep --options runtime --sign "$DEVELOPER_ID" "$APP_PATH"; then
+SIGN_IDENTITY="$DEVELOPER_ID"
+if ! security find-identity -v -p codesigning 2>/dev/null | grep -q "$DEVELOPER_ID"; then
+    echo "⚠️  Developer ID cert not in keychain — signing ad-hoc (local builds only, NOT notarizable)"
+    SIGN_IDENTITY="-"
+fi
+if codesign --force --deep --options runtime --sign "$SIGN_IDENTITY" "$APP_PATH"; then
     echo "✅ App signed with Developer ID"
     if codesign --verify --verbose=2 "$APP_PATH" 2>&1 | grep -q "valid on disk"; then
         echo "✅ Signature verified"
