@@ -211,13 +211,9 @@
       border: 1px solid rgba(218,119,86,.3);
       border-radius: 20px;
       padding: 40px;
-      display: grid;
-      grid-template-columns: 1fr auto;
-      gap: 40px;
-      align-items: center;
     }
     @media (max-width: 760px) {
-      .cta { grid-template-columns: 1fr; padding: 28px; gap: 28px; text-align: center; }
+      .cta { padding: 28px; text-align: center; }
     }
     .cta h2 {
       font-size: 24px; font-weight: 700;
@@ -225,21 +221,18 @@
     }
     .cta-lead {
       color: var(--text-secondary);
-      font-size: 14px; margin-bottom: 18px;
+      font-size: 14px; margin-bottom: 22px;
     }
     .cta-lead b { color: var(--text-primary); }
-    .cta-feats {
-      list-style: none; display: flex; flex-direction: column; gap: 6px;
-      margin-bottom: 22px;
-    }
-    .cta-feats li {
-      font-size: 13px; color: var(--text-secondary);
-    }
     .cta-buttons {
-      display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+      display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
     }
     @media (max-width: 760px) {
-      .cta-buttons { justify-content: center; }
+      .cta-buttons {
+        flex-direction: column;
+        align-items: center;
+        gap: 14px;
+      }
     }
     .cta-button {
       display: inline-block;
@@ -258,27 +251,6 @@
       font-size: 13px;
     }
     .cta-secondary:hover { color: var(--text-primary); }
-
-    /* Mini menu bar mock for the CTA */
-    .mac-mock {
-      display: flex; flex-direction: column; align-items: center; gap: 14px;
-    }
-    .mock-menubar {
-      display: flex; align-items: center; gap: 18px;
-      padding: 8px 18px;
-      background: #2d2d2d;
-      border-radius: 8px;
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 13px; color: var(--text-secondary);
-      box-shadow: 0 8px 24px rgba(0,0,0,.4);
-    }
-    .mock-menubar .file,
-    .mock-menubar .dots { opacity: .55; }
-    .mock-spark { display: inline-flex; align-items: center; gap: 6px; color: #21c55d; font-weight: 600; }
-    .mock-spark.bad { color: #ff8c42; }
-    .mock-caption {
-      font-size: 11px; color: var(--text-muted);
-    }
 
     /* Footer */
     footer {
@@ -353,29 +325,11 @@
 <!-- CTA -->
 <section class="cta-section">
   <div class="cta">
-    <div>
-      <h2>Get notified on your Mac</h2>
-      <p class="cta-lead"><b>ClaudeUsageBar</b> is a free, open-source macOS menu bar app. It quietly tracks your Claude usage limits (5-hour session + weekly) and pings you the moment a Claude service you depend on goes down.</p>
-      <ul class="cta-feats">
-        <li>🟢 Color-coded indicator right in your menu bar</li>
-        <li>🔔 Smart alerts only for the services you tick</li>
-        <li>📊 Real-time view of your Claude usage</li>
-      </ul>
-      <div class="cta-buttons">
-        <a class="cta-button" href="https://github.com/Artzainnn/ClaudeUsageBar/releases/latest/download/ClaudeUsageBar-Installer.dmg" data-fast-goal="download_macos">Download for macOS</a>
-        <a class="cta-secondary" href="/">See all features →</a>
-      </div>
-    </div>
-    <div class="mac-mock">
-      <div class="mock-menubar">
-        <span class="file">File</span>
-        <span class="dots">···</span>
-        <span class="mock-spark" id="mockSpark">
-          <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M8 1L9 6L13 3L10 7L15 8L10 9L13 13L9 10L8 15L7 10L3 13L6 9L1 8L6 7L3 3L7 6L8 1Z"/></svg>
-          <span id="mockPct">52%</span>
-        </span>
-      </div>
-      <div class="mock-caption">Lives quietly in your menu bar</div>
+    <h2>Track Claude usage from your Mac</h2>
+    <p class="cta-lead"><b>ClaudeUsageBar</b> is a free, open-source macOS menu bar app. It quietly tracks your Claude usage limits (5-hour session + weekly) and pings you the moment a Claude service you depend on goes down.</p>
+    <div class="cta-buttons">
+      <a class="cta-button" href="https://github.com/Artzainnn/ClaudeUsageBar/releases/latest/download/ClaudeUsageBar-Installer.dmg" data-fast-goal="download_macos">Download for free</a>
+      <a class="cta-secondary" href="/">See all features →</a>
     </div>
   </div>
 </section>
@@ -555,10 +509,6 @@
 
     document.getElementById('statusChecked').textContent =
       `Last checked ${relativeTime(checkedAt)} · auto-refreshes every 60s`;
-
-    // CTA mock spark color follows current status
-    const spark = document.getElementById('mockSpark');
-    if (spark) spark.classList.toggle('bad', ind !== 'none');
 
     // Last 5 incidents touching tracked components
     const filtered = recentIncidents
