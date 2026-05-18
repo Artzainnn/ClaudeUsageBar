@@ -48,34 +48,19 @@
 .nav-status-dot.monitoring,
 .footer-status-dot.monitoring    { background: #4f7a8c; box-shadow: 0 0 0 3px rgba(79,122,140,.22); }
 
-/* Footer download CTA + layout */
-.footer-cta-bar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 20px;
-  flex-wrap: wrap;
-  padding: 20px 0 24px;
-  border-bottom: 1px solid #27272a;
-  margin-bottom: 20px;
+/* Footer-specific compact styling: pill is slightly smaller; Free download
+   sits inline with the other footer links but with the accent color. */
+.footer-status-pill {
+  font-size: 12px;
+  padding: 4px 10px;
+  vertical-align: middle;
 }
-@media (max-width: 640px) {
-  .footer-cta-bar {
-    flex-direction: column;
-    gap: 16px;
-    text-align: center;
-  }
-}
-.footer-download-cta {
-  display: inline-block;
-  background: #da7756;
-  color: white !important;
-  padding: 11px 22px;
-  border-radius: 10px;
+.footer-status-pill .footer-status-dot { width: 7px; height: 7px; }
+
+.footer-cta-link {
+  color: #da7756 !important;
   font-weight: 600;
-  font-size: 14px;
   text-decoration: none;
-  transition: background .2s, transform .1s;
+  transition: color .2s;
 }
-.footer-download-cta:hover { background: #b85a42; }
-.footer-download-cta:active { transform: translateY(1px); }
+.footer-cta-link:hover { color: #b85a42 !important; }
