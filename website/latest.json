@@ -1,7 +1,7 @@
 {
-  "version": "1.1",
-  "title": "Claude status alerts + auto update notifications",
-  "description": "ClaudeUsageBar now shows Anthropic service status in the popup and notifies you on outages. It also alerts you when a new version is released.",
+  "version": "1.2",
+  "title": "Better notifications + improved cookie setup link",
+  "description": "Separate toggles for Usage vs Status notifications, a clickable tutorial link inside the cookie setup, and a behind-the-scenes infra fix so future versions cost nothing to run. Highly recommended upgrade.",
   "buttons": [
     {
       "label": "Download",
