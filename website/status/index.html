@@ -514,6 +514,7 @@
       { id: ids.gov,     name: 'Claude for Government',                status: 'operational' },
     ];
     recentIncidents = [
+      // Active — one of each status
       {
         id: 'demo-1', name: 'Elevated errors on Claude Opus 4.5 and Sonnet 4.5',
         status: 'investigating',
@@ -534,6 +535,21 @@
         body: 'A fix has been deployed and we are monitoring the results.',
         updatedAt: new Date(Date.now() - 25 * 60 * 1000),
         componentIds: [ids.console],
+      },
+      // Recent history (resolved)
+      {
+        id: 'demo-4', name: 'Elevated errors on Claude Opus 4.5',
+        status: 'resolved',
+        body: 'This incident has been resolved.',
+        updatedAt: new Date(Date.now() - 26 * 3600 * 1000),
+        componentIds: [ids.api],
+      },
+      {
+        id: 'demo-5', name: 'Claude API: regional connectivity issue',
+        status: 'resolved',
+        body: 'This incident has been resolved.',
+        updatedAt: new Date(Date.now() - 48 * 3600 * 1000),
+        componentIds: [ids.api],
       },
     ];
     ensureSelectionInitialized();
