@@ -417,6 +417,7 @@
     return null;
   }
   function saveSelection() {
+    if (DEMO) return; // Demo selections are ephemeral — don't pollute real prefs
     localStorage.setItem(STORAGE_KEY, JSON.stringify([...selectedIds]));
   }
 
@@ -552,7 +553,9 @@
         componentIds: [ids.api],
       },
     ];
-    ensureSelectionInitialized();
+    // In demo mode, ignore user's localStorage selection and track everything
+    // so the demo incidents are always visible.
+    selectedIds = new Set(allComponents.map(c => c.id));
     render(new Date());
   }
 
