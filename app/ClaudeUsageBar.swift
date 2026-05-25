@@ -90,25 +90,39 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Check if app has Accessibility permissions
         let trusted = AXIsProcessTrusted()
 
-        if !trusted {
-            NSLog("⚠️ Accessibility permissions not granted")
-            // Show alert to guide user
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                let alert = NSAlert()
-                alert.messageText = "Accessibility Permission Required"
-                alert.informativeText = "ClaudeUsageBar needs Accessibility permission to use the Cmd+U keyboard shortcut.\n\nPlease enable it in:\nSystem Settings → Privacy & Security → Accessibility"
-                alert.alertStyle = .informational
-                alert.addButton(withTitle: "Open System Settings")
-                alert.addButton(withTitle: "Skip for Now")
-
-                let response = alert.runModal()
-                if response == .alertFirstButtonReturn {
-                    // Open System Settings
-                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
-                }
-            }
-        } else {
+        if trusted {
             NSLog("✅ Accessibility permissions granted")
+            return
+        }
+
+        NSLog("⚠️ Accessibility permissions not granted")
+
+        // If the user previously chose "Skip for Now", honor that choice and
+        // don't keep re-prompting on every launch. They can still grant the
+        // permission later via the "Grant Accessibility Permission" button in
+        // Settings, which opens System Settings directly.
+        if UserDefaults.standard.bool(forKey: "accessibility_prompt_dismissed") {
+            NSLog("⏭️ Accessibility prompt previously dismissed — not re-prompting")
+            return
+        }
+
+        // Show alert to guide user
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            let alert = NSAlert()
+            alert.messageText = "Accessibility Permission Required"
+            alert.informativeText = "ClaudeUsageBar needs Accessibility permission to use the Cmd+U keyboard shortcut.\n\nPlease enable it in:\nSystem Settings → Privacy & Security → Accessibility"
+            alert.alertStyle = .informational
+            alert.addButton(withTitle: "Open System Settings")
+            alert.addButton(withTitle: "Skip for Now")
+
+            let response = alert.runModal()
+            if response == .alertFirstButtonReturn {
+                // Open System Settings
+                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+            } else {
+                // "Skip for Now" — remember the choice so we don't re-prompt on every launch
+                UserDefaults.standard.set(true, forKey: "accessibility_prompt_dismissed")
+            }
         }
     }
 
