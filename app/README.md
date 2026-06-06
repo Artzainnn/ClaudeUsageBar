@@ -102,14 +102,14 @@ Access settings by clicking the gear icon in the popup:
 - ✅ **All data stays on your Mac** - stored in UserDefaults only
 - ✅ **No analytics or tracking** - zero external services
 - ✅ **Session cookies stored locally** - never sent anywhere except claude.ai
-- ✅ **No hardcoded credentials** - org ID extracted dynamically from your cookie
+- ✅ **No hardcoded credentials** - org ID extracted dynamically from your cookie; if extraction fails, you can set it manually in the app UI
 - ✅ **Open source** - review the code yourself
 
 ## 🎯 How It Works
 
 1. Uses your session cookie to authenticate with claude.ai API
 2. Fetches usage data from the same endpoints the website uses
-3. Extracts org ID dynamically from your cookie
+3. Extracts org ID dynamically from your cookie — and if that fails, you can set it manually in the "Set Session Cookie" panel
 4. Displays real-time usage in your menu bar
 5. Sends notifications when you hit usage thresholds
 
