@@ -91,19 +91,6 @@ The built app will be in `app/build/ClaudeUsageBar.app`
 - `app/build.sh` - Build script
 - `app/create_dmg.sh` - DMG installer creation
 - `website/index.html` - Landing page
-- `tools/stripe_payments_export.py` - Internal Stripe payment contact export helper
-
-### Internal Stripe Payment Export
-
-For internal donation/payment follow-up workflows, export successful Stripe payments to CSV:
-
-```bash
-STRIPE_API_KEY=rk_live_... python3 tools/stripe_payments_export.py --output stripe_payments.csv
-```
-
-The script reads the key only from `STRIPE_API_KEY`; never commit or paste the key into the repo.
-It fetches successful PaymentIntents and uses Checkout Sessions / Charges as fallbacks for name,
-email, amount, currency, and payment IDs.
 
 ### Key Technologies
 
