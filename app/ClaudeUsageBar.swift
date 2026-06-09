@@ -59,6 +59,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self.statusManager.fetch()
         }
 
+        // Foundation Timers are paused while the Mac sleeps and do not catch
+        // up missed ticks on wake — so without this, the menu bar can show
+        // pre-sleep stale data for up to 5 minutes after resume. Refetch
+        // immediately when the system wakes.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            NSLog("⏰ Mac woke from sleep — refetching usage and status")
+            self?.usageManager.fetchUsage()
+            self?.statusManager.fetch()
+        }
+
         // App updates are infrequent (new release at most weekly) — poll every 3 hours.
         Timer.scheduledTimer(withTimeInterval: 3 * 3600, repeats: true) { _ in
             self.updateManager.fetch()
