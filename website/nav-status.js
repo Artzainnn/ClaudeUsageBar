@@ -49,14 +49,28 @@
 
   function chooseState(data) {
     const selected = getSelectedIds(data.components);
-    const relevant = data.incidents.filter(i =>
-      i.componentIds.length === 0 || i.componentIds.some(id => selected.has(id))
+    // Mirror the status-page card: only show a non-green state when a TRACKED
+    // component is actually degraded. An incident lingering in "monitoring"
+    // while its components are already back to operational must NOT grey the
+    // pill (that mismatch is exactly what made the dot look grey while the card
+    // showed all-green).
+    const degraded = new Set(
+      data.components
+        .filter(c => selected.has(c.id) && c.status !== 'operational')
+        .map(c => c.id)
     );
-    if (!relevant.length) return 'operational';
+    if (!degraded.size) return 'operational';
+    // Pick the incident lifecycle state, but only from incidents that hit a
+    // currently-degraded tracked component.
+    const relevant = data.incidents.filter(i =>
+      i.componentIds.some(id => degraded.has(id))
+    );
     if (relevant.some(i => i.status === 'investigating')) return 'investigating';
     if (relevant.some(i => i.status === 'identified'))    return 'identified';
     if (relevant.some(i => i.status === 'monitoring'))    return 'monitoring';
-    return 'operational';
+    // A tracked component is degraded but no matching incident state — still
+    // not green; surface it as monitoring rather than hiding the problem.
+    return 'monitoring';
   }
 
   function applyState(state) {
