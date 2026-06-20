@@ -29,24 +29,25 @@
   transition: background-color .3s, box-shadow .3s;
 }
 
-/* State colors */
+/* State colors — severity model, identical palette to the status-page card
+   (none/minor/major/critical => green/yellow/orange/red). */
 .nav-status-pill.operational,
-.footer-status-pill.operational  { border-color: rgba(33, 197, 93, .45); }
-.nav-status-pill.investigating,
-.footer-status-pill.investigating { border-color: rgba(217, 83, 79, .55); }
-.nav-status-pill.identified,
-.footer-status-pill.identified    { border-color: rgba(240, 173, 78, .55); }
-.nav-status-pill.monitoring,
-.footer-status-pill.monitoring    { border-color: rgba(79, 122, 140, .65); }
+.footer-status-pill.operational { border-color: rgba(33, 197, 93, .45); }
+.nav-status-pill.minor,
+.footer-status-pill.minor       { border-color: rgba(250, 204, 21, .55); }
+.nav-status-pill.major,
+.footer-status-pill.major       { border-color: rgba(255, 140, 66, .55); }
+.nav-status-pill.critical,
+.footer-status-pill.critical    { border-color: rgba(255, 59, 48, .55); }
 
 .nav-status-dot.operational,
-.footer-status-dot.operational   { background: #21c55d; box-shadow: 0 0 0 3px rgba(33,197,93,.18); }
-.nav-status-dot.investigating,
-.footer-status-dot.investigating { background: #d9534f; box-shadow: 0 0 0 3px rgba(217,83,79,.18); }
-.nav-status-dot.identified,
-.footer-status-dot.identified    { background: #f0ad4e; box-shadow: 0 0 0 3px rgba(240,173,78,.18); }
-.nav-status-dot.monitoring,
-.footer-status-dot.monitoring    { background: #4f7a8c; box-shadow: 0 0 0 3px rgba(79,122,140,.22); }
+.footer-status-dot.operational { background: #21c55d; box-shadow: 0 0 0 3px rgba(33,197,93,.18); }
+.nav-status-dot.minor,
+.footer-status-dot.minor       { background: #facc15; box-shadow: 0 0 0 3px rgba(250,204,21,.18); }
+.nav-status-dot.major,
+.footer-status-dot.major       { background: #ff8c42; box-shadow: 0 0 0 3px rgba(255,140,66,.18); }
+.nav-status-dot.critical,
+.footer-status-dot.critical    { background: #ff3b30; box-shadow: 0 0 0 3px rgba(255,59,48,.18); }
 
 /* Footer-specific compact styling: pill is slightly smaller; Free download
    sits inline with the other footer links but with the accent color. */
