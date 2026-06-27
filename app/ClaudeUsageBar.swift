@@ -59,6 +59,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self.statusManager.fetch()
         }
 
+        // Refresh menu bar title every minute so the session countdown stays accurate
+        // (no network call — only re-renders the title from already-fetched data).
+        Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in
+            if self.usageManager.showSessionTimeInMenuBar {
+                self.usageManager.updateStatusBar()
+            }
+        }
+
         // App updates are infrequent (new release at most weekly) — poll every 3 hours.
         Timer.scheduledTimer(withTimeInterval: 3 * 3600, repeats: true) { _ in
             self.updateManager.fetch()
@@ -230,7 +238,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func updateStatusIcon(percentage: Int) {
+    func updateStatusIcon(percentage: Int, timeRemaining: String? = nil) {
         guard let button = statusItem.button else { return }
 
         // Determine color based on percentage
@@ -248,7 +256,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Set image and title
         button.image = sparkIcon
-        button.title = " \(percentage)%"
+        if let timeRemaining = timeRemaining {
+            button.title = " \(percentage)% · \(timeRemaining)"
+        } else {
+            button.title = " \(percentage)%"
+        }
     }
 
     func createSparkIcon(color: NSColor) -> NSImage {
@@ -332,6 +344,7 @@ class UsageManager: ObservableObject {
     @Published var hasFetchedData: Bool = false
     @Published var isAccessibilityEnabled: Bool = false
     @Published var shortcutEnabled: Bool = true
+    @Published var showSessionTimeInMenuBar: Bool = false
 
     private var statusItem: NSStatusItem?
     private var sessionCookie: String = ""
@@ -388,6 +401,8 @@ class UsageManager: ObservableObject {
         } else {
             shortcutEnabled = UserDefaults.standard.bool(forKey: "shortcut_enabled")
         }
+
+        showSessionTimeInMenuBar = UserDefaults.standard.bool(forKey: "show_session_time_in_menubar")
     }
 
     func saveSettings() {
@@ -395,6 +410,7 @@ class UsageManager: ObservableObject {
         UserDefaults.standard.set(statusNotificationsEnabled, forKey: "status_notifications_enabled")
         UserDefaults.standard.set(openAtLogin, forKey: "open_at_login")
         UserDefaults.standard.set(shortcutEnabled, forKey: "shortcut_enabled")
+        UserDefaults.standard.set(showSessionTimeInMenuBar, forKey: "show_session_time_in_menubar")
         UserDefaults.standard.synchronize()
     }
 
@@ -638,11 +654,27 @@ class UsageManager: ObservableObject {
     func updateStatusBar() {
         let sessionPercent = Int((Double(sessionUsage) / Double(sessionLimit)) * 100)
 
-        // Update the icon color
-        delegate?.updateStatusIcon(percentage: sessionPercent)
+        // Update the icon color (and optionally the time remaining until session resets)
+        let timeRemaining = showSessionTimeInMenuBar ? formatTimeUntilReset(sessionResetsAt) : nil
+        delegate?.updateStatusIcon(percentage: sessionPercent, timeRemaining: timeRemaining)
 
         // Check for notification thresholds
         checkNotificationThresholds(percentage: sessionPercent)
+    }
+
+    private func formatTimeUntilReset(_ resetsAt: Date?) -> String? {
+        guard let resetsAt = resetsAt else { return nil }
+        let seconds = Int(resetsAt.timeIntervalSinceNow)
+        guard seconds > 0 else { return nil }
+        let hours = seconds / 3600
+        let minutes = (seconds % 3600) / 60
+        if hours > 0 {
+            return "\(hours)h\(String(format: "%02d", minutes))"
+        } else if minutes > 0 {
+            return "\(minutes)m"
+        } else {
+            return "<1m"
+        }
     }
 
     func checkNotificationThresholds(percentage: Int) {
@@ -1618,6 +1650,25 @@ struct UsageView: View {
                             Text("Launch app automatically when you log in")
                                 .font(.caption2)
                                 .foregroundColor(.secondary)
+                        }
+                    }
+                    .toggleStyle(.checkbox)
+
+                    Toggle(isOn: Binding(
+                        get: { usageManager.showSessionTimeInMenuBar },
+                        set: { newValue in
+                            usageManager.showSessionTimeInMenuBar = newValue
+                            usageManager.saveSettings()
+                            usageManager.updateStatusBar()
+                        }
+                    )) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Show Session Time in Menu Bar")
+                                .font(.caption)
+                            Text("Display time remaining until the 5-hour session resets, next to the usage percentage")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                     }
                     .toggleStyle(.checkbox)
