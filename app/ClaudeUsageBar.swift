@@ -312,6 +312,14 @@ struct Main {
     }
 }
 
+// One per-model weekly limit (e.g. Fable), from the API's `limits` array.
+struct ScopedWeeklyLimit: Identifiable, Equatable {
+    let id: String        // model display name
+    let name: String      // e.g. "Fable" — taken straight from the API
+    let percentage: Double // 0.0–1.0
+    let resetsAt: Date?
+}
+
 class UsageManager: ObservableObject {
     @Published var sessionUsage: Int = 0
     @Published var sessionLimit: Int = 100
@@ -322,6 +330,7 @@ class UsageManager: ObservableObject {
     @Published var sessionResetsAt: Date?
     @Published var weeklyResetsAt: Date?
     @Published var weeklySonnetResetsAt: Date?
+    @Published var scopedWeeklyLimits: [ScopedWeeklyLimit] = []
     @Published var lastUpdated: Date = Date()
     @Published var isLoading: Bool = false
     @Published var errorMessage: String?
@@ -419,6 +428,7 @@ class UsageManager: ObservableObject {
         sessionResetsAt = nil
         weeklyResetsAt = nil
         weeklySonnetResetsAt = nil
+        scopedWeeklyLimits = []
         hasFetchedData = false
         hasWeeklySonnet = false
         errorMessage = nil
@@ -620,8 +630,33 @@ class UsageManager: ObservableObject {
                 hasWeeklySonnet = false
             }
 
+            // Per-model weekly limits (e.g. Fable) from the modern `limits` array.
+            // The web shows these under "Weekly limits" as separate rows; mirror that.
+            var parsedScoped: [ScopedWeeklyLimit] = []
+            if let limits = json["limits"] as? [[String: Any]] {
+                for limit in limits {
+                    guard (limit["group"] as? String) == "weekly",
+                          (limit["kind"] as? String) == "weekly_scoped",
+                          let scope = limit["scope"] as? [String: Any],
+                          let model = scope["model"] as? [String: Any],
+                          let name = model["display_name"] as? String else { continue }
+                    let percentInt = (limit["percent"] as? Int) ?? Int((limit["percent"] as? Double) ?? 0)
+                    var resetsAt: Date? = nil
+                    if let resetsAtString = limit["resets_at"] as? String {
+                        resetsAt = iso8601Formatter.date(from: resetsAtString)
+                    }
+                    parsedScoped.append(ScopedWeeklyLimit(
+                        id: name,
+                        name: name,
+                        percentage: Double(percentInt) / 100.0,
+                        resetsAt: resetsAt
+                    ))
+                }
+            }
+            scopedWeeklyLimits = parsedScoped
+
             // Log what we found
-            NSLog("✅ Parsed: Session \(sessionUsage)%, Weekly \(weeklyUsage)%\(hasWeeklySonnet ? ", Weekly Sonnet \(weeklySonnetUsage)%" : "")")
+            NSLog("✅ Parsed: Session \(sessionUsage)%, Weekly \(weeklyUsage)%\(hasWeeklySonnet ? ", Weekly Sonnet \(weeklySonnetUsage)%" : "")\(parsedScoped.isEmpty ? "" : ", scoped: " + parsedScoped.map { "\($0.name) \(Int($0.percentage * 100))%" }.joined(separator: ", "))")
 
             lastUpdated = Date()
             errorMessage = nil
@@ -1356,6 +1391,29 @@ struct UsageView: View {
                         .tint(colorForPercentage(usageManager.weeklySonnetPercentage))
 
                     Text("\(Int(usageManager.weeklySonnetPercentage * 100))% used")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+
+            // Per-model weekly limits (e.g. Fable) — labels come straight from the API
+            ForEach(usageManager.scopedWeeklyLimits) { limit in
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text(limit.name)
+                            .font(.subheadline)
+                        Spacer()
+                        if let resetTime = limit.resetsAt {
+                            Text("Resets \(formatResetTime(resetTime, includeDate: true))")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+
+                    ProgressView(value: limit.percentage)
+                        .tint(colorForPercentage(limit.percentage))
+
+                    Text("\(Int(limit.percentage * 100))% used")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
