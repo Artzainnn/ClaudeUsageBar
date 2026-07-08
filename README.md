@@ -60,7 +60,6 @@ A lightweight, open-source macOS menu bar application that displays your Claude.
 
 ```
 app/        - macOS menu bar application (Swift/SwiftUI)
-website/    - Landing page (HTML/CSS)
 ```
 
 ## 🛠️ Build from Source
@@ -90,7 +89,6 @@ The built app will be in `app/build/ClaudeUsageBar.app`
 - `app/ClaudeUsageBar.swift` - Main application code
 - `app/build.sh` - Build script
 - `app/create_dmg.sh` - DMG installer creation
-- `website/index.html` - Landing page
 
 ### Key Technologies
 
@@ -107,7 +105,6 @@ Contributions are welcome! Here's how you can help:
 - 💡 Suggest features or improvements
 - 🔧 Submit pull requests
 - 📖 Improve documentation
-- 🌍 Translate the website
 
 ## 📄 License
 
@@ -125,7 +122,6 @@ If you find this useful, consider:
 
 ## 🔗 Links
 
-- **Website:** [claudeusagebar.com](https://claudeusagebar.com)
 - **Issues:** [GitHub Issues](https://github.com/Artzainnn/claudeusagebar/issues)
 - **Releases:** [GitHub Releases](https://github.com/Artzainnn/claudeusagebar/releases)
 
