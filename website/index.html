@@ -248,11 +248,11 @@
       border-radius: 100px;
     }
 
-    .announce-bar-arrow { opacity: 0.85; transition: transform 0.2s ease; }
-    .announce-bar:hover .announce-bar-arrow { transform: translateX(3px); }
+    .announce-bar-sep { opacity: 0.5; font-weight: 400; }
 
     @media (max-width: 480px) {
-      .announce-bar { font-size: 12px; height: 38px; gap: 6px; }
+      .announce-bar { font-size: 13.5px; height: 40px; pointer-events: none; }
+      .announce-bar-cta { display: none; }
     }
 
     .hero-icon {
@@ -1084,10 +1084,9 @@
 <body style="background-color: #0d0d0f;">
 
   <!-- Full-width announcement banner -->
-  <a href="#features" class="announce-bar">
+  <a href="https://github.com/Artzainnn/ClaudeUsageBar/releases/latest/download/ClaudeUsageBar-Installer.dmg" class="announce-bar" data-fast-goal="download_macos">
     <span class="announce-bar-tag">NEW</span>
-    Now tracking Fable usage
-    <svg class="announce-bar-arrow" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+    Now tracking Fable usage<span class="announce-bar-cta"> <span class="announce-bar-sep">•</span> Free Download</span>
   </a>
   <div class="ambient"></div>
 
