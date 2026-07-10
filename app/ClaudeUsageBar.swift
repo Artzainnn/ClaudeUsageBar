@@ -976,8 +976,25 @@ struct AvailableUpdate: Equatable {
     let buttons: [BannerButton]
 }
 
+// Free-form message channel, decoupled from the app version. Driven by the
+// `message` object in latest.json and keyed on `id` (not version), so any
+// message can be sent at any time without shipping a new build. Every field is
+// author-controlled — including the notification title, which is NOT possible
+// on the legacy version-based channel.
+struct Announcement: Equatable {
+    let id: String
+    let heading: String?          // optional small top line on the card (nil = none)
+    let title: String
+    let body: String
+    let buttons: [BannerButton]
+    let notify: Bool              // false = show the in-app card only, no OS notification
+    let notifTitle: String        // fully custom notification title
+    let notifBody: String         // fully custom notification body
+}
+
 class UpdateManager: ObservableObject {
     @Published var available: AvailableUpdate?
+    @Published var announcement: Announcement?
 
     // Served directly from the repo via GitHub — free, unlimited, no Vercel meter.
     // Same file as website/latest.json so existing v1.1 users on Vercel see the same JSON.
@@ -1031,46 +1048,97 @@ class UpdateManager: ObservableObject {
         URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
             guard let self = self,
                   let data = data,
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let version = json["version"] as? String,
-                  let title = json["title"] as? String,
-                  let body = json["description"] as? String else {
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 NSLog("⚠️ Update fetch failed or invalid payload")
                 return
             }
 
-            let buttons = Self.parseButtons(from: json)
+            // ---- Legacy version-update channel (for real releases; also what
+            //      pre-1.3.1 apps rely on). Optional — absent fields = no update.
+            let updatePayload: AvailableUpdate? = {
+                guard let version = json["version"] as? String,
+                      let title = json["title"] as? String,
+                      let body = json["description"] as? String else { return nil }
+                return AvailableUpdate(version: version, title: title, body: body,
+                                       buttons: Self.parseButtons(from: json))
+            }()
+
+            // ---- Free-form message channel (`message` object, keyed on `id`).
+            //      Every field author-controlled, including the notification title.
+            let announcementPayload: Announcement? = {
+                guard let msg = json["message"] as? [String: Any],
+                      let id = msg["id"] as? String, !id.isEmpty else { return nil }
+                let title = msg["title"] as? String ?? ""
+                let body  = msg["body"]  as? String ?? ""
+                let notif = msg["notification"] as? [String: Any]
+                return Announcement(
+                    id: id,
+                    heading: msg["heading"] as? String,
+                    title: title,
+                    body: body,
+                    buttons: Self.parseButtons(from: msg),
+                    notify: (msg["notify"] as? Bool) ?? true,
+                    notifTitle: (notif?["title"] as? String) ?? (title.isEmpty ? "ClaudeUsageBar" : title),
+                    notifBody:  (notif?["body"]  as? String) ?? body
+                )
+            }()
 
             DispatchQueue.main.async {
-                guard self.isNewer(remote: version, than: self.currentVersion) else {
+                // Version-update channel
+                if let update = updatePayload, self.isNewer(remote: update.version, than: self.currentVersion) {
+                    if self.available != update {
+                        self.available = update
+                        NSLog("⬆️ Update available: \(update.version)")
+                    }
+                    let lastNotified = UserDefaults.standard.string(forKey: "last_notified_update_version")
+                    if lastNotified != update.version {
+                        let n = NSUserNotification()
+                        n.title = "ClaudeUsageBar \(update.version) is available"
+                        n.informativeText = update.title
+                        n.soundName = NSUserNotificationDefaultSoundName
+                        NSUserNotificationCenter.default.deliver(n)
+                        UserDefaults.standard.set(update.version, forKey: "last_notified_update_version")
+                        NSLog("📬 Sent update notification for \(update.version)")
+                    }
+                } else {
                     self.available = nil
-                    return
                 }
 
-                let update = AvailableUpdate(version: version, title: title, body: body, buttons: buttons)
+                // Message channel — notify once per `id`. On the very first run
+                // that supports messages, seed the current id WITHOUT notifying so
+                // updating from an older version doesn't re-ping the live message.
+                if let ann = announcementPayload {
+                    let dismissed = UserDefaults.standard.string(forKey: "dismissed_message_id")
+                    self.announcement = (dismissed == ann.id) ? nil : ann
 
-                if self.available != update {
-                    self.available = update
-                    NSLog("⬆️ Update available: \(version)")
-                }
-
-                let lastNotified = UserDefaults.standard.string(forKey: "last_notified_update_version")
-                // Update notifications fire regardless of usage/status toggles — they're
-                // version-once and tied to user-initiated upgrade flow, not noise.
-                if lastNotified != version {
-                    let n = NSUserNotification()
-                    n.title = "ClaudeUsageBar \(version) is available"
-                    n.informativeText = title
-                    n.soundName = NSUserNotificationDefaultSoundName
-                    NSUserNotificationCenter.default.deliver(n)
-                    UserDefaults.standard.set(version, forKey: "last_notified_update_version")
-                    NSLog("📬 Sent update notification for \(version)")
+                    let lastShown = UserDefaults.standard.string(forKey: "last_shown_message_id")
+                    if lastShown == nil {
+                        UserDefaults.standard.set(ann.id, forKey: "last_shown_message_id")   // seed, no notif
+                    } else if lastShown != ann.id {
+                        if ann.notify {
+                            let n = NSUserNotification()
+                            n.title = ann.notifTitle
+                            n.informativeText = ann.notifBody
+                            n.soundName = NSUserNotificationDefaultSoundName
+                            NSUserNotificationCenter.default.deliver(n)
+                            NSLog("📬 Sent message notification for id \(ann.id)")
+                        }
+                        UserDefaults.standard.set(ann.id, forKey: "last_shown_message_id")
+                    }
+                } else {
+                    self.announcement = nil
                 }
             }
         }.resume()
     }
 
     func dismissCurrent() {
+        // Announcement takes priority in the UI, so dismiss it first if present.
+        if let id = announcement?.id {
+            UserDefaults.standard.set(id, forKey: "dismissed_message_id")
+            announcement = nil
+            return
+        }
         if let v = available?.version {
             UserDefaults.standard.set(v, forKey: "dismissed_update_version")
         }
@@ -1286,8 +1354,50 @@ struct UsageView: View {
                 .font(.headline)
                 .padding(.bottom, 4)
 
-            // App update / announcement banner
-            if let update = updateManager.available, !updateManager.isCurrentDismissed {
+            // Free-form message banner (author-controlled). Takes priority over
+            // the version-update banner when both are present.
+            if let ann = updateManager.announcement {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 6) {
+                        if let heading = ann.heading, !heading.isEmpty {
+                            Text(heading)
+                                .font(.caption)
+                                .fontWeight(.semibold)
+                        }
+                        Spacer()
+                        Button(action: { updateManager.dismissCurrent() }) {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.borderless)
+                    }
+                    if !ann.title.isEmpty {
+                        Text(ann.title)
+                            .font(.caption)
+                    }
+                    if !ann.body.isEmpty {
+                        Text(ann.body)
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if !ann.buttons.isEmpty {
+                        HStack(spacing: 6) {
+                            ForEach(ann.buttons.indices, id: \.self) { i in
+                                bannerButton(ann.buttons[i])
+                            }
+                        }
+                    }
+                }
+                .padding(8)
+                .background(Color.accentColor.opacity(0.12))
+                .cornerRadius(6)
+            }
+
+            // App update banner (version-based). Hidden while a message banner shows.
+            if updateManager.announcement == nil,
+               let update = updateManager.available, !updateManager.isCurrentDismissed {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 6) {
                         Text("⬆️")
