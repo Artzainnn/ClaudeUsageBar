@@ -1,7 +1,7 @@
 {
-  "version": "1.2.1",
-  "title": "Smaller footprint update",
-  "description": "Reduces background network usage by checking for new versions every 3 hours instead of every 5 minutes. Usage and Claude status still refresh every 5 minutes as before.",
+  "version": "1.3.0",
+  "title": "New: Fable usage bar",
+  "description": "Adds a separate weekly usage bar for the new Fable model. It appears automatically once your Fable usage goes above 1%, and stays hidden otherwise to keep things tidy.",
   "buttons": [
     {
       "label": "Download",
