@@ -102,7 +102,7 @@
     /* Navigation */
     nav {
       position: fixed;
-      top: 0;
+      top: 40px;
       left: 0;
       right: 0;
       z-index: 100;
@@ -189,7 +189,7 @@
       flex-direction: column;
       align-items: center;
       justify-content: center;
-      padding: 80px 24px 80px;
+      padding: 120px 24px 80px;
       text-align: center;
     }
 
@@ -211,6 +211,48 @@
     .hero-badge svg {
       width: 16px;
       height: 16px;
+    }
+
+    /* Full-width announcement banner (fixed, sits above the nav) */
+    .announce-bar {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 101;
+      height: 40px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 0 16px;
+      background: linear-gradient(90deg, var(--claude-orange), var(--claude-orange-dark));
+      color: #ffffff;
+      font-size: 13.5px;
+      font-weight: 600;
+      text-decoration: none;
+      white-space: nowrap;
+      transition: filter 0.2s ease;
+    }
+
+    .announce-bar:hover { filter: brightness(1.07); }
+
+    .announce-bar-tag {
+      flex-shrink: 0;
+      background: rgba(255, 255, 255, 0.22);
+      color: #ffffff;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      padding: 2px 8px;
+      border-radius: 100px;
+    }
+
+    .announce-bar-arrow { opacity: 0.85; transition: transform 0.2s ease; }
+    .announce-bar:hover .announce-bar-arrow { transform: translateX(3px); }
+
+    @media (max-width: 480px) {
+      .announce-bar { font-size: 12px; height: 38px; gap: 6px; }
     }
 
     .hero-icon {
@@ -1040,6 +1082,13 @@
   <script src="/nav-status.js" defer></script>
 </head>
 <body style="background-color: #0d0d0f;">
+
+  <!-- Full-width announcement banner -->
+  <a href="#features" class="announce-bar">
+    <span class="announce-bar-tag">NEW</span>
+    Now tracking Fable usage
+    <svg class="announce-bar-arrow" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+  </a>
   <div class="ambient"></div>
 
   <nav>
