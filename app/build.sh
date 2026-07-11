@@ -33,9 +33,22 @@ if [ -f "ClaudeUsageBar.icns" ]; then
     /usr/libexec/PlistBuddy -c "Set :CFBundleIconFile ClaudeUsageBar" "$APP_PATH/Contents/Info.plist"
 fi
 
-# Compile the Swift app for arm64
+# Compile the Swift app for arm64.
+# Log.swift, AnthropicUsageFetcher.swift, UsageProvider.swift, and the
+# Codex provider files are compiled alongside ClaudeUsageBar.swift; see the
+# header comments in those files for why the SwiftPM library boundary is
+# drawn where it is. AnthropicUsageStore stays app-only (needs UsageManager);
+# the Codex files are also in the SwiftPM library for unit testing.
 swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_arm64" \
     ClaudeUsageBar.swift \
+    Log.swift \
+    AnthropicUsageFetcher.swift \
+    UsageProvider.swift \
+    AnthropicUsageStore.swift \
+    CodexUsageFetcher.swift \
+    CodexUsageStore.swift \
+    DeepSeekUsageFetcher.swift \
+    DeepSeekUsageStore.swift \
     -framework SwiftUI \
     -framework AppKit \
     -framework WebKit \
@@ -44,6 +57,14 @@ swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_arm64" \
 # Compile for x86_64 (Intel)
 swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_x86_64" \
     ClaudeUsageBar.swift \
+    Log.swift \
+    AnthropicUsageFetcher.swift \
+    UsageProvider.swift \
+    AnthropicUsageStore.swift \
+    CodexUsageFetcher.swift \
+    CodexUsageStore.swift \
+    DeepSeekUsageFetcher.swift \
+    DeepSeekUsageStore.swift \
     -framework SwiftUI \
     -framework AppKit \
     -framework WebKit \
