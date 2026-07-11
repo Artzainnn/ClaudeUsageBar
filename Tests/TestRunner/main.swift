@@ -662,6 +662,15 @@ run("ProviderCopy.help returns DeepSeek Keychain guidance") {
     expect(ds?.contains("balance") == true)
 }
 
+run("ProviderCopy.help returns Zed guidance and no disclosure") {
+    let zed = ProviderCopy.help(for: "zed")
+    expect(zed != nil)
+    expect(zed?.contains("edit-prediction") == true)
+    expect(zed?.contains("Keychain") == true)
+    // Zed reads a first-party local credential — no private-API disclosure.
+    expect(ProviderCopy.disclosure(for: "zed") == nil)
+}
+
 // MARK: - DeepSeekUsageFetcher.parse (PR 4-BE)
 
 // Fixture shapes match api-docs.deepseek.com/api/get-user-balance: is_available

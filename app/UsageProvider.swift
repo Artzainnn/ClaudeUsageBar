@@ -197,6 +197,8 @@ public enum ProviderCopy {
             return "Codex counters cover the Codex CLI, IDE extensions, Slack, and Cloud tasks — one shared 5-hour and weekly pool. General GPT chat is not counted. Reads your existing `codex auth login` session; run it in a terminal if prompted."
         case "deepseek":
             return "Shows your DeepSeek platform balance (granted + topped-up), per currency. Paste a DeepSeek API key below; it is stored in your macOS Keychain and used only to read the balance."
+        case "zed":
+            return "Shows your Zed plan and edit-prediction usage. Reads the login Zed already saved in your Keychain — macOS will ask once to allow it. Sign in to Zed first, then click Refresh."
         default:
             return nil
         }

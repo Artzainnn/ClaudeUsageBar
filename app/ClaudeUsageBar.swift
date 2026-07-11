@@ -60,6 +60,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // defaults false) and additionally requires a pasted API key, so it
         // is doubly inert until the user both enables and configures it.
         providers.append(ProviderBox(DeepSeekUsageStore()))
+        // PR 5-UI: register Zed. Opt-in (features.zed.enabled defaults false);
+        // it reads Zed's own Keychain login on first fetch (one-time macOS
+        // prompt), so it is inert until enabled and the prompt is allowed.
+        providers.append(ProviderBox(ZedUsageStore()))
         // Model SwiftUI observes for the generic (non-Anthropic) provider
         // tiles. Anthropic continues to render through usageManager directly.
         providersModel = ProvidersModel(providers: providers)
