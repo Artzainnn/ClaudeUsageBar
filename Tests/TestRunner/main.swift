@@ -632,6 +632,28 @@ MainActor.assumeIsolated {
     defaults.removePersistentDomain(forName: suiteName)
 }
 
+// MARK: - ProviderCopy (Settings toggle copy — PR 3-UI)
+
+run("ProviderCopy.help returns Codex copy and nil for unknown") {
+    let codex = ProviderCopy.help(for: "codex")
+    expect(codex != nil)
+    expect(codex?.contains("Codex CLI") == true)
+    expect(codex?.contains("General GPT chat is not counted") == true)
+    // Honest-labels invariant: never claim to track general ChatGPT usage.
+    expect(codex?.contains("ChatGPT usage") == false)
+    expect(ProviderCopy.help(for: "anthropic") == nil)
+    expect(ProviderCopy.help(for: "unknown-provider") == nil)
+}
+
+run("ProviderCopy.disclosure warns about the private API for Codex only") {
+    let codex = ProviderCopy.disclosure(for: "codex")
+    expect(codex != nil)
+    expect(codex?.contains("private Codex API") == true)
+    expect(codex?.contains("without notice") == true)
+    expect(ProviderCopy.disclosure(for: "anthropic") == nil)
+    expect(ProviderCopy.disclosure(for: "deepseek") == nil)
+}
+
 // MARK: - Summary
 
 print("")

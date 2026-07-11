@@ -121,7 +121,13 @@ public protocol UsageProvider: AnyObject, ObservableObject {
 /// observation site did not. `ProviderBox` is the fix.
 @MainActor
 public final class ProviderBox: ObservableObject, Identifiable {
-    public let provider: any UsageProvider
+    // `nonisolated` so consumers that are not themselves main-actor-isolated
+    // (e.g. ProvidersModel.fetchEnabled, called from AppDelegate timer and
+    // lifecycle closures) can read it without an actor hop. It is an
+    // immutable `let` set once at init; the underlying provider's own methods
+    // remain main-actor-isolated, so this only exposes the reference, not
+    // unsynchronised mutable state.
+    public nonisolated let provider: any UsageProvider
     // Cached at construction rather than reaching through `provider.id` on
     // every access — keeps `id` a nonisolated stored property so the
     // Identifiable conformance is Swift-6-strict-concurrency clean.
@@ -156,6 +162,35 @@ public protocol CredentialStore {
     func read(_ key: String) -> Data?
     func write(_ key: String, _ value: Data)
     func delete(_ key: String)
+}
+
+// MARK: - ProviderCopy
+
+/// Per-provider help and disclosure copy for the Settings toggles. Kept in
+/// the library (not the app view file) so the strings are unit-testable —
+/// they are user-facing and must not silently change. Returns nil for a
+/// provider with no bespoke copy.
+public enum ProviderCopy {
+    /// Explanatory help shown under a provider's Settings toggle.
+    public static func help(for id: String) -> String? {
+        switch id {
+        case "codex":
+            return "Codex counters cover the Codex CLI, IDE extensions, Slack, and Cloud tasks — one shared 5-hour and weekly pool. General GPT chat is not counted. Reads your existing `codex auth login` session; run it in a terminal if prompted."
+        default:
+            return nil
+        }
+    }
+
+    /// A warning line shown for providers backed by a private/undocumented
+    /// API that may break without notice. Rendered in an accent colour.
+    public static func disclosure(for id: String) -> String? {
+        switch id {
+        case "codex":
+            return "Uses OpenAI's private Codex API. It may stop working without notice."
+        default:
+            return nil
+        }
+    }
 }
 
 /// UserDefaults-backed credential store. Used only for the legacy

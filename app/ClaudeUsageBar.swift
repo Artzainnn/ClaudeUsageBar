@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import WebKit
 import Carbon
+import Combine
 
 // The categorical logger (enum Log, enum LogValue) lives in Log.swift so
 // the SwiftPM library target can compile it without also compiling this
@@ -21,6 +22,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // via `providers.append(...)`. The existing UsageManager continues to
     // drive Anthropic tiles — providers[0] is a thin wrapper around it.
     var providers: [ProviderBox] = []
+    // PR 3-UI: the ObservableObject SwiftUI watches for generic provider
+    // tiles. Holds the same ProviderBox instances as `providers`.
+    var providersModel: ProvidersModel!
     var eventMonitor: Any?
     var hotKeyRef: EventHotKeyRef?
 
@@ -45,9 +49,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Initialize managers
         usageManager = UsageManager(statusItem: statusItem, delegate: self)
-        // Wrap the manager in a UsageProvider so future provider PRs can
-        // add themselves to `providers[]` without disturbing this one.
+        // Wrap the manager in a UsageProvider so additional providers can
+        // register alongside it without disturbing the Anthropic path.
         providers.append(ProviderBox(AnthropicUsageStore(manager: usageManager)))
+        // PR 3-UI: register the Codex provider. It is opt-in (feature flag
+        // features.codex.enabled defaults false), so registering it here is
+        // inert for existing users — it contributes no tiles until enabled.
+        providers.append(ProviderBox(CodexUsageStore()))
+        // Model SwiftUI observes for the generic (non-Anthropic) provider
+        // tiles. Anthropic continues to render through usageManager directly.
+        providersModel = ProvidersModel(providers: providers)
         statusManager = StatusManager()
         updateManager = UpdateManager()
 
@@ -59,13 +70,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         popover.contentViewController = NSHostingController(rootView: UsageView(
             usageManager: usageManager,
             statusManager: statusManager,
-            updateManager: updateManager
+            updateManager: updateManager,
+            providersModel: providersModel
         ))
 
         // Fetch initial data
         usageManager.fetchUsage()
         statusManager.fetch()
         updateManager.fetch()
+        // Fetch any enabled non-Anthropic providers (Codex, etc.) on launch.
+        providersModel.fetchEnabled()
+
+        // Non-Anthropic providers poll on their own cadence. Codex documents
+        // 60s while active; a single 60s timer drives every enabled provider.
+        Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in
+            self.providersModel.fetchEnabled()
+        }
 
         // Usage + Anthropic status are time-sensitive — poll every 5 min.
         Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { _ in
@@ -222,6 +242,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 self.usageManager.updatePercentages()
             }
+            // Refresh enabled non-Anthropic providers (Codex, etc.) so their
+            // tiles are current when the popover appears.
+            providersModel?.fetchEnabled()
 
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
 
@@ -1243,6 +1266,71 @@ struct PasteableTextField: NSViewRepresentable {
     }
 }
 
+// PR 3-UI: the single ObservableObject SwiftUI watches for the generic
+// (non-Anthropic) provider tiles. SwiftUI cannot observe a bare
+// `[ProviderBox]`; it needs one ObservableObject to subscribe to. This model
+// holds the boxes and re-broadcasts each box's objectWillChange, so any
+// provider state change redraws the popover. Anthropic is intentionally
+// excluded from `genericProviders` — it renders through usageManager as
+// before; this model only drives the additional providers.
+//
+// @MainActor because it reads and drives @MainActor providers (ProviderBox,
+// the stores). Every call site (AppDelegate lifecycle, timers on the main
+// runloop, the SwiftUI popover) is already on the main actor, so this adds
+// no friction. AppDelegate is annotated @MainActor to match, which AppKit
+// already guarantees at runtime.
+@MainActor
+final class ProvidersModel: ObservableObject {
+    let providers: [ProviderBox]
+    private var cancellables: [AnyCancellable] = []
+
+    init(providers: [ProviderBox]) {
+        self.providers = providers
+        for box in providers {
+            box.objectWillChange
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] _ in self?.objectWillChange.send() }
+                .store(in: &cancellables)
+        }
+    }
+
+    /// Providers rendered through the generic path — everything except
+    /// Anthropic, which keeps its bespoke rendering in UsageView.content.
+    /// `nonisolated` because `providers` is an immutable `let` and `id` is a
+    /// nonisolated stored property on ProviderBox — no main-actor state is
+    /// touched, so AppDelegate's timer/lifecycle closures can call it.
+    nonisolated var genericProviders: [ProviderBox] {
+        providers.filter { $0.id != "anthropic" }
+    }
+
+    /// The subset of generic providers the user has enabled via Settings.
+    /// Reads each provider's `isEnabled` through the `any UsageProvider`
+    /// existential, whose protocol is not @MainActor (the stores add it with
+    /// @preconcurrency), so this stays nonisolated.
+    nonisolated var enabledGenericProviders: [ProviderBox] {
+        genericProviders.filter { $0.provider.isEnabled }
+    }
+
+    /// Fetch every enabled non-Anthropic provider. Called on launch, on the
+    /// 60s timer, when the popover opens, and from the Refresh button — all
+    /// on the main thread in practice. `nonisolated` so those synchronous
+    /// call sites do not need per-site actor hops.
+    nonisolated func fetchEnabled() {
+        for box in enabledGenericProviders {
+            box.provider.fetch()
+        }
+    }
+
+    /// Force the popover to re-evaluate which provider sections are visible.
+    /// A Settings toggle writes the feature flag straight to UserDefaults,
+    /// which does not itself fire objectWillChange; the toggle calls this so
+    /// a section appears or disappears immediately on both transitions
+    /// (enabling a provider also fetches; disabling it has no other signal).
+    func providersChanged() {
+        objectWillChange.send()
+    }
+}
+
 private struct ContentHeightKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
@@ -1254,6 +1342,8 @@ struct UsageView: View {
     @ObservedObject var usageManager: UsageManager
     @ObservedObject var statusManager: StatusManager
     @ObservedObject var updateManager: UpdateManager
+    // PR 3-UI: drives the generic (non-Anthropic) provider tiles.
+    @ObservedObject var providersModel: ProvidersModel
     @State private var sessionCookieInput: String = ""
     @State private var showingCookieInput: Bool = false
     @State private var showingSettings: Bool = false
@@ -1485,6 +1575,15 @@ struct UsageView: View {
             }
             }
 
+            // PR 3-UI: generic (non-Anthropic) provider tiles. Each enabled
+            // provider contributes a section; Anthropic is rendered above via
+            // usageManager and is excluded here. Renders nothing when no such
+            // provider is enabled, so existing users see no change.
+            ForEach(providersModel.enabledGenericProviders) { box in
+                Divider()
+                ProviderSectionView(box: box)
+            }
+
             if statusManager.hasFetched {
                 Divider()
             }
@@ -1626,6 +1725,7 @@ struct UsageView: View {
                     usageManager.fetchUsage()
                     statusManager.fetch()
                     updateManager.fetch()
+                    providersModel.fetchEnabled()
                 }
                 .buttonStyle(.borderless)
                 .font(.caption)
@@ -1787,6 +1887,30 @@ struct UsageView: View {
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
+                    }
+
+                    Divider()
+
+                    // PR 3-UI: per-provider opt-in toggles. Each non-Anthropic
+                    // provider is off by default; enabling one writes its
+                    // featureFlagKey and triggers an immediate fetch.
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Providers")
+                            .font(.caption)
+                            .fontWeight(.semibold)
+                        Text("Track additional AI services. Each is opt-in; enable only the ones you use.")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        ForEach(providersModel.genericProviders) { box in
+                            ProviderToggleRow(box: box) { enabled in
+                                // Re-evaluate section visibility on both
+                                // transitions; fetch immediately on enable.
+                                if enabled { box.provider.fetch() }
+                                providersModel.providersChanged()
+                            }
+                        }
                     }
 
                     Divider()
@@ -2003,3 +2127,237 @@ struct UsageView: View {
     }
 
 }
+
+// MARK: - Generic provider rendering (PR 3-UI)
+
+/// Renders one non-Anthropic provider: a section header (display name +
+/// optional error / last-updated) followed by one UsageTileView per tile.
+/// Observes the box so provider state changes redraw this section.
+struct ProviderSectionView: View {
+    @ObservedObject var box: ProviderBox
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(box.provider.displayName)
+                    .font(.subheadline)
+                    .fontWeight(.semibold)
+                Spacer()
+                if let updated = box.provider.lastUpdated {
+                    Text("Updated \(shortTime(updated))")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+            }
+
+            if let error = box.provider.errorMessage {
+                Text(error)
+                    .font(.caption)
+                    .foregroundColor(.orange)
+            }
+
+            ForEach(box.provider.tiles) { tile in
+                UsageTileView(tile: tile)
+            }
+        }
+    }
+
+    private func shortTime(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.timeStyle = .short
+        f.dateStyle = .none
+        return f.string(from: date)
+    }
+}
+
+/// Renders a single UsageTile by switching on its Kind. This is the generic
+/// renderer every future provider reuses — adding a provider needs no new UI
+/// as long as it emits one of these kinds.
+struct UsageTileView: View {
+    let tile: UsageTile
+
+    var body: some View {
+        switch tile.kind {
+        case let .bar(fraction, resetsAt, badge):
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text(tile.title)
+                        .font(.caption)
+                    if let badge = badge, !badge.isEmpty {
+                        Text(badge)
+                            .font(.caption2)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(Color.secondary.opacity(0.2))
+                            .cornerRadius(3)
+                    }
+                    Spacer()
+                    if let resetsAt = resetsAt {
+                        Text("Resets \(resetLabel(resetsAt))")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                ProgressView(value: fraction)
+                    .tint(color(for: fraction))
+                Text("\(Int((fraction * 100).rounded()))% used")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+
+        case let .balance(remainingMinorUnits, currency, plan, resetsAt):
+            VStack(alignment: .leading, spacing: 2) {
+                HStack {
+                    Text(tile.title)
+                        .font(.caption)
+                    Spacer()
+                    Text(formatBalance(remainingMinorUnits, currency: currency))
+                        .font(.caption)
+                        .fontWeight(.semibold)
+                }
+                if let plan = plan, !plan.isEmpty {
+                    Text(plan)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+                if let resetsAt = resetsAt {
+                    Text("Resets \(resetLabel(resetsAt))")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+            }
+
+        case let .counter(used, limit, resetsAt):
+            VStack(alignment: .leading, spacing: 2) {
+                HStack {
+                    Text(tile.title)
+                        .font(.caption)
+                    Spacer()
+                    if let limit = limit {
+                        Text("\(used) / \(limit)")
+                            .font(.caption)
+                            .fontWeight(.semibold)
+                    } else {
+                        Text("\(used)")
+                            .font(.caption)
+                            .fontWeight(.semibold)
+                    }
+                }
+                if let resetsAt = resetsAt {
+                    Text("Resets \(resetLabel(resetsAt))")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+            }
+
+        case let .text(status, subtitle):
+            VStack(alignment: .leading, spacing: 2) {
+                HStack {
+                    Text(tile.title)
+                        .font(.caption)
+                    Spacer()
+                    Text(status)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                if let subtitle = subtitle, !subtitle.isEmpty {
+                    Text(subtitle)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+        case let .needsAccess(path, guidance):
+            VStack(alignment: .leading, spacing: 4) {
+                Text(tile.title)
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                Text(guidance)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(path)
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .padding(8)
+            .background(Color.secondary.opacity(0.1))
+            .cornerRadius(6)
+        }
+    }
+
+    private func color(for fraction: Double) -> Color {
+        if fraction < 0.7 { return .green }
+        if fraction < 0.9 { return .orange }
+        return .red
+    }
+
+    private func resetLabel(_ date: Date) -> String {
+        let f = DateFormatter()
+        // Include the date when the reset is more than ~a day out (weekly
+        // windows); otherwise just the time (5-hour windows).
+        if date.timeIntervalSinceNow > 86_400 {
+            f.dateFormat = "d MMM 'at' h:mm a"
+            return "on \(f.string(from: date))"
+        }
+        f.timeStyle = .short
+        f.dateStyle = .none
+        return "at \(f.string(from: date))"
+    }
+
+    private func formatBalance(_ minorUnits: Int, currency: String) -> String {
+        let major = Double(minorUnits) / 100.0
+        return String(format: "%@ %.2f", currency, major)
+    }
+}
+
+/// One opt-in checkbox for a non-Anthropic provider in Settings. Reads and
+/// writes the provider's featureFlagKey directly in UserDefaults; on enable
+/// it fires `onEnable` so the provider fetches immediately rather than
+/// waiting for the next timer tick. Below the toggle it shows provider-
+/// specific help and, where relevant, a private-API disclosure line.
+struct ProviderToggleRow: View {
+    @ObservedObject var box: ProviderBox
+    /// Called after the flag is written, with the new value, on every
+    /// toggle (both enable and disable).
+    let onChange: (Bool) -> Void
+
+    @State private var enabled: Bool = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Toggle(isOn: Binding(
+                get: { enabled },
+                set: { newValue in
+                    enabled = newValue
+                    UserDefaults.standard.set(newValue, forKey: box.provider.featureFlagKey)
+                    onChange(newValue)
+                }
+            )) {
+                Text(box.provider.displayName)
+                    .font(.caption)
+            }
+            .toggleStyle(.checkbox)
+
+            if let help = ProviderCopy.help(for: box.id) {
+                Text(help)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let disclosure = ProviderCopy.disclosure(for: box.id) {
+                Text(disclosure)
+                    .font(.caption2)
+                    .foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .onAppear {
+            enabled = UserDefaults.standard.bool(forKey: box.provider.featureFlagKey)
+        }
+    }
+}
+
