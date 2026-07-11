@@ -904,6 +904,207 @@ run("KeychainStore round-trips when a keychain is available") {
     }
 }
 
+// MARK: - ZedUsageFetcher.parse (PR 5-BE)
+
+// Fixture: zed_free. limit is Zed's UsageLimit enum: Limited(N) is the OBJECT
+// {"limited": N} on the wire (verified against Zed's cloud_api_types source),
+// NOT a bare integer. ended_at is an RFC3339 string.
+let fixtureZedFree = #"""
+{
+  "plan": {
+    "plan_v3": "zed_free",
+    "usage": { "edit_predictions": { "used": 320, "limit": {"limited": 2000} } },
+    "subscription_period": { "started_at": "2026-07-01T00:00:00.000Z", "ended_at": "2026-08-01T00:00:00.000Z" },
+    "has_overdue_invoices": false,
+    "is_account_too_young": false
+  }
+}
+"""#
+
+run("parse Zed free plan: limit as {\"limited\": N} object") {
+    let snap = try! ZedUsageFetcher.parse(fixtureZedFree.data(using: .utf8)!)
+    expectEqual(snap.planV3, "zed_free")
+    expectEqual(snap.editPredictions?.used, 320)
+    expectEqual(snap.editPredictions?.limit, 2000)
+    expect(snap.periodEndsAt != nil)
+    expectEqual(snap.hasOverdueInvoices, false)
+    expectEqual(snap.isAccountTooYoung, false)
+}
+
+// Fixture: zed_pro — Unlimited serializes as the bare STRING "unlimited".
+let fixtureZedPro = #"""
+{
+  "plan": {
+    "plan_v3": "zed_pro",
+    "usage": { "edit_predictions": { "used": 5123, "limit": "unlimited" } },
+    "subscription_period": { "ended_at": "2026-08-15T00:00:00.000Z" },
+    "has_overdue_invoices": false,
+    "is_account_too_young": false
+  }
+}
+"""#
+
+run("parse Zed pro plan: limit \"unlimited\" string -> nil") {
+    let snap = try! ZedUsageFetcher.parse(fixtureZedPro.data(using: .utf8)!)
+    expectEqual(snap.planV3, "zed_pro")
+    expectEqual(snap.editPredictions?.used, 5123)
+    expect(snap.editPredictions?.limit == nil)   // unlimited
+}
+
+// UsageLimit parsing in isolation — the non-obvious wire encoding.
+run("parseUsageLimit maps object, unlimited string, and defensively bare int") {
+    expectEqual(ZedUsageFetcher.parseUsageLimit(["limited": 500]), 500)
+    expect(ZedUsageFetcher.parseUsageLimit("unlimited") == nil)
+    expect(ZedUsageFetcher.parseUsageLimit(nil) == nil)
+    expectEqual(ZedUsageFetcher.parseUsageLimit(42), 42)          // defensive
+    expectEqual(ZedUsageFetcher.parseUsageLimit("50"), 50)        // header-style
+}
+
+// Fixture: overdue invoices flag true.
+let fixtureZedOverdue = #"""
+{
+  "plan": {
+    "plan_v3": "zed_pro",
+    "usage": { "edit_predictions": { "used": 10, "limit": "unlimited" } },
+    "has_overdue_invoices": true,
+    "is_account_too_young": false
+  }
+}
+"""#
+
+run("parse Zed plan with overdue invoices") {
+    let snap = try! ZedUsageFetcher.parse(fixtureZedOverdue.data(using: .utf8)!)
+    expectEqual(snap.hasOverdueInvoices, true)
+}
+
+run("parse Zed tolerates plan block at top level (no wrapper)") {
+    // Some versions may return the plan block directly.
+    let bytes = #"""
+    {"plan_v3": "zed_free", "usage": {"edit_predictions": {"used": 1, "limit": 2000}}}
+    """#.data(using: .utf8)!
+    let snap = try! ZedUsageFetcher.parse(bytes)
+    expectEqual(snap.planV3, "zed_free")
+    expectEqual(snap.editPredictions?.used, 1)
+}
+
+run("parse Zed tolerates empty object") {
+    let snap = try! ZedUsageFetcher.parse("{}".data(using: .utf8)!)
+    expect(snap.planV3 == nil)
+    expect(snap.editPredictions == nil)
+    expectEqual(snap.hasOverdueInvoices, false)
+}
+
+run("parse Zed accepts numeric used as Double, limited object as Double") {
+    let bytes = #"""
+    {"plan": {"plan_v3": "zed_free", "usage": {"edit_predictions": {"used": 12.0, "limit": {"limited": 2000.0}}}}}
+    """#.data(using: .utf8)!
+    let snap = try! ZedUsageFetcher.parse(bytes)
+    expectEqual(snap.editPredictions?.used, 12)
+    expectEqual(snap.editPredictions?.limit, 2000)
+}
+
+run("parse Zed accepts unix-epoch ended_at") {
+    let bytes = #"""
+    {"plan": {"plan_v3": "zed_free", "subscription_period": {"ended_at": 1785000000}}}
+    """#.data(using: .utf8)!
+    let snap = try! ZedUsageFetcher.parse(bytes)
+    expectEqual(snap.periodEndsAt, Date(timeIntervalSince1970: 1785000000))
+}
+
+run("parse Zed throws on array top-level") {
+    do {
+        _ = try ZedUsageFetcher.parse("[]".data(using: .utf8)!)
+        expect(false, "expected throw")
+    } catch { expect(true) }
+}
+
+// Credentials header format: space-delimited, not Bearer.
+run("ZedCredentials builds a space-delimited Authorization value") {
+    let creds = ZedCredentials(userId: "12345", accessToken: "tok-abc")
+    expectEqual(creds.authorizationHeaderValue, "12345 tok-abc")
+    // Explicitly NOT the Bearer scheme.
+    expect(!creds.authorizationHeaderValue.hasPrefix("Bearer"))
+}
+
+// MARK: - ZedUsageStore (injected credential reader, no real Keychain)
+
+MainActor.assumeIsolated {
+    let suiteName = "zed-tests-\(ProcessInfo.processInfo.processIdentifier)"
+    let defaults = UserDefaults(suiteName: suiteName)!
+    defaults.removePersistentDomain(forName: suiteName)
+    defaults.set(true, forKey: "features.zed.enabled")
+
+    let goodCreds: @Sendable () -> Result<ZedCredentials, Error> = {
+        .success(ZedCredentials(userId: "u1", accessToken: "tok"))
+    }
+    let missingCreds: @Sendable () -> Result<ZedCredentials, Error> = {
+        .failure(ZedAuthError.keychainItemMissing)
+    }
+
+    run("Zed store off by default emits no tiles") {
+        let d2 = UserDefaults(suiteName: suiteName + "-off")!
+        d2.removePersistentDomain(forName: suiteName + "-off")
+        let store = ZedUsageStore(defaults: d2, credentialReader: goodCreds)
+        expectEqual(store.isEnabled, false)
+        expectEqual(store.tiles.count, 0)
+    }
+
+    run("Zed enabled before first read emits needsAccess card") {
+        let store = ZedUsageStore(defaults: defaults, credentialReader: missingCreds)
+        expectEqual(store.isEnabled, true)
+        let tiles = store.tiles
+        expectEqual(tiles.count, 1)
+        if case .needsAccess = tiles.first?.kind { expect(true) }
+        else { expect(false, "expected needsAccess") }
+    }
+
+    run("Zed applies free-plan snapshot: plan + counter tiles") {
+        let store = ZedUsageStore(defaults: defaults, credentialReader: goodCreds)
+        // Simulate a successful Keychain read + fetch by applying a result.
+        store.apply(.success(fixtureZedFree.data(using: .utf8)!))
+        let tiles = store.tiles
+        // plan tile + edit-predictions counter (no billing warning)
+        expectEqual(tiles.count, 2)
+        expectEqual(tiles[0].id, "zed-plan")
+        if case let .text(status, _) = tiles[0].kind { expectEqual(status, "Free") }
+        else { expect(false, "expected plan text tile") }
+        expectEqual(tiles[1].id, "zed-edit-predictions")
+        if case let .counter(used, limit, _) = tiles[1].kind {
+            expectEqual(used, 320); expectEqual(limit, 2000)
+        } else { expect(false, "expected counter tile") }
+    }
+
+    run("Zed pro plan renders unlimited counter (nil limit)") {
+        let store = ZedUsageStore(defaults: defaults, credentialReader: goodCreds)
+        store.apply(.success(fixtureZedPro.data(using: .utf8)!))
+        let counter = store.tiles.first { $0.id == "zed-edit-predictions" }
+        if case let .counter(_, limit, _) = counter?.kind { expect(limit == nil) }
+        else { expect(false, "expected counter") }
+    }
+
+    run("Zed overdue invoices adds a billing warning tile") {
+        let store = ZedUsageStore(defaults: defaults, credentialReader: goodCreds)
+        store.apply(.success(fixtureZedOverdue.data(using: .utf8)!))
+        expect(store.tiles.contains { $0.id == "zed-billing" })
+    }
+
+    run("Zed 401 maps to a re-sign-in message") {
+        let store = ZedUsageStore(defaults: defaults, credentialReader: goodCreds)
+        store.apply(.unauthorized)
+        expect(store.errorMessage?.contains("sign in again") == true)
+    }
+
+    run("Zed planLabel maps known tiers and passes through unknown") {
+        expectEqual(ZedUsageStore.planLabel("zed_free"), "Free")
+        expectEqual(ZedUsageStore.planLabel("zed_pro"), "Pro")
+        expectEqual(ZedUsageStore.planLabel("zed_pro_trial"), "Pro (trial)")
+        expectEqual(ZedUsageStore.planLabel("some_new_tier"), "some_new_tier")
+        expectEqual(ZedUsageStore.planLabel(nil), "Unknown")
+    }
+
+    defaults.removePersistentDomain(forName: suiteName)
+}
+
 // MARK: - Summary
 
 print("")
