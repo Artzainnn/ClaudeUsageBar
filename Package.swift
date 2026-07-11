@@ -53,7 +53,16 @@ let package = Package(
                 "LICENSE",
                 "README.md"
             ],
-            sources: ["Log.swift", "AnthropicUsageFetcher.swift"]
+            sources: [
+                "Log.swift",
+                "AnthropicUsageFetcher.swift",
+                "UsageProvider.swift"
+                // AnthropicUsageStore.swift depends on UsageManager
+                // (defined in ClaudeUsageBar.swift), so it stays in the
+                // app-bundle compile only, not in the SwiftPM library
+                // target. Tests for AnthropicUsageStore live in the
+                // full-app integration tier, not this unit-test layer.
+            ]
         ),
         .executableTarget(
             name: "TestRunner",

@@ -15,6 +15,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var usageManager: UsageManager!
     var statusManager: StatusManager!
     var updateManager: UpdateManager!
+
+    // PR 2c: multi-provider registry. Anthropic is the only provider today;
+    // subsequent PRs register additional stores (Codex, DeepSeek, Zed, ...)
+    // via `providers.append(...)`. The existing UsageManager continues to
+    // drive Anthropic tiles — providers[0] is a thin wrapper around it.
+    var providers: [ProviderBox] = []
     var eventMonitor: Any?
     var hotKeyRef: EventHotKeyRef?
 
@@ -39,6 +45,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Initialize managers
         usageManager = UsageManager(statusItem: statusItem, delegate: self)
+        // Wrap the manager in a UsageProvider so future provider PRs can
+        // add themselves to `providers[]` without disturbing this one.
+        providers.append(ProviderBox(AnthropicUsageStore(manager: usageManager)))
         statusManager = StatusManager()
         updateManager = UpdateManager()
 
