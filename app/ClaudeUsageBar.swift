@@ -2,6 +2,85 @@ import SwiftUI
 import AppKit
 import WebKit
 import Carbon
+import Security
+
+/**
+ * Stores the claude.ai session cookie in the Keychain instead of UserDefaults.
+ * The cookie carries `sessionKey` (full account access), so it must not sit in
+ * the world-readable preferences plist.
+ */
+enum KeychainHelper {
+    private static let service = "com.claude.usagebar"
+
+    /**
+     * Full-account credential: pin it to this device only (no iCloud Keychain
+     * sync or inclusion in backups) and keep it readable by the 5-minute
+     * background poll after the first unlock following boot.
+     */
+    private static let accessibility = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+
+    @discardableResult
+    static func save(_ value: String, forKey key: String) -> Bool {
+        guard let data = value.data(using: .utf8) else { return false }
+
+        let query: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: service,
+            kSecAttrAccount: key
+        ]
+        let attributes: [CFString: Any] = [
+            kSecValueData: data,
+            kSecAttrAccessible: accessibility
+        ]
+        let updateStatus = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+
+        if updateStatus == errSecItemNotFound {
+            var addQuery = query
+            addQuery[kSecValueData] = data
+            addQuery[kSecAttrAccessible] = accessibility
+            let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+            if addStatus != errSecSuccess {
+                let addDesc = SecCopyErrorMessageString(addStatus, nil) as String? ?? "unknown"
+                NSLog("ClaudeUsage: Keychain add failed for key '\(key)': \(addStatus) – \(addDesc)")
+                return false
+            }
+        } else if updateStatus != errSecSuccess {
+            let updateDesc = SecCopyErrorMessageString(updateStatus, nil) as String? ?? "unknown"
+            NSLog("ClaudeUsage: Keychain update failed for key '\(key)': \(updateStatus) – \(updateDesc)")
+            return false
+        }
+        return true
+    }
+
+    static func load(forKey key: String) -> String? {
+        let query: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: service,
+            kSecAttrAccount: key,
+            kSecReturnData: true,
+            kSecMatchLimit: kSecMatchLimitOne
+        ]
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess,
+              let data = result as? Data,
+              let value = String(data: data, encoding: .utf8) else { return nil }
+        return value
+    }
+
+    static func delete(forKey key: String) {
+        let query: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: service,
+            kSecAttrAccount: key
+        ]
+        let status = SecItemDelete(query as CFDictionary)
+        if status != errSecSuccess && status != errSecItemNotFound {
+            let deleteDesc = SecCopyErrorMessageString(status, nil) as String? ?? "unknown"
+            NSLog("ClaudeUsage: Keychain delete failed for key '\(key)': \(status) – \(deleteDesc)")
+        }
+    }
+}
 
 // Main entry point
 class AppDelegate: NSObject, NSApplicationDelegate {
@@ -355,9 +434,23 @@ class UsageManager: ObservableObject {
     }
 
     func loadSessionCookie() {
-        if let savedCookie = UserDefaults.standard.string(forKey: "claude_session_cookie") {
-            sessionCookie = savedCookie
+        if let cookie = KeychainHelper.load(forKey: "session_cookie") {
+            sessionCookie = cookie
+        } else if let legacyCookie = UserDefaults.standard.string(forKey: "claude_session_cookie") {
+            // Migrate the plaintext cookie to the Keychain on first launch after update.
+            NSLog("ClaudeUsage: Migrating cookie from UserDefaults to Keychain")
+            sessionCookie = legacyCookie
+            if KeychainHelper.save(legacyCookie, forKey: "session_cookie") {
+                UserDefaults.standard.removeObject(forKey: "claude_session_cookie")
+            } else {
+                NSLog("ClaudeUsage: Migration failed — cookie retained in UserDefaults")
+            }
         }
+    }
+
+    /** Truncated, non-secret placeholder hint for the cookie field — sourced from memory, never disk. */
+    var cookieHint: String? {
+        sessionCookie.isEmpty ? nil : String(sessionCookie.prefix(20)) + "..."
     }
 
     func loadSettings() {
@@ -405,16 +498,19 @@ class UsageManager: ObservableObject {
     func saveSessionCookie(_ cookie: String) {
         NSLog("ClaudeUsage: Saving cookie, length: \(cookie.count)")
         sessionCookie = cookie
-        UserDefaults.standard.set(cookie, forKey: "claude_session_cookie")
-        UserDefaults.standard.synchronize()
-        NSLog("ClaudeUsage: Cookie saved successfully")
+        if KeychainHelper.save(cookie, forKey: "session_cookie") {
+            NSLog("ClaudeUsage: Cookie saved to Keychain successfully")
+        } else {
+            NSLog("ClaudeUsage: Cookie save to Keychain FAILED — it will not persist across restart")
+        }
     }
 
     func clearSessionCookie() {
         NSLog("ClaudeUsage: Clearing cookie")
         sessionCookie = ""
+        KeychainHelper.delete(forKey: "session_cookie")
+        // Defensive: wipe any plaintext copy a pre-migration build may have left behind.
         UserDefaults.standard.removeObject(forKey: "claude_session_cookie")
-        UserDefaults.standard.synchronize()
 
         // Reset all data
         sessionUsage = 0
@@ -1331,8 +1427,8 @@ struct UsageView: View {
                 measuredHeight = value
             }
             .onAppear {
-                if let savedCookie = UserDefaults.standard.string(forKey: "claude_session_cookie") {
-                    sessionCookieInput = String(savedCookie.prefix(20)) + "..."
+                if let hint = usageManager.cookieHint {
+                    sessionCookieInput = hint
                 }
                 usageManager.updatePercentages()
             }
