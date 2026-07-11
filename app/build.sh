@@ -34,15 +34,19 @@ if [ -f "ClaudeUsageBar.icns" ]; then
 fi
 
 # Compile the Swift app for arm64.
-# Log.swift and AnthropicUsageFetcher.swift are compiled alongside
-# ClaudeUsageBar.swift; see the header comments in those files for why
-# the SwiftPM library boundary is drawn where it is.
+# Log.swift, AnthropicUsageFetcher.swift, UsageProvider.swift, and the
+# Codex provider files are compiled alongside ClaudeUsageBar.swift; see the
+# header comments in those files for why the SwiftPM library boundary is
+# drawn where it is. AnthropicUsageStore stays app-only (needs UsageManager);
+# the Codex files are also in the SwiftPM library for unit testing.
 swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_arm64" \
     ClaudeUsageBar.swift \
     Log.swift \
     AnthropicUsageFetcher.swift \
     UsageProvider.swift \
     AnthropicUsageStore.swift \
+    CodexUsageFetcher.swift \
+    CodexUsageStore.swift \
     -framework SwiftUI \
     -framework AppKit \
     -framework WebKit \
@@ -55,6 +59,8 @@ swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_x86_64" \
     AnthropicUsageFetcher.swift \
     UsageProvider.swift \
     AnthropicUsageStore.swift \
+    CodexUsageFetcher.swift \
+    CodexUsageStore.swift \
     -framework SwiftUI \
     -framework AppKit \
     -framework WebKit \

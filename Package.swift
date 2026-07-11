@@ -51,12 +51,24 @@ let package = Package(
                 "ClaudeUsageBar.icns",
                 "claudeusagebar-icon.png",
                 "LICENSE",
-                "README.md"
+                "README.md",
+                // AnthropicUsageStore depends on UsageManager (defined in the
+                // excluded @main entry point) so it is compiled only by
+                // build.sh into the .app bundle, not by the SwiftPM library.
+                // Listed here explicitly to silence the "unhandled file"
+                // warning now that `sources` is an allow-list.
+                "AnthropicUsageStore.swift"
             ],
             sources: [
                 "Log.swift",
                 "AnthropicUsageFetcher.swift",
-                "UsageProvider.swift"
+                "UsageProvider.swift",
+                "CodexUsageFetcher.swift",
+                // CodexUsageStore has no dependency on UsageManager (unlike
+                // AnthropicUsageStore), so it lives in the library where the
+                // TestRunner can exercise its tile-generation and 401 →
+                // session-expired mapping through a stubbed transport.
+                "CodexUsageStore.swift"
                 // AnthropicUsageStore.swift depends on UsageManager
                 // (defined in ClaudeUsageBar.swift), so it stays in the
                 // app-bundle compile only, not in the SwiftPM library
