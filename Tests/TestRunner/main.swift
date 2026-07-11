@@ -651,7 +651,15 @@ run("ProviderCopy.disclosure warns about the private API for Codex only") {
     expect(codex?.contains("private Codex API") == true)
     expect(codex?.contains("without notice") == true)
     expect(ProviderCopy.disclosure(for: "anthropic") == nil)
+    // DeepSeek uses a documented, stable API — no private-API disclosure.
     expect(ProviderCopy.disclosure(for: "deepseek") == nil)
+}
+
+run("ProviderCopy.help returns DeepSeek Keychain guidance") {
+    let ds = ProviderCopy.help(for: "deepseek")
+    expect(ds != nil)
+    expect(ds?.contains("Keychain") == true)
+    expect(ds?.contains("balance") == true)
 }
 
 // MARK: - DeepSeekUsageFetcher.parse (PR 4-BE)
@@ -847,6 +855,15 @@ MainActor.assumeIsolated {
         expectEqual(store.errorMessage, "HTTP 500")
         store.apply(.networkError)
         expectEqual(store.errorMessage, "Network error")
+    }
+
+    run("DeepSeek conforms to PasteKeyProvider with sk- placeholder") {
+        let store = DeepSeekUsageStore(credentials: InMemoryCredentialStore(), defaults: defaults)
+        let keyProvider = store as PasteKeyProvider
+        expect(keyProvider.keyPlaceholder.contains("sk"))
+        expectEqual(keyProvider.hasKey, false)
+        keyProvider.saveKey("sk-fake")
+        expectEqual(keyProvider.hasKey, true)
     }
 
     run("DeepSeek clear deletes the key and state") {

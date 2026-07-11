@@ -56,6 +56,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // features.codex.enabled defaults false), so registering it here is
         // inert for existing users — it contributes no tiles until enabled.
         providers.append(ProviderBox(CodexUsageStore()))
+        // PR 4-UI: register DeepSeek. Also opt-in (features.deepseek.enabled
+        // defaults false) and additionally requires a pasted API key, so it
+        // is doubly inert until the user both enables and configures it.
+        providers.append(ProviderBox(DeepSeekUsageStore()))
         // Model SwiftUI observes for the generic (non-Anthropic) provider
         // tiles. Anthropic continues to render through usageManager directly.
         providersModel = ProvidersModel(providers: providers)
@@ -2326,6 +2330,16 @@ struct ProviderToggleRow: View {
     let onChange: (Bool) -> Void
 
     @State private var enabled: Bool = false
+    // Local buffer for a pasted secret (PasteKeyProvider). Never pre-filled
+    // with the stored secret — we only ever write, never read it back out.
+    @State private var keyInput: String = ""
+    @State private var hasStoredKey: Bool = false
+
+    /// The provider as a PasteKeyProvider, when it is configured by pasting a
+    /// secret; nil otherwise.
+    private var pasteKeyProvider: PasteKeyProvider? {
+        box.provider as? PasteKeyProvider
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -2354,9 +2368,44 @@ struct ProviderToggleRow: View {
                     .foregroundColor(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
+
+            // Key-entry affordance for paste-a-secret providers, shown only
+            // when the provider is enabled. Uses a SecureField so the pasted
+            // value is masked on screen; the stored secret is never read back
+            // into the field.
+            if enabled, let keyProvider = pasteKeyProvider {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        SecureField(keyProvider.keyPlaceholder, text: $keyInput)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.caption2)
+                        Button("Save") {
+                            keyProvider.saveKey(keyInput)
+                            keyInput = ""
+                            hasStoredKey = keyProvider.hasKey
+                            onChange(true)  // trigger a fetch now that a key exists
+                        }
+                        .controlSize(.small)
+                        .disabled(keyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                        if hasStoredKey {
+                            Button("Clear") {
+                                keyProvider.saveKey("")  // empty clears
+                                hasStoredKey = keyProvider.hasKey
+                                onChange(false)
+                            }
+                            .controlSize(.small)
+                        }
+                    }
+                    Text(hasStoredKey ? "Key saved in Keychain." : "No key saved yet.")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+            }
         }
         .onAppear {
             enabled = UserDefaults.standard.bool(forKey: box.provider.featureFlagKey)
+            hasStoredKey = pasteKeyProvider?.hasKey ?? false
         }
     }
 }

@@ -20,11 +20,14 @@ import SwiftUI
 import Combine
 
 @MainActor
-public final class DeepSeekUsageStore: @preconcurrency UsageProvider {
+public final class DeepSeekUsageStore: @preconcurrency UsageProvider, PasteKeyProvider {
 
     public let id: String = "deepseek"
     public let displayName: String = "DeepSeek"
     public let featureFlagKey: String = "features.deepseek.enabled"
+
+    // PasteKeyProvider: the DeepSeek key is pasted by the user into Settings.
+    public let keyPlaceholder: String = "sk-…"
 
     /// Keychain key under which the DeepSeek API key is stored.
     public static let apiKeyKeychainKey = "deepseek.api_key"

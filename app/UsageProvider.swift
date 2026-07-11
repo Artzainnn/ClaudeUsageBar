@@ -164,6 +164,25 @@ public protocol CredentialStore {
     func delete(_ key: String)
 }
 
+// MARK: - PasteKeyProvider
+
+/// Optional capability for providers configured by pasting a secret (an API
+/// key, a session cookie). The Settings toggle row shows a secure entry
+/// field for any provider that conforms. Providers configured another way
+/// (Codex reads a CLI file; Anthropic uses the cookie sheet) do not conform.
+///
+/// @MainActor because conformers are main-actor stores; the entry field is
+/// itself on the main actor.
+@MainActor
+public protocol PasteKeyProvider {
+    /// Placeholder shown in the entry field (e.g. "sk-…").
+    var keyPlaceholder: String { get }
+    /// True when a secret is currently stored.
+    var hasKey: Bool { get }
+    /// Store a pasted secret. Empty input clears it.
+    func saveKey(_ raw: String)
+}
+
 // MARK: - ProviderCopy
 
 /// Per-provider help and disclosure copy for the Settings toggles. Kept in
@@ -176,6 +195,8 @@ public enum ProviderCopy {
         switch id {
         case "codex":
             return "Codex counters cover the Codex CLI, IDE extensions, Slack, and Cloud tasks — one shared 5-hour and weekly pool. General GPT chat is not counted. Reads your existing `codex auth login` session; run it in a terminal if prompted."
+        case "deepseek":
+            return "Shows your DeepSeek platform balance (granted + topped-up), per currency. Paste a DeepSeek API key below; it is stored in your macOS Keychain and used only to read the balance."
         default:
             return nil
         }
