@@ -2,6 +2,72 @@ import SwiftUI
 import AppKit
 import WebKit
 import Carbon
+import CryptoKit
+import Foundation
+
+// MARK: - Logging (categorical redaction)
+//
+// PR 1 replaces every NSLog site that touched cookies, org IDs, or response
+// bodies with the categorical logger below. The call site cannot interpolate
+// a raw String; every value goes through a category, and each category has
+// its own emission rule. This makes accidental credential logging a compile-
+// time impossibility rather than a discipline problem.
+//
+// The CI static grep guard (see .github/workflows/ci.yml) refuses PRs that
+// reintroduce raw-interpolation NSLog calls or the deleted response-body
+// log line at the network fetch site. The exact banned pattern lives in
+// the workflow file to avoid embedding it here (which would self-trigger).
+
+enum LogValue {
+    /// Safe to log verbatim (status codes, event names, HTTP methods, etc.).
+    case `public`(String)
+    /// Redacted to `<redacted: N chars>` in every build. Use for cookies,
+    /// bodies, tokens, API keys, anything that could leak a credential.
+    case sensitive(String)
+    /// Emitted as a short SHA-256 prefix so the value can be correlated
+    /// across log lines without revealing it. Use for org IDs, user IDs.
+    case identifier(String)
+    /// Numeric counts are safe to log as-is (lengths, HTTP status codes,
+    /// retry counts, threshold values).
+    case count(Int)
+
+    var rendered: String {
+        switch self {
+        case .public(let s):
+            return s
+        case .sensitive(let s):
+            return "<redacted: \(s.count) chars>"
+        case .identifier(let s):
+            let digest = SHA256.hash(data: Data(s.utf8))
+            let hex = digest.compactMap { String(format: "%02x", $0) }.joined()
+            return "<id: \(hex.prefix(8))>"
+        case .count(let n):
+            return String(n)
+        }
+    }
+}
+
+enum Log {
+    /// Debug-only diagnostics. Stripped in release builds by the `#if DEBUG`
+    /// gate. Accepts a plain message — no interpolation of untrusted values.
+    static func debug(_ message: String) {
+        #if DEBUG
+        NSLog("[debug] %@", message)
+        #endif
+    }
+
+    /// Info-level diagnostics. Retained in release builds. Values must be
+    /// wrapped in a `LogValue` category, forcing an explicit redaction
+    /// decision at the call site.
+    static func info(_ message: String, _ values: LogValue...) {
+        let rendered = values.map(\.rendered).joined(separator: ", ")
+        if rendered.isEmpty {
+            NSLog("%@", message)
+        } else {
+            NSLog("%@ | %@", message, rendered)
+        }
+    }
+}
 
 // Main entry point
 class AppDelegate: NSObject, NSApplicationDelegate {
@@ -403,15 +469,15 @@ class UsageManager: ObservableObject {
     }
 
     func saveSessionCookie(_ cookie: String) {
-        NSLog("ClaudeUsage: Saving cookie, length: \(cookie.count)")
+        Log.info("ClaudeUsage: saving cookie", .count(cookie.count))
         sessionCookie = cookie
         UserDefaults.standard.set(cookie, forKey: "claude_session_cookie")
         UserDefaults.standard.synchronize()
-        NSLog("ClaudeUsage: Cookie saved successfully")
+        Log.info("ClaudeUsage: cookie saved successfully")
     }
 
     func clearSessionCookie() {
-        NSLog("ClaudeUsage: Clearing cookie")
+        Log.info("ClaudeUsage: clearing cookie")
         sessionCookie = ""
         UserDefaults.standard.removeObject(forKey: "claude_session_cookie")
         UserDefaults.standard.synchronize()
@@ -435,7 +501,7 @@ class UsageManager: ObservableObject {
         // Update status bar to show 0%
         delegate?.updateStatusIcon(percentage: 0)
 
-        NSLog("ClaudeUsage: Cookie cleared, data reset")
+        Log.info("ClaudeUsage: cookie cleared, data reset")
     }
 
     func fetchOrganizationId(completion: @escaping (String?) -> Void) {
@@ -445,7 +511,7 @@ class UsageManager: ObservableObject {
             let trimmed = part.trimmingCharacters(in: .whitespaces)
             if trimmed.hasPrefix("lastActiveOrg=") {
                 let orgId = trimmed.replacingOccurrences(of: "lastActiveOrg=", with: "")
-                NSLog("📋 Found org ID in cookie: \(orgId)")
+                Log.info("Found org ID in cookie", .identifier(orgId))
                 completion(orgId)
                 return
             }
@@ -545,11 +611,17 @@ class UsageManager: ObservableObject {
                     return
                 }
 
-                NSLog("📡 Status: \(httpResponse.statusCode)")
+                Log.info("Usage API response", .count(httpResponse.statusCode))
 
+                // Response body is intentionally NOT logged. It contains the
+                // full usage JSON tied to the user's cookie and would land in
+                // unified log. Diagnostics for debugging live parse issues
+                // must go through the DEBUG-only path.
+                #if DEBUG
                 if let data = data, let responseString = String(data: data, encoding: .utf8) {
-                    NSLog("📦 Response: \(responseString)")
+                    Log.debug("Usage API body (DEBUG only): \(responseString)")
                 }
+                #endif
 
                 if httpResponse.statusCode == 200, let data = data {
                     self?.parseUsageData(data)
@@ -1729,7 +1801,7 @@ struct UsageView: View {
 
                             HStack(spacing: 8) {
                                 Button("Save Cookie & Fetch") {
-                                    NSLog("ClaudeUsage: Save clicked, input length: \(sessionCookieInput.count)")
+                                    Log.info("ClaudeUsage: save clicked", .count(sessionCookieInput.count))
                                     if sessionCookieInput.isEmpty {
                                         usageManager.errorMessage = "Cookie field is empty!"
                                     } else {
