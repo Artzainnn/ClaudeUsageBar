@@ -67,5 +67,39 @@ jobs:
             exit 1
           fi
 
-  # build-and-test: enabled when PR 2a lands Package.swift.
-  # See EXPANSION_PLAN.md § Phase 0 for the sequencing.
+  build-and-test:
+    name: Build and test (macOS)
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          swift --version
+          xcodebuild -version || true
+
+      - name: swift build
+        run: swift build --configuration debug
+
+      - name: swift run TestRunner
+        # Assertion-based test runner (see Package.swift header for why
+        # we do not use XCTest / Testing here — CLT compatibility).
+        run: swift run TestRunner --configuration debug
+
+      - name: Legacy build.sh compile smoke (unsigned)
+        run: |
+          # Verify the swiftc-driven build.sh path still compiles cleanly.
+          # We patch out the hardcoded Developer ID for CI, but leave the
+          # local file on disk unchanged.
+          sed 's|Developer ID Application: Linkko Technology Pte Ltd (Q467HQ5432)|-|' \
+            app/build.sh > /tmp/build-ci.sh
+          chmod +x /tmp/build-ci.sh
+          cd app
+          # Skip the launch step at the end of build.sh — CI has no display.
+          sed -i.bak '/^open "\$APP_PATH"/d' /tmp/build-ci.sh
+          /tmp/build-ci.sh

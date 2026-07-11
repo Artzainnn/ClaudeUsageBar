@@ -72,3 +72,7 @@ internal-docs/
 EXPANSION_PLAN.md
 docs/tracking-issue-draft.md
 .pr-bodies/
+
+# SwiftPM build artefacts
+.build/
+Package.resolved
