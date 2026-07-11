@@ -47,6 +47,8 @@ swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_arm64" \
     AnthropicUsageStore.swift \
     CodexUsageFetcher.swift \
     CodexUsageStore.swift \
+    DeepSeekUsageFetcher.swift \
+    DeepSeekUsageStore.swift \
     -framework SwiftUI \
     -framework AppKit \
     -framework WebKit \
@@ -61,6 +63,8 @@ swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_x86_64" \
     AnthropicUsageStore.swift \
     CodexUsageFetcher.swift \
     CodexUsageStore.swift \
+    DeepSeekUsageFetcher.swift \
+    DeepSeekUsageStore.swift \
     -framework SwiftUI \
     -framework AppKit \
     -framework WebKit \

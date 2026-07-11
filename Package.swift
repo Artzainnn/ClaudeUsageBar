@@ -68,7 +68,11 @@ let package = Package(
                 // AnthropicUsageStore), so it lives in the library where the
                 // TestRunner can exercise its tile-generation and 401 →
                 // session-expired mapping through a stubbed transport.
-                "CodexUsageStore.swift"
+                "CodexUsageStore.swift",
+                // DeepSeek: fetcher + KeychainStore + store. Same rationale —
+                // no UsageManager dependency, so it is unit-testable here.
+                "DeepSeekUsageFetcher.swift",
+                "DeepSeekUsageStore.swift"
                 // AnthropicUsageStore.swift depends on UsageManager
                 // (defined in ClaudeUsageBar.swift), so it stays in the
                 // app-bundle compile only, not in the SwiftPM library

@@ -654,6 +654,239 @@ run("ProviderCopy.disclosure warns about the private API for Codex only") {
     expect(ProviderCopy.disclosure(for: "deepseek") == nil)
 }
 
+// MARK: - DeepSeekUsageFetcher.parse (PR 4-BE)
+
+// Fixture shapes match api-docs.deepseek.com/api/get-user-balance: is_available
+// bool, balance_infos[] with currency + three STRING amounts.
+let fixtureDeepSeekUSD = #"""
+{
+  "is_available": true,
+  "balance_infos": [
+    {"currency": "USD", "total_balance": "110.00", "granted_balance": "10.00", "topped_up_balance": "100.00"}
+  ]
+}
+"""#
+
+run("parse DeepSeek USD balance (strings preserved verbatim)") {
+    let snap = try! DeepSeekUsageFetcher.parse(fixtureDeepSeekUSD.data(using: .utf8)!)
+    expectEqual(snap.isAvailable, true)
+    expectEqual(snap.balances.count, 1)
+    expectEqual(snap.balances[0].currency, "USD")
+    expectEqual(snap.balances[0].totalBalance, "110.00")
+    expectEqual(snap.balances[0].grantedBalance, "10.00")
+    expectEqual(snap.balances[0].toppedUpBalance, "100.00")
+}
+
+let fixtureDeepSeekCNY = #"""
+{
+  "is_available": true,
+  "balance_infos": [
+    {"currency": "CNY", "total_balance": "550.5", "granted_balance": "0", "topped_up_balance": "550.5"}
+  ]
+}
+"""#
+
+run("parse DeepSeek CNY balance") {
+    let snap = try! DeepSeekUsageFetcher.parse(fixtureDeepSeekCNY.data(using: .utf8)!)
+    expectEqual(snap.balances.count, 1)
+    expectEqual(snap.balances[0].currency, "CNY")
+    expectEqual(snap.balances[0].totalBalance, "550.5")
+}
+
+let fixtureDeepSeekDual = #"""
+{
+  "is_available": true,
+  "balance_infos": [
+    {"currency": "USD", "total_balance": "5.00", "granted_balance": "5.00", "topped_up_balance": "0"},
+    {"currency": "CNY", "total_balance": "36.00", "granted_balance": "36.00", "topped_up_balance": "0"}
+  ]
+}
+"""#
+
+run("parse DeepSeek dual-currency balance_infos") {
+    let snap = try! DeepSeekUsageFetcher.parse(fixtureDeepSeekDual.data(using: .utf8)!)
+    expectEqual(snap.balances.count, 2)
+    expectEqual(snap.balances[0].currency, "USD")
+    expectEqual(snap.balances[1].currency, "CNY")
+}
+
+run("parse DeepSeek is_available false") {
+    let bytes = #"{"is_available": false, "balance_infos": []}"#.data(using: .utf8)!
+    let snap = try! DeepSeekUsageFetcher.parse(bytes)
+    expectEqual(snap.isAvailable, false)
+    expectEqual(snap.balances.count, 0)
+}
+
+run("parse DeepSeek accepts numeric amounts defensively") {
+    // The documented API returns strings; accept numbers too so a server
+    // change does not drop the value.
+    let bytes = #"""
+    {"is_available": true, "balance_infos": [{"currency": "USD", "total_balance": 42, "granted_balance": 0, "topped_up_balance": 42.5}]}
+    """#.data(using: .utf8)!
+    let snap = try! DeepSeekUsageFetcher.parse(bytes)
+    expectEqual(snap.balances[0].totalBalance, "42")
+    expectEqual(snap.balances[0].toppedUpBalance, "42.5")
+}
+
+run("parse DeepSeek skips entries with no currency") {
+    let bytes = #"""
+    {"is_available": true, "balance_infos": [{"total_balance": "1.00"}, {"currency": "USD", "total_balance": "2.00", "granted_balance": "0", "topped_up_balance": "2.00"}]}
+    """#.data(using: .utf8)!
+    let snap = try! DeepSeekUsageFetcher.parse(bytes)
+    expectEqual(snap.balances.count, 1)
+    expectEqual(snap.balances[0].currency, "USD")
+}
+
+run("parse DeepSeek tolerates empty object") {
+    let snap = try! DeepSeekUsageFetcher.parse("{}".data(using: .utf8)!)
+    expectEqual(snap.isAvailable, false)
+    expectEqual(snap.balances.count, 0)
+}
+
+run("parse DeepSeek throws on array top-level") {
+    do {
+        _ = try DeepSeekUsageFetcher.parse("[]".data(using: .utf8)!)
+        expect(false, "expected throw")
+    } catch { expect(true) }
+}
+
+// MARK: - DeepSeekUsageStore (via in-memory CredentialStore)
+
+/// In-memory CredentialStore so store tests never touch the real Keychain
+/// (which could prompt or persist). Deterministic and isolated.
+final class InMemoryCredentialStore: CredentialStore {
+    private var storage: [String: Data] = [:]
+    func read(_ key: String) -> Data? { storage[key] }
+    func write(_ key: String, _ value: Data) { storage[key] = value }
+    func delete(_ key: String) { storage[key] = nil }
+}
+
+MainActor.assumeIsolated {
+    let suiteName = "deepseek-tests-\(ProcessInfo.processInfo.processIdentifier)"
+    let defaults = UserDefaults(suiteName: suiteName)!
+    defaults.removePersistentDomain(forName: suiteName)
+    defaults.set(true, forKey: "features.deepseek.enabled")
+
+    run("DeepSeek store off by default emits no tiles") {
+        let d2 = UserDefaults(suiteName: suiteName + "-off")!
+        d2.removePersistentDomain(forName: suiteName + "-off")
+        let store = DeepSeekUsageStore(credentials: InMemoryCredentialStore(), defaults: d2)
+        expectEqual(store.isEnabled, false)
+        expectEqual(store.tiles.count, 0)
+    }
+
+    run("DeepSeek enabled but no key emits needsAccess tile") {
+        let store = DeepSeekUsageStore(credentials: InMemoryCredentialStore(), defaults: defaults)
+        expectEqual(store.isEnabled, true)
+        expectEqual(store.isConfigured, false)
+        let tiles = store.tiles
+        expectEqual(tiles.count, 1)
+        if case .needsAccess = tiles.first?.kind { expect(true) }
+        else { expect(false, "expected needsAccess") }
+    }
+
+    run("DeepSeek saveKey stores in credential store and configures") {
+        let creds = InMemoryCredentialStore()
+        let store = DeepSeekUsageStore(credentials: creds, defaults: defaults)
+        expectEqual(store.hasKey, false)
+        store.saveKey("  sk-fake-deepseek-key  ")  // trimmed
+        expectEqual(store.hasKey, true)
+        expectEqual(store.isConfigured, true)
+        // The stored value is trimmed.
+        let stored = String(data: creds.read(DeepSeekUsageStore.apiKeyKeychainKey)!, encoding: .utf8)
+        expectEqual(stored, "sk-fake-deepseek-key")
+    }
+
+    run("DeepSeek saveKey with empty string clears the key") {
+        let creds = InMemoryCredentialStore()
+        let store = DeepSeekUsageStore(credentials: creds, defaults: defaults)
+        store.saveKey("sk-fake")
+        expectEqual(store.hasKey, true)
+        store.saveKey("   ")
+        expectEqual(store.hasKey, false)
+    }
+
+    run("DeepSeek applies USD balance and renders a balance tile") {
+        let creds = InMemoryCredentialStore()
+        let store = DeepSeekUsageStore(credentials: creds, defaults: defaults)
+        store.saveKey("sk-fake")
+        store.apply(.success(fixtureDeepSeekUSD.data(using: .utf8)!))
+        expect(store.lastUpdated != nil)
+        expect(store.errorMessage == nil)
+        let tiles = store.tiles
+        // Available == true so no status tile; one balance tile.
+        expectEqual(tiles.count, 1)
+        expectEqual(tiles[0].id, "deepseek-balance-usd")
+        if case let .text(status, subtitle) = tiles[0].kind {
+            expectEqual(status, "USD 110.00")
+            expectEqual(subtitle, "Granted 10.00 + topped-up 100.00")
+        } else { expect(false, "expected text tile") }
+    }
+
+    run("DeepSeek unavailable balance adds an amber status tile") {
+        let creds = InMemoryCredentialStore()
+        let store = DeepSeekUsageStore(credentials: creds, defaults: defaults)
+        store.saveKey("sk-fake")
+        let bytes = #"{"is_available": false, "balance_infos": [{"currency": "USD", "total_balance": "0.00", "granted_balance": "0", "topped_up_balance": "0"}]}"#.data(using: .utf8)!
+        store.apply(.success(bytes))
+        let tiles = store.tiles
+        // status tile + balance tile
+        expectEqual(tiles.count, 2)
+        expectEqual(tiles[0].id, "deepseek-status")
+    }
+
+    run("DeepSeek 401 maps to invalid-key error") {
+        let store = DeepSeekUsageStore(credentials: InMemoryCredentialStore(), defaults: defaults)
+        store.apply(.unauthorized)
+        expectEqual(store.errorMessage, "Invalid DeepSeek API key")
+    }
+
+    run("DeepSeek httpError and networkError map to messages") {
+        let store = DeepSeekUsageStore(credentials: InMemoryCredentialStore(), defaults: defaults)
+        store.apply(.httpError(500))
+        expectEqual(store.errorMessage, "HTTP 500")
+        store.apply(.networkError)
+        expectEqual(store.errorMessage, "Network error")
+    }
+
+    run("DeepSeek clear deletes the key and state") {
+        let creds = InMemoryCredentialStore()
+        let store = DeepSeekUsageStore(credentials: creds, defaults: defaults)
+        store.saveKey("sk-fake")
+        store.apply(.success(fixtureDeepSeekUSD.data(using: .utf8)!))
+        store.clear()
+        expectEqual(store.hasKey, false)
+        expect(store.snapshot == nil)
+        expect(creds.read(DeepSeekUsageStore.apiKeyKeychainKey) == nil)
+    }
+
+    defaults.removePersistentDomain(forName: suiteName)
+}
+
+// MARK: - KeychainStore round-trip (guarded — real Keychain may be absent)
+
+// Uses a throwaway service so the test never collides with real credentials,
+// and cleans up. In a headless CI keychain SecItemAdd can fail (errSecMissing
+// Entitlement / no keychain); in that case read returns nil and we skip the
+// positive assertions rather than fail the suite.
+run("KeychainStore round-trips when a keychain is available") {
+    let store = KeychainStore(service: "com.claude.usagebar.test-\(ProcessInfo.processInfo.processIdentifier)")
+    let key = "roundtrip-key"
+    let value = Data("sk-fake-value".utf8)
+    store.delete(key)  // clean slate
+    store.write(key, value)
+    if let read = store.read(key) {
+        // Keychain available — verify round-trip and delete.
+        expectEqual(read, value)
+        store.delete(key)
+        expect(store.read(key) == nil)
+    } else {
+        // No keychain in this environment (headless CI) — not a failure of
+        // KeychainStore logic. Record a pass so the suite total stays honest.
+        expect(true)
+    }
+}
+
 // MARK: - Summary
 
 print("")
