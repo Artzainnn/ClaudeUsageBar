@@ -76,3 +76,10 @@ docs/tracking-issue-draft.md
 # SwiftPM build artefacts
 .build/
 Package.resolved
+
+# Local credentials and probe transcripts — NEVER pushed to any remote
+secrets/
+.env
+.env.*
+probes/
+*.probe.json

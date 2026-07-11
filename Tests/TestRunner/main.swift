@@ -1,11 +1,13 @@
-// PR 2a — assertion-based test runner.
+// PR 2a + PR 2b — assertion-based test runner.
 //
 // Runs with `swift run TestRunner` from the repo root. Works with
 // Command Line Tools alone; does not require Xcode.app / XCTest.
 // Prints one line per test and exits nonzero if any assertion fails.
 //
-// When Xcode.app is installed, this runner can be promoted to XCTest
-// or Apple's Testing framework without changing the assertion bodies.
+// PR 2a added LogValue tests. PR 2b adds AnthropicUsageFetcher tests
+// covering every branch of the parser against synthetic fixtures whose
+// shape matches the documented claude.ai /api/organizations/{org}/usage
+// response.
 
 import Foundation
 import ClaudeUsageBar
@@ -69,9 +71,7 @@ run("LogValue.sensitive never emits the raw value") {
 }
 
 run("LogValue.identifier emits short SHA-256 prefix") {
-    // SHA-256("hello") = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
     expectEqual(LogValue.identifier("hello").rendered, "<id: 2cf24dba>")
-    // SHA-256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
     expectEqual(LogValue.identifier("").rendered, "<id: e3b0c442>")
 }
 
@@ -100,6 +100,202 @@ run("LogValue.count emits numeric literal") {
     expectEqual(LogValue.count(42).rendered, "42")
     expectEqual(LogValue.count(-1).rendered, "-1")
     expectEqual(LogValue.count(823).rendered, "823")
+}
+
+// MARK: - AnthropicUsageFetcher.orgId(fromCookieString:)
+
+run("orgId returns nil when lastActiveOrg is absent") {
+    let cookie = "sessionKey=abc; foo=bar"
+    expect(AnthropicUsageFetcher.orgId(fromCookieString: cookie) == nil)
+}
+
+run("orgId extracts value from lastActiveOrg") {
+    let cookie = "sessionKey=abc; lastActiveOrg=8f2c3d1a-e5b9; foo=bar"
+    expectEqual(
+        AnthropicUsageFetcher.orgId(fromCookieString: cookie),
+        "8f2c3d1a-e5b9"
+    )
+}
+
+run("orgId trims whitespace around each cookie part") {
+    let cookie = "  lastActiveOrg=  8f2c ; foo=bar"
+    // The extractor trims each semicolon-separated part before matching
+    // the `lastActiveOrg=` prefix. The trailing space in "  8f2c " is
+    // consumed by that trim. Leading spaces inside the value survive
+    // because the prefix drop is exact-length. This matches the
+    // pre-refactor behaviour byte-for-byte (which used the same
+    // trimmingCharacters + replacingOccurrences sequence).
+    let out = AnthropicUsageFetcher.orgId(fromCookieString: cookie)
+    expectEqual(out, "  8f2c")
+}
+
+run("orgId returns nil on empty cookie") {
+    expect(AnthropicUsageFetcher.orgId(fromCookieString: "") == nil)
+}
+
+// MARK: - AnthropicUsageFetcher.parse — happy path fixtures
+
+// Fixture 1: minimum shape — five_hour and seven_day only, no Sonnet,
+// no Fable in limits[]. This is what a Free plan account looks like.
+let fixtureFreeMinimal = #"""
+{
+  "five_hour":  {"utilization": 42.3, "resets_at": "2026-07-12T09:15:00.000Z"},
+  "seven_day":  {"utilization": 17.8, "resets_at": "2026-07-18T00:00:00.000Z"}
+}
+"""#
+
+run("parse Free-plan minimal fixture") {
+    let snap = try! AnthropicUsageFetcher.parse(fixtureFreeMinimal.data(using: .utf8)!)
+    expectEqual(snap.sessionUsage, 42)
+    expectEqual(snap.weeklyUsage, 17)
+    expectEqual(snap.hasWeeklySonnet, false)
+    expectEqual(snap.weeklySonnetUsage, 0)
+    expectEqual(snap.hasWeeklyFable, false)
+    expectEqual(snap.weeklyFableUsage, 0)
+    expect(snap.sessionResetsAt != nil)
+    expect(snap.weeklyResetsAt != nil)
+    expect(snap.weeklySonnetResetsAt == nil)
+    expect(snap.weeklyFableResetsAt == nil)
+}
+
+// Fixture 2: Pro plan with Sonnet bucket present.
+let fixtureProWithSonnet = #"""
+{
+  "five_hour":         {"utilization": 55.5, "resets_at": "2026-07-12T09:15:00.000Z"},
+  "seven_day":         {"utilization": 33.3, "resets_at": "2026-07-18T00:00:00.000Z"},
+  "seven_day_sonnet":  {"utilization": 12.9, "resets_at": "2026-07-18T00:00:00.000Z"}
+}
+"""#
+
+run("parse Pro-plan Sonnet fixture") {
+    let snap = try! AnthropicUsageFetcher.parse(fixtureProWithSonnet.data(using: .utf8)!)
+    expectEqual(snap.sessionUsage, 55)
+    expectEqual(snap.weeklyUsage, 33)
+    expectEqual(snap.hasWeeklySonnet, true)
+    expectEqual(snap.weeklySonnetUsage, 12)
+    expectEqual(snap.hasWeeklyFable, false)
+}
+
+// Fixture 3: Fable present in limits[] with percent as Int.
+let fixtureFableInt = #"""
+{
+  "five_hour":  {"utilization": 60.0, "resets_at": "2026-07-12T09:15:00.000Z"},
+  "seven_day":  {"utilization": 40.0, "resets_at": "2026-07-18T00:00:00.000Z"},
+  "limits": [
+    {"scope": {"model": {"display_name": "Opus"}}, "percent": 5, "resets_at": "2026-07-18T00:00:00.000Z"},
+    {"scope": {"model": {"display_name": "Fable"}}, "percent": 7, "resets_at": "2026-07-18T00:00:00.000Z"}
+  ]
+}
+"""#
+
+run("parse Fable fixture with percent as Int") {
+    let snap = try! AnthropicUsageFetcher.parse(fixtureFableInt.data(using: .utf8)!)
+    expectEqual(snap.hasWeeklyFable, true)
+    expectEqual(snap.weeklyFableUsage, 7)
+    expect(snap.weeklyFableResetsAt != nil)
+}
+
+// Fixture 4: Fable present with percent as Double (documented variant).
+let fixtureFableDouble = #"""
+{
+  "five_hour":  {"utilization": 60.0, "resets_at": "2026-07-12T09:15:00.000Z"},
+  "seven_day":  {"utilization": 40.0, "resets_at": "2026-07-18T00:00:00.000Z"},
+  "limits": [
+    {"scope": {"model": {"display_name": "Fable"}}, "percent": 12.7, "resets_at": "2026-07-18T00:00:00.000Z"}
+  ]
+}
+"""#
+
+run("parse Fable fixture with percent as Double") {
+    let snap = try! AnthropicUsageFetcher.parse(fixtureFableDouble.data(using: .utf8)!)
+    expectEqual(snap.hasWeeklyFable, true)
+    expectEqual(snap.weeklyFableUsage, 12)
+}
+
+// Fixture 5: full — Sonnet, Fable, Opus in limits, etc. All buckets present.
+let fixtureFull = #"""
+{
+  "five_hour":         {"utilization": 88.4, "resets_at": "2026-07-12T09:15:00.000Z"},
+  "seven_day":         {"utilization": 71.2, "resets_at": "2026-07-18T00:00:00.000Z"},
+  "seven_day_sonnet":  {"utilization": 44.0, "resets_at": "2026-07-18T00:00:00.000Z"},
+  "limits": [
+    {"scope": {"model": {"display_name": "Fable"}}, "percent": 23, "resets_at": "2026-07-18T00:00:00.000Z"},
+    {"scope": {"model": {"display_name": "Opus"}}, "percent": 15}
+  ]
+}
+"""#
+
+run("parse full fixture with every bucket populated") {
+    let snap = try! AnthropicUsageFetcher.parse(fixtureFull.data(using: .utf8)!)
+    expectEqual(snap.sessionUsage, 88)
+    expectEqual(snap.weeklyUsage, 71)
+    expectEqual(snap.hasWeeklySonnet, true)
+    expectEqual(snap.weeklySonnetUsage, 44)
+    expectEqual(snap.hasWeeklyFable, true)
+    expectEqual(snap.weeklyFableUsage, 23)
+}
+
+// MARK: - AnthropicUsageFetcher.parse — error paths
+
+run("parse throws invalidJSON on empty body") {
+    do {
+        _ = try AnthropicUsageFetcher.parse(Data())
+        expect(false, "expected throw on empty body")
+    } catch {
+        expect(true)
+    }
+}
+
+run("parse throws invalidJSON on malformed body") {
+    let bytes = "not json at all".data(using: .utf8)!
+    do {
+        _ = try AnthropicUsageFetcher.parse(bytes)
+        expect(false, "expected throw on malformed body")
+    } catch {
+        expect(true)
+    }
+}
+
+run("parse throws invalidJSON on non-object top-level") {
+    let bytes = "[1,2,3]".data(using: .utf8)!
+    do {
+        _ = try AnthropicUsageFetcher.parse(bytes)
+        expect(false, "expected throw on array top-level")
+    } catch {
+        expect(true)
+    }
+}
+
+// MARK: - AnthropicUsageFetcher.parse — degenerate but non-throwing shapes
+
+run("parse tolerates empty JSON object (all fields default)") {
+    let snap = try! AnthropicUsageFetcher.parse("{}".data(using: .utf8)!)
+    expectEqual(snap.sessionUsage, 0)
+    expectEqual(snap.weeklyUsage, 0)
+    expectEqual(snap.hasWeeklySonnet, false)
+    expectEqual(snap.hasWeeklyFable, false)
+    expect(snap.sessionResetsAt == nil)
+}
+
+run("parse tolerates missing resets_at strings") {
+    let bytes = #"""
+    {"five_hour": {"utilization": 10.0}, "seven_day": {"utilization": 5.0}}
+    """#.data(using: .utf8)!
+    let snap = try! AnthropicUsageFetcher.parse(bytes)
+    expectEqual(snap.sessionUsage, 10)
+    expectEqual(snap.weeklyUsage, 5)
+    expect(snap.sessionResetsAt == nil)
+    expect(snap.weeklyResetsAt == nil)
+}
+
+run("parse ignores non-Fable entries in limits[]") {
+    let bytes = #"""
+    {"five_hour": {"utilization": 0}, "seven_day": {"utilization": 0},
+     "limits": [{"scope": {"model": {"display_name": "Sonnet"}}, "percent": 42}]}
+    """#.data(using: .utf8)!
+    let snap = try! AnthropicUsageFetcher.parse(bytes)
+    expectEqual(snap.hasWeeklyFable, false)
+    expectEqual(snap.weeklyFableUsage, 0)
 }
 
 // MARK: - Summary

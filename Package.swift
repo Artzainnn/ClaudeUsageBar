@@ -53,7 +53,7 @@ let package = Package(
                 "LICENSE",
                 "README.md"
             ],
-            sources: ["Log.swift"]
+            sources: ["Log.swift", "AnthropicUsageFetcher.swift"]
         ),
         .executableTarget(
             name: "TestRunner",

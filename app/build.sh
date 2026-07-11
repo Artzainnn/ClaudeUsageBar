@@ -34,11 +34,13 @@ if [ -f "ClaudeUsageBar.icns" ]; then
 fi
 
 # Compile the Swift app for arm64.
-# Log.swift is compiled alongside ClaudeUsageBar.swift; see the header
-# comment in Log.swift for why the split exists.
+# Log.swift and AnthropicUsageFetcher.swift are compiled alongside
+# ClaudeUsageBar.swift; see the header comments in those files for why
+# the SwiftPM library boundary is drawn where it is.
 swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_arm64" \
     ClaudeUsageBar.swift \
     Log.swift \
+    AnthropicUsageFetcher.swift \
     -framework SwiftUI \
     -framework AppKit \
     -framework WebKit \
@@ -48,6 +50,7 @@ swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_arm64" \
 swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_x86_64" \
     ClaudeUsageBar.swift \
     Log.swift \
+    AnthropicUsageFetcher.swift \
     -framework SwiftUI \
     -framework AppKit \
     -framework WebKit \

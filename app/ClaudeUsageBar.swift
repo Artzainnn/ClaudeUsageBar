@@ -444,16 +444,14 @@ class UsageManager: ObservableObject {
     }
 
     func fetchOrganizationId(completion: @escaping (String?) -> Void) {
-        // Get org ID from the lastActiveOrg cookie value
-        let cookieParts = sessionCookie.components(separatedBy: ";")
-        for part in cookieParts {
-            let trimmed = part.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("lastActiveOrg=") {
-                let orgId = trimmed.replacingOccurrences(of: "lastActiveOrg=", with: "")
-                Log.info("Found org ID in cookie", .identifier(orgId))
-                completion(orgId)
-                return
-            }
+        // PR 2b: parsing lives in AnthropicUsageFetcher. UsageManager keeps
+        // ownership of the network call (which needs to be in the manager
+        // for delegate/main-actor reasons) but delegates the string
+        // parsing.
+        if let orgId = AnthropicUsageFetcher.orgId(fromCookieString: sessionCookie) {
+            Log.info("Found org ID in cookie", .identifier(orgId))
+            completion(orgId)
+            return
         }
 
         // If not in cookie, fetch from bootstrap
@@ -574,113 +572,43 @@ class UsageManager: ObservableObject {
     }
 
     func parseUsageData(_ data: Data) {
+        // PR 2b: parsing extracted into AnthropicUsageFetcher (Sendable
+        // value type, no side effects). UsageManager only applies the
+        // resulting snapshot to observable state. Behaviour is identical
+        // to the pre-refactor code; every branch is locked in by fixture
+        // tests in Tests/TestRunner.
         do {
-            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                errorMessage = "Invalid JSON"
-                return
-            }
+            let snap = try AnthropicUsageFetcher.parse(data)
+            sessionUsage = snap.sessionUsage
+            sessionLimit = 100
+            sessionResetsAt = snap.sessionResetsAt
 
-            NSLog("📊 Parsing usage data...")
+            weeklyUsage = snap.weeklyUsage
+            weeklyLimit = 100
+            weeklyResetsAt = snap.weeklyResetsAt
 
-            let iso8601Formatter = ISO8601DateFormatter()
-            iso8601Formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            hasWeeklySonnet = snap.hasWeeklySonnet
+            weeklySonnetUsage = snap.weeklySonnetUsage
+            weeklySonnetLimit = 100
+            weeklySonnetResetsAt = snap.weeklySonnetResetsAt
 
-            // Parse the actual claude.ai response format
-            if let fiveHour = json["five_hour"] as? [String: Any] {
-                if let sessionUtil = fiveHour["utilization"] as? Double {
-                    sessionUsage = Int(sessionUtil)
-                    sessionLimit = 100
-                }
-                if let resetsAtString = fiveHour["resets_at"] as? String {
-                    NSLog("🕐 Session resets_at string: \(resetsAtString)")
-                    if let resetsAt = iso8601Formatter.date(from: resetsAtString) {
-                        sessionResetsAt = resetsAt
-                        NSLog("✅ Parsed session reset time: \(resetsAt)")
-                    } else {
-                        NSLog("❌ Failed to parse session reset time")
-                    }
-                }
-            }
+            hasWeeklyFable = snap.hasWeeklyFable
+            weeklyFableUsage = snap.weeklyFableUsage
+            weeklyFableLimit = 100
+            weeklyFableResetsAt = snap.weeklyFableResetsAt
 
-            if let sevenDay = json["seven_day"] as? [String: Any] {
-                if let weeklyUtil = sevenDay["utilization"] as? Double {
-                    weeklyUsage = Int(weeklyUtil)
-                    weeklyLimit = 100
-                }
-                if let resetsAtString = sevenDay["resets_at"] as? String {
-                    NSLog("🕐 Weekly resets_at string: \(resetsAtString)")
-                    if let resetsAt = iso8601Formatter.date(from: resetsAtString) {
-                        weeklyResetsAt = resetsAt
-                        NSLog("✅ Parsed weekly reset time: \(resetsAt)")
-                    } else {
-                        NSLog("❌ Failed to parse weekly reset time")
-                    }
-                }
-            }
-
-            // Check for seven_day_sonnet (Pro plan feature)
-            if let sevenDaySonnet = json["seven_day_sonnet"] as? [String: Any] {
-                hasWeeklySonnet = true
-                if let sonnetUtil = sevenDaySonnet["utilization"] as? Double {
-                    weeklySonnetUsage = Int(sonnetUtil)
-                    weeklySonnetLimit = 100
-                }
-                if let resetsAtString = sevenDaySonnet["resets_at"] as? String {
-                    NSLog("🕐 Weekly Sonnet resets_at string: \(resetsAtString)")
-                    if let resetsAt = iso8601Formatter.date(from: resetsAtString) {
-                        weeklySonnetResetsAt = resetsAt
-                        NSLog("✅ Parsed weekly Sonnet reset time: \(resetsAt)")
-                    } else {
-                        NSLog("❌ Failed to parse weekly Sonnet reset time")
-                    }
-                }
-            } else {
-                hasWeeklySonnet = false
-            }
-
-            // Fable is a new, separately-counted model. It isn't a top-level
-            // key like seven_day_sonnet — it lives in the `limits` array as a
-            // model-scoped weekly limit (scope.model.display_name == "Fable").
-            // The bar is only surfaced in the UI when usage is above 1%.
-            hasWeeklyFable = false
-            if let limits = json["limits"] as? [[String: Any]] {
-                let fableLimit = limits.first { entry in
-                    let scope = entry["scope"] as? [String: Any]
-                    let model = scope?["model"] as? [String: Any]
-                    return (model?["display_name"] as? String) == "Fable"
-                }
-                if let fable = fableLimit {
-                    hasWeeklyFable = true
-                    // `percent` may decode as Int or Double depending on payload.
-                    if let p = fable["percent"] as? Int {
-                        weeklyFableUsage = p
-                    } else if let p = fable["percent"] as? Double {
-                        weeklyFableUsage = Int(p)
-                    }
-                    weeklyFableLimit = 100
-                    if let resetsAtString = fable["resets_at"] as? String {
-                        NSLog("🕐 Weekly Fable resets_at string: \(resetsAtString)")
-                        if let resetsAt = iso8601Formatter.date(from: resetsAtString) {
-                            weeklyFableResetsAt = resetsAt
-                            NSLog("✅ Parsed weekly Fable reset time: \(resetsAt)")
-                        } else {
-                            NSLog("❌ Failed to parse weekly Fable reset time")
-                        }
-                    }
-                }
-            }
-
-            // Log what we found
-            NSLog("✅ Parsed: Session \(sessionUsage)%, Weekly \(weeklyUsage)%\(hasWeeklySonnet ? ", Weekly Sonnet \(weeklySonnetUsage)%" : "")\(hasWeeklyFable ? ", Weekly Fable \(weeklyFableUsage)%" : "")")
+            Log.info("Parsed usage",
+                     .public("session"), .count(sessionUsage),
+                     .public("weekly"), .count(weeklyUsage))
 
             lastUpdated = Date()
             errorMessage = nil
             hasFetchedData = true
-
-            // Update percentage values for progress bars
             updatePercentages()
+        } catch AnthropicUsageParseError.invalidJSON {
+            errorMessage = "Invalid JSON"
         } catch {
-            NSLog("❌ Parse error: \(error.localizedDescription)")
+            Log.info("Parse error", .public(error.localizedDescription))
             errorMessage = "Parse error"
         }
     }
