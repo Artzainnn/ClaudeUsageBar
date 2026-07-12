@@ -1691,6 +1691,641 @@ MainActor.assumeIsolated {
     defaults.removePersistentDomain(forName: suiteName)
 }
 
+// MARK: - PerplexityCookie extraction (PR 8-BE)
+
+run("Perplexity cookie: bare token wrapped under default name") {
+    let extracted = PerplexityCookie.extract(from: "  ey.jwe.raw.value  ")
+    expectEqual(extracted?.name, "__Secure-next-auth.session-token")
+    expectEqual(extracted?.token, "ey.jwe.raw.value")
+}
+
+run("Perplexity cookie: empty input returns nil") {
+    expect(PerplexityCookie.extract(from: "   ") == nil)
+}
+
+run("Perplexity cookie: name=value pair (Secure next-auth)") {
+    let raw = "__Secure-next-auth.session-token=abc.def.ghi"
+    let extracted = PerplexityCookie.extract(from: raw)
+    expectEqual(extracted?.name, "__Secure-next-auth.session-token")
+    expectEqual(extracted?.token, "abc.def.ghi")
+}
+
+run("Perplexity cookie: prefers Secure over unprefixed within a full header") {
+    // A user pasting a full DevTools "Copy string" gets many cookies; the
+    // Secure-prefixed variant must win over the plain one.
+    let raw = "next-auth.session-token=OLD; __Secure-next-auth.session-token=NEW; _ga=1"
+    let extracted = PerplexityCookie.extract(from: raw)
+    expectEqual(extracted?.name, "__Secure-next-auth.session-token")
+    expectEqual(extracted?.token, "NEW")
+}
+
+run("Perplexity cookie: unprefixed next-auth falls through when Secure absent") {
+    let raw = "next-auth.session-token=UNPREFIXED; other=1"
+    let extracted = PerplexityCookie.extract(from: raw)
+    expectEqual(extracted?.name, "next-auth.session-token")
+    expectEqual(extracted?.token, "UNPREFIXED")
+}
+
+run("Perplexity cookie: Auth.js v5 __Secure-authjs.session-token") {
+    let raw = "__Secure-authjs.session-token=V5TOK"
+    let extracted = PerplexityCookie.extract(from: raw)
+    expectEqual(extracted?.name, "__Secure-authjs.session-token")
+    expectEqual(extracted?.token, "V5TOK")
+}
+
+run("Perplexity cookie: unprefixed authjs.session-token") {
+    let raw = "authjs.session-token=V5PLAIN"
+    let extracted = PerplexityCookie.extract(from: raw)
+    expectEqual(extracted?.name, "authjs.session-token")
+    expectEqual(extracted?.token, "V5PLAIN")
+}
+
+run("Perplexity cookie: NextAuth chunked variant reassembles in index order") {
+    // NextAuth splits a large JWE across ".0", ".1", … suffixed cookies.
+    // Reassembly must respect the numeric index, not the paste order.
+    let raw = "__Secure-next-auth.session-token.1=BBB; __Secure-next-auth.session-token.0=AAA"
+    let extracted = PerplexityCookie.extract(from: raw)
+    expectEqual(extracted?.name, "__Secure-next-auth.session-token")
+    expectEqual(extracted?.token, "AAABBB")
+}
+
+run("Perplexity cookie: chunk index Int.max is rejected (overflow guard)") {
+    // Codex adversarial review #2: a hostile paste `…session-token.<Int.max>=x`
+    // must not trap on `maxIdx + 1` nor force massive reserveCapacity.
+    let raw = "__Secure-next-auth.session-token.9223372036854775807=EVIL"
+    expect(PerplexityCookie.extract(from: raw) == nil)
+}
+
+run("Perplexity cookie: chunk index above sane cap is rejected") {
+    // Real NextAuth chunk indexes are single digits. Anything past the
+    // maxAllowedChunkIndex sentinel is refused before it reaches reassemble.
+    let raw = "__Secure-next-auth.session-token.99999=EVIL; __Secure-next-auth.session-token.0=OK"
+    let extracted = PerplexityCookie.extract(from: raw)
+    // The .0 chunk alone is a valid single-chunk cookie.
+    expectEqual(extracted?.token, "OK")
+}
+
+run("Perplexity cookie: unrelated cookies alone → nil") {
+    let raw = "_ga=1; _gcl=2; theme=dark"
+    expect(PerplexityCookie.extract(from: raw) == nil)
+}
+
+run("Perplexity cookie: bare token containing base64 = padding routes verbatim") {
+    // Codex adversarial review #7: an opaque token like `abc.def==` must not
+    // be mis-parsed as an unsupported `abc.def=` cookie name. When there is
+    // no `;` separator and no supported cookie name matched, the whole input
+    // is treated as a bare token under the default name.
+    let raw = "abc.def=="
+    let extracted = PerplexityCookie.extract(from: raw)
+    expectEqual(extracted?.name, "__Secure-next-auth.session-token")
+    expectEqual(extracted?.token, "abc.def==")
+}
+
+run("Perplexity cookie: paste with `;` but no supported session cookie → nil (not bare-token fallback)") {
+    // A cookie-header-shaped paste that lacks any supported session cookie
+    // is a mistake we surface, not something to paper over by treating the
+    // whole blob as a token.
+    let raw = "_ga=1; theme=dark"
+    expect(PerplexityCookie.extract(from: raw) == nil)
+}
+
+// MARK: - PerplexityUsageFetcher.parseCredits
+
+run("Perplexity parseCredits: happy path with recurring + promo + purchased grants") {
+    // Synthetic fixture — shape matches multiple independent live captures
+    // (CodexBar PerplexityModels.swift; jacob-bd/perplexity-web-mcp). All
+    // amounts are floats in USD cents; timestamps are Unix seconds.
+    let json = """
+    {
+      "balance_cents": 4235.50,
+      "renewal_date_ts": 1770000000,
+      "current_period_purchased_cents": 500.0,
+      "total_usage_cents": 764.5,
+      "credit_grants": [
+        { "type": "recurring",    "amount_cents": 5000.0, "expires_at_ts": null },
+        { "type": "promotional",  "amount_cents": 250.0,  "expires_at_ts": 1780000000 },
+        { "type": "purchased",    "amount_cents": 500.0,  "expires_at_ts": null }
+      ]
+    }
+    """
+    guard let data = json.data(using: .utf8) else { expect(false, "utf8 data"); return }
+    do {
+        let parsed = try PerplexityUsageFetcher.parseCredits(data)
+        expectEqual(parsed.balanceCents, 4235.50)
+        expectEqual(parsed.renewalEpoch, 1770000000)
+        expectEqual(parsed.currentPeriodPurchasedCents, 500.0)
+        expectEqual(parsed.totalUsageCents, 764.5)
+        expectEqual(parsed.grants.count, 3)
+        expectEqual(parsed.grants[0].type, "recurring")
+        expectEqual(parsed.grants[0].amountCents, 5000.0)
+        expect(parsed.grants[0].expiresAtEpoch == nil)
+        expectEqual(parsed.grants[1].type, "promotional")
+        expectEqual(parsed.grants[1].expiresAtEpoch, 1780000000)
+    } catch {
+        expect(false, "parseCredits threw: \(error)")
+    }
+}
+
+run("Perplexity parseCredits: empty account tolerated (Free tier)") {
+    // A Free-tier account may have zero grants and a zero balance. Parser
+    // must not throw or drop into unexpectedShape.
+    let json = """
+    {"balance_cents": 0, "renewal_date_ts": 0, "current_period_purchased_cents": 0, "total_usage_cents": 0, "credit_grants": []}
+    """
+    guard let data = json.data(using: .utf8) else { expect(false); return }
+    let parsed = try? PerplexityUsageFetcher.parseCredits(data)
+    expect(parsed != nil)
+    expectEqual(parsed?.grants.count, 0)
+    expectEqual(parsed?.balanceCents, 0)
+}
+
+run("Perplexity parseCredits: invalid JSON throws invalidJSON") {
+    let data = Data("<html>Just a moment...</html>".utf8)  // Cloudflare challenge HTML
+    do {
+        _ = try PerplexityUsageFetcher.parseCredits(data)
+        expect(false, "expected throw")
+    } catch let e as PerplexityUsageParseError {
+        expectEqual(e, .invalidJSON)
+    } catch {
+        expect(false, "wrong error type")
+    }
+}
+
+run("Perplexity parseCredits: non-finite Double is coerced to safe values") {
+    // Defence against a hostile / broken response with 1e400-style numbers.
+    // JSONSerialization already refuses to decode `NaN`/`Infinity` as bare
+    // JSON tokens, so exercise the coercion via a numeric string.
+    let json = """
+    {"balance_cents": "not-a-number", "renewal_date_ts": 1770000000, "credit_grants": []}
+    """
+    guard let data = json.data(using: .utf8) else { expect(false); return }
+    let parsed = try? PerplexityUsageFetcher.parseCredits(data)
+    expectEqual(parsed?.balanceCents, 0)   // failed string coercion → 0, not a crash
+    expectEqual(parsed?.renewalEpoch, 1770000000)
+}
+
+run("Perplexity parseCredits: out-of-range renewal_date_ts is treated as missing") {
+    // Codex adversarial review round 2 #4: a wild timestamp must not flow
+    // into a pathological Date.
+    let json = """
+    {"balance_cents": 100, "renewal_date_ts": 1e300, "credit_grants": [
+        {"type": "recurring", "amount_cents": 500, "expires_at_ts": 1e300}
+    ]}
+    """
+    guard let data = json.data(using: .utf8) else { expect(false); return }
+    let parsed = try? PerplexityUsageFetcher.parseCredits(data)
+    expectEqual(parsed?.renewalEpoch, 0)                          // clamped
+    expect(parsed?.grants.first?.expiresAtEpoch == nil)           // clamped to nil
+}
+
+run("Perplexity parseCredits: pre-2000 renewal timestamp rejected") {
+    // A stray 0 or a 1970-era timestamp is outside the sane range and
+    // should be reported as "no renewal date" rather than plumbed through.
+    let json = """
+    {"balance_cents": 100, "renewal_date_ts": 100, "credit_grants": []}
+    """
+    guard let data = json.data(using: .utf8) else { expect(false); return }
+    let parsed = try? PerplexityUsageFetcher.parseCredits(data)
+    expectEqual(parsed?.renewalEpoch, 0)
+}
+
+// MARK: - PerplexityUsageFetcher.parseRateLimits
+
+run("Perplexity parseRateLimits: full Pro-account shape") {
+    // Shape from three independent live captures. Only remaining_* on the
+    // top level; sources.source_to_limit for connectors.
+    let json = """
+    {
+      "remaining_pro": 192,
+      "remaining_research": 19,
+      "remaining_labs": 25,
+      "remaining_agentic_research": 2,
+      "model_specific_limits": {},
+      "sources": {
+        "source_to_limit": {
+          "web":       {"monthly_limit": null, "remaining": null},
+          "scholar":   {"monthly_limit": null, "remaining": null},
+          "bmj_mcp":   {"monthly_limit": 500, "remaining": 495},
+          "nejm_alt":  {"monthly_limit": 25,  "remaining": 10}
+        }
+      }
+    }
+    """
+    guard let data = json.data(using: .utf8) else { expect(false); return }
+    do {
+        let parsed = try PerplexityUsageFetcher.parseRateLimits(data)
+        expectEqual(parsed.remainingPro, 192)
+        expectEqual(parsed.remainingResearch, 19)
+        expectEqual(parsed.remainingLabs, 25)
+        expectEqual(parsed.remainingAgenticResearch, 2)
+        expectEqual(parsed.sources.count, 4)
+        // Sorted by sourceId for determinism.
+        expectEqual(parsed.sources[0].sourceId, "bmj_mcp")
+        expectEqual(parsed.sources[0].monthlyLimit, 500)
+        expectEqual(parsed.sources[0].remaining, 495)
+        // Nulls preserved as nil.
+        let web = parsed.sources.first { $0.sourceId == "web" }
+        expect(web?.monthlyLimit == nil)
+        expect(web?.remaining == nil)
+    } catch {
+        expect(false, "parseRateLimits threw: \(error)")
+    }
+}
+
+run("Perplexity parseRateLimits: Free account with omitted sources") {
+    // Free-tier / anonymous omits the sources map entirely; must parse.
+    let json = """
+    {"remaining_pro": 3, "remaining_research": 0, "remaining_labs": 0, "remaining_agentic_research": 0}
+    """
+    guard let data = json.data(using: .utf8) else { expect(false); return }
+    let parsed = try? PerplexityUsageFetcher.parseRateLimits(data)
+    expectEqual(parsed?.remainingPro, 3)
+    expectEqual(parsed?.sources.count, 0)
+}
+
+run("Perplexity parseRateLimits: negative remaining clamped to zero") {
+    // Defence: a hostile / miscalculated server value must not surface as a
+    // negative counter tile ("-5 Pro Search remaining").
+    let json = """
+    {"remaining_pro": -5, "remaining_research": 10, "remaining_labs": 0, "remaining_agentic_research": 0}
+    """
+    guard let data = json.data(using: .utf8) else { expect(false); return }
+    let parsed = try? PerplexityUsageFetcher.parseRateLimits(data)
+    expectEqual(parsed?.remainingPro, 0)
+    expectEqual(parsed?.remainingResearch, 10)
+}
+
+// MARK: - PerplexityUsageFetcher.parseUserSettings
+
+run("Perplexity parseUserSettings: subscription fields + numeric limits") {
+    let json = """
+    {
+      "pages_limit": 100,
+      "upload_limit": 500,
+      "create_limit": 25,
+      "max_files_per_user": 500,
+      "max_files_per_repository": 100,
+      "subscription_status": "active",
+      "subscription_source": "stripe",
+      "subscription_tier": "pro",
+      "query_count": 42,
+      "query_count_copilot": 7,
+      "default_model": "sonar-pro",
+      "has_ai_profile": true
+    }
+    """
+    guard let data = json.data(using: .utf8) else { expect(false); return }
+    do {
+        let parsed = try PerplexityUsageFetcher.parseUserSettings(data)
+        expectEqual(parsed.subscriptionStatus, "active")
+        expectEqual(parsed.subscriptionSource, "stripe")
+        expectEqual(parsed.subscriptionTier, "pro")
+        expectEqual(parsed.pagesLimit, 100)
+        expectEqual(parsed.uploadLimit, 500)
+        expectEqual(parsed.createLimit, 25)
+        expectEqual(parsed.queryCount, 42)
+    } catch {
+        expect(false, "parseUserSettings threw: \(error)")
+    }
+}
+
+run("Perplexity parseUserSettings: unknown tier preserved verbatim") {
+    // Guard against silently dropping a new server-side tier.
+    let json = """
+    {"subscription_tier": "enterprise-yearly", "subscription_status": "active"}
+    """
+    guard let data = json.data(using: .utf8) else { expect(false); return }
+    let parsed = try? PerplexityUsageFetcher.parseUserSettings(data)
+    expectEqual(parsed?.subscriptionTier, "enterprise-yearly")
+}
+
+// MARK: - PerplexityUsageStore (in-memory credentials + stubbed transport)
+
+final class StubPerplexityTransport: PerplexityUsageTransport, @unchecked Sendable {
+    let result: PerplexityUsageResult
+    init(_ result: PerplexityUsageResult) { self.result = result }
+    func fetchAll(cookieName: String, cookieValue: String, completion: @escaping @Sendable (PerplexityUsageResult) -> Void) {
+        completion(result)
+    }
+}
+
+MainActor.assumeIsolated {
+    let suiteName = "perplexity-tests-\(ProcessInfo.processInfo.processIdentifier)"
+    let defaults = UserDefaults(suiteName: suiteName)!
+    defaults.removePersistentDomain(forName: suiteName)
+    defaults.set(true, forKey: "features.perplexity.enabled")
+
+    run("Perplexity store off by default emits no tiles") {
+        let d2 = UserDefaults(suiteName: suiteName + "-off")!
+        d2.removePersistentDomain(forName: suiteName + "-off")
+        let store = PerplexityUsageStore(credentials: InMemoryCredentialStore(), transport: StubPerplexityTransport(.networkError), defaults: d2)
+        expectEqual(store.isEnabled, false)
+        expectEqual(store.tiles.count, 0)
+    }
+
+    run("Perplexity enabled without cookie emits needsAccess card") {
+        let store = PerplexityUsageStore(credentials: InMemoryCredentialStore(), transport: StubPerplexityTransport(.networkError), defaults: defaults)
+        expectEqual(store.isConfigured, false)
+        let tiles = store.tiles
+        expectEqual(tiles.count, 1)
+        if case .needsAccess = tiles.first?.kind { expect(true) }
+        else { expect(false, "expected needsAccess") }
+    }
+
+    run("Perplexity locked keychain still counted as configured") {
+        // ".unavailable means still configured" invariant from PR #60.
+        let store = PerplexityUsageStore(credentials: UnavailableCredentialStore(), transport: StubPerplexityTransport(.networkError), defaults: defaults)
+        expectEqual(store.isConfigured, true)
+    }
+
+    run("Perplexity saveKey stores cookie; clear deletes it") {
+        let creds = InMemoryCredentialStore()
+        let store = PerplexityUsageStore(credentials: creds, transport: StubPerplexityTransport(.networkError), defaults: defaults)
+        expectEqual(store.hasKey, false)
+        store.saveKey("__Secure-next-auth.session-token=abc")
+        expectEqual(store.hasKey, true)
+        store.clear()
+        expectEqual(store.hasKey, false)
+    }
+
+    run("Perplexity saveKey with whitespace-only clears") {
+        let store = PerplexityUsageStore(credentials: InMemoryCredentialStore(), transport: StubPerplexityTransport(.networkError), defaults: defaults)
+        store.saveKey("initial")
+        store.saveKey("   \n  ")   // deletes
+        expectEqual(store.hasKey, false)
+    }
+
+    run("Perplexity plan tile derived from subscription_tier + status") {
+        let store = PerplexityUsageStore(credentials: InMemoryCredentialStore(), transport: StubPerplexityTransport(.networkError), defaults: defaults)
+        store.saveKey("cookie")
+        var snap = PerplexityUsageSnapshot()
+        snap.settings = PerplexityUserSettings(
+            subscriptionStatus: "active",
+            subscriptionSource: "stripe",
+            subscriptionTier: "pro"
+        )
+        store.apply(.success(snap))
+        let planTile = store.tiles.first { $0.id == "perplexity-plan" }
+        expect(planTile != nil)
+        if case let .text(status, _) = planTile?.kind {
+            expect(status.contains("Pro"))
+            expect(status.contains("active"))
+        } else {
+            expect(false, "expected text tile")
+        }
+    }
+
+    run("Perplexity credits tile carries USD cents + Max plan hint from large recurring grant") {
+        let store = PerplexityUsageStore(credentials: InMemoryCredentialStore(), transport: StubPerplexityTransport(.networkError), defaults: defaults)
+        store.saveKey("cookie")
+        var snap = PerplexityUsageSnapshot()
+        snap.credits = PerplexityCredits(
+            balanceCents: 4235.50,
+            renewalEpoch: 1770000000,
+            currentPeriodPurchasedCents: 0,
+            // Max recurring ~$500/mo = 50 000 cents. Above the 10 000c boundary.
+            grants: [PerplexityCreditGrant(type: "recurring", amountCents: 50000, expiresAtEpoch: nil)],
+            totalUsageCents: 764.5
+        )
+        store.apply(.success(snap))
+        let tile = store.tiles.first { $0.id == "perplexity-credits" }
+        expect(tile != nil)
+        if case let .balance(minor, currency, plan, resetsAt) = tile?.kind {
+            expectEqual(minor, 4236)          // rounded from 4235.50
+            expectEqual(currency, "USD")
+            expectEqual(plan, "Max")          // recurring >= 10 000c → Max
+            expect(resetsAt != nil)
+        } else {
+            expect(false, "expected balance tile")
+        }
+    }
+
+    run("Perplexity credits tile: Pro plan hint from a $50-tier recurring grant") {
+        // Codex adversarial review #3: the initial 5 000c threshold flipped
+        // Pro users to "Max" — a $50 grant must still register as Pro.
+        let store = PerplexityUsageStore(credentials: InMemoryCredentialStore(), transport: StubPerplexityTransport(.networkError), defaults: defaults)
+        store.saveKey("cookie")
+        var snap = PerplexityUsageSnapshot()
+        snap.credits = PerplexityCredits(
+            balanceCents: 350.0,
+            renewalEpoch: 1770000000,
+            grants: [PerplexityCreditGrant(type: "recurring", amountCents: 5000, expiresAtEpoch: nil)],  // $50
+            totalUsageCents: 150.0
+        )
+        store.apply(.success(snap))
+        if case let .balance(_, _, plan, _) = store.tiles.first(where: { $0.id == "perplexity-credits" })?.kind {
+            expectEqual(plan, "Pro")   // 5 000c < 10 000c
+        } else { expect(false, "expected balance tile") }
+    }
+
+    run("Perplexity credits tile: absurdly large balance_cents does not trap the tile mapper") {
+        // Codex adversarial review #1: a hostile 1e300 balance would have
+        // trapped `Int(Double)`. The new clamp routes it to Int.max instead.
+        let store = PerplexityUsageStore(credentials: InMemoryCredentialStore(), transport: StubPerplexityTransport(.networkError), defaults: defaults)
+        store.saveKey("cookie")
+        var snap = PerplexityUsageSnapshot()
+        snap.credits = PerplexityCredits(balanceCents: 1e300, renewalEpoch: 1770000000)
+        store.apply(.success(snap))
+        // Must not crash. Balance tile is emitted with a clamped value.
+        let tile = store.tiles.first { $0.id == "perplexity-credits" }
+        expect(tile != nil)
+        if case let .balance(minor, _, _, _) = tile?.kind {
+            expect(minor > 0)          // clamped, not zero, not a trap
+        } else { expect(false, "expected balance tile") }
+    }
+
+    run("Perplexity credits tile: no plan hint when only promotional grant present") {
+        let store = PerplexityUsageStore(credentials: InMemoryCredentialStore(), transport: StubPerplexityTransport(.networkError), defaults: defaults)
+        store.saveKey("cookie")
+        var snap = PerplexityUsageSnapshot()
+        snap.credits = PerplexityCredits(
+            grants: [PerplexityCreditGrant(type: "promotional", amountCents: 500, expiresAtEpoch: 1780000000)]
+        )
+        store.apply(.success(snap))
+        if case let .balance(_, _, plan, _) = store.tiles.first(where: { $0.id == "perplexity-credits" })?.kind {
+            expect(plan == nil, "no recurring grant → no plan hint")
+        } else { expect(false, "expected balance tile") }
+    }
+
+    run("Perplexity rate-limit counters only emitted when remaining > 0") {
+        let store = PerplexityUsageStore(credentials: InMemoryCredentialStore(), transport: StubPerplexityTransport(.networkError), defaults: defaults)
+        store.saveKey("cookie")
+        var snap = PerplexityUsageSnapshot()
+        snap.rateLimits = PerplexityRateLimits(
+            remainingPro: 42,
+            remainingResearch: 0,     // omitted from tiles
+            remainingLabs: 5,
+            remainingAgenticResearch: 0
+        )
+        store.apply(.success(snap))
+        let ids = store.tiles.map { $0.id }
+        expect(ids.contains("perplexity-pro"))
+        expect(ids.contains("perplexity-labs"))
+        expect(!ids.contains("perplexity-research"))
+        expect(!ids.contains("perplexity-agentic"))
+    }
+
+    run("Perplexity rate-limit tile uses .text 'N left' with no resets") {
+        // Codex adversarial review #4: the endpoint reports remaining only
+        // — no total, no reset. Rendering as `.counter(used: 0, limit: 42)`
+        // would read as an unused-42-limit meter. Render as a text tile.
+        let store = PerplexityUsageStore(credentials: InMemoryCredentialStore(), transport: StubPerplexityTransport(.networkError), defaults: defaults)
+        store.saveKey("cookie")
+        var snap = PerplexityUsageSnapshot()
+        snap.rateLimits = PerplexityRateLimits(remainingPro: 42)
+        store.apply(.success(snap))
+        if case let .text(status, subtitle) = store.tiles.first(where: { $0.id == "perplexity-pro" })?.kind {
+            expectEqual(status, "42 left")
+            expect(subtitle == nil)
+        } else {
+            expect(false, "expected text tile")
+        }
+    }
+
+    run("Perplexity 401 maps to session-expired error AND drops stale snapshot") {
+        // Codex adversarial review #6: a stale snapshot must not linger
+        // after the credential is known-bad — old numbers on the tile are
+        // worse than an onboarding message.
+        let store = PerplexityUsageStore(credentials: InMemoryCredentialStore(), transport: StubPerplexityTransport(.unauthorized), defaults: defaults)
+        store.saveKey("expired-cookie")
+        // First a successful fetch populates the snapshot.
+        var snap = PerplexityUsageSnapshot()
+        snap.credits = PerplexityCredits(balanceCents: 100)
+        store.apply(.success(snap))
+        expect(store.snapshot != nil)
+        // Then the cookie is revoked → 401 arrives.
+        store.apply(.unauthorized)
+        expect(store.errorMessage?.contains("expired") == true || store.errorMessage?.contains("blocked") == true)
+        expect(store.snapshot == nil)  // stale data cleared
+    }
+
+    run("Perplexity fetch() completion from a background queue applies safely") {
+        // Codex adversarial review #9: the store hops through
+        // Task { @MainActor } — a regression to `assumeIsolated` would trap
+        // when a real URLSession completion lands off-main. This transport
+        // dispatches its completion onto a background queue to exercise
+        // that path.
+        final class BackgroundQueueTransport: PerplexityUsageTransport, @unchecked Sendable {
+            func fetchAll(cookieName: String, cookieValue: String, completion: @escaping @Sendable (PerplexityUsageResult) -> Void) {
+                DispatchQueue.global().async { completion(.unauthorized) }
+            }
+        }
+        let store = PerplexityUsageStore(credentials: InMemoryCredentialStore(), transport: BackgroundQueueTransport(), defaults: defaults)
+        store.saveKey("cookie")
+        store.fetch()
+        // Spin the runloop briefly so the Task { @MainActor } hop is
+        // observed; TestRunner drives synchronous main-actor work only,
+        // so we sleep on the main thread just long enough for the hop.
+        let deadline = Date().addingTimeInterval(1.0)
+        while store.errorMessage == nil && Date() < deadline {
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.02))
+        }
+        expect(store.errorMessage != nil)
+    }
+
+    run("Perplexity partial success: only credits present renders credits tile") {
+        // Cloudflare-challenge a subset. Only `credits` came back OK.
+        let store = PerplexityUsageStore(credentials: InMemoryCredentialStore(), transport: StubPerplexityTransport(.networkError), defaults: defaults)
+        store.saveKey("cookie")
+        var snap = PerplexityUsageSnapshot()
+        snap.credits = PerplexityCredits(balanceCents: 100.0, renewalEpoch: 1770000000)
+        store.apply(.success(snap))
+        expect(store.tiles.contains { $0.id == "perplexity-credits" })
+        expect(!store.tiles.contains { $0.id == "perplexity-plan" })
+    }
+
+    run("Perplexity conforms to PasteKeyProvider protocol") {
+        let store = PerplexityUsageStore(credentials: InMemoryCredentialStore(), transport: StubPerplexityTransport(.networkError), defaults: defaults)
+        let paster = store as PasteKeyProvider
+        expect(paster.keyPlaceholder.contains("session-token") || paster.keyPlaceholder.contains("cookie"))
+        expectEqual(paster.hasKey, false)
+        paster.saveKey("pasted-cookie-value")
+        expectEqual(paster.hasKey, true)
+    }
+
+    run("Perplexity 429 surfaces a rate-limit specific message, not generic Network error") {
+        // Codex adversarial review round 3. If Perplexity shadow-bans /
+        // rate-limits the session, all three endpoints return 429 and the
+        // transport now emits .httpError(429). The store's apply() maps it
+        // to an actionable message about slowing down.
+        let store = PerplexityUsageStore(credentials: InMemoryCredentialStore(), transport: StubPerplexityTransport(.httpError(429)), defaults: defaults)
+        store.saveKey("cookie")
+        store.apply(.httpError(429))
+        expect(store.errorMessage?.contains("rate-limit") == true || store.errorMessage?.contains("Slow") == true)
+    }
+
+    run("Perplexity 5xx surfaces a server-error specific message") {
+        let store = PerplexityUsageStore(credentials: InMemoryCredentialStore(), transport: StubPerplexityTransport(.httpError(503)), defaults: defaults)
+        store.saveKey("cookie")
+        store.apply(.httpError(503))
+        expect(store.errorMessage?.contains("server error") == true || store.errorMessage?.contains("503") == true)
+    }
+
+    run("Perplexity fetch() with a malformed stored cookie surfaces an error message") {
+        // Codex adversarial review round 2 #1. A stored blob that hasKey=true
+        // but extract()=nil must not silently render blank tiles indefinitely.
+        let creds = InMemoryCredentialStore()
+        // Write a value directly (bypassing saveKey's trimming) that
+        // exercises the extract=nil path — a chunked cookie with a bogus
+        // index the overflow guard rejects.
+        creds.write(PerplexityUsageFetcher.cookieKeychainKey,
+                    Data("__Secure-next-auth.session-token.9999999=EVIL".utf8))
+        let store = PerplexityUsageStore(credentials: creds, transport: StubPerplexityTransport(.networkError), defaults: defaults)
+        expectEqual(store.isConfigured, true)   // presence, not parseability
+        store.fetch()
+        expect(store.errorMessage?.contains("parse") == true || store.errorMessage?.contains("Re-paste") == true)
+    }
+
+    run("Perplexity transport rejects a semicolon-injected cookie name") {
+        // Codex adversarial review round 2 #2. cookieName splicing.
+        let transport = URLSessionPerplexityTransport()
+        final class Box: @unchecked Sendable { var value: PerplexityUsageResult? }
+        let box = Box()
+        transport.fetchAll(cookieName: "__Secure-next-auth.session-token=real; other", cookieValue: "evil") { result in
+            box.value = result
+        }
+        let deadline = Date().addingTimeInterval(2.0)
+        while box.value == nil && Date() < deadline {
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.02))
+        }
+        if case .unauthorized = box.value {
+            expect(true)
+        } else {
+            expect(false, "expected .unauthorized, got \(String(describing: box.value))")
+        }
+    }
+
+    run("Perplexity transport rejects a semicolon-injected cookie value") {
+        // Codex adversarial review #5. A hostile paste like "real; other=evil"
+        // is caught by extract() when the paste is parsed (it becomes a full
+        // header the extractor picks from), but a value with an embedded `;`
+        // arriving DIRECTLY at fetchAll — e.g. an attacker-controlled
+        // Keychain item bypassing extract() — must not silently splice a
+        // second cookie into the request. The production transport rejects.
+        //
+        // The transport dispatches the completion via DispatchQueue.main.async,
+        // so we drive the runloop until it fires rather than blocking on a
+        // semaphore (which would deadlock the main-queue hop).
+        let transport = URLSessionPerplexityTransport()
+        final class Box: @unchecked Sendable { var value: PerplexityUsageResult? }
+        let box = Box()
+        transport.fetchAll(cookieName: "__Secure-next-auth.session-token", cookieValue: "real; other=evil") { result in
+            box.value = result
+        }
+        let deadline = Date().addingTimeInterval(2.0)
+        while box.value == nil && Date() < deadline {
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.02))
+        }
+        if case .unauthorized = box.value {
+            expect(true)
+        } else {
+            expect(false, "expected .unauthorized rejection, got \(String(describing: box.value))")
+        }
+    }
+
+    defaults.removePersistentDomain(forName: suiteName)
+}
+
 // MARK: - Summary
 
 print("")

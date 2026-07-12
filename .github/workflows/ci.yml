@@ -68,7 +68,12 @@ jobs:
           # codes go through Log.info(.count). New providers add new secret
           # variable names — extend this alternation when you add one.
           SINKS='(NSLog|print|debugPrint|dump|os_log|Logger|Log\.debug|Log\.info)'
-          SECRETS='(adminKey|inferenceKey|managementKey|apiKey|accessToken|refreshKey|refreshToken|idToken|sessionCookie|sessionCookieInput|bearer|accessKey|secret|[Cc]ookie)'
+          # `cookieValue`, `cookieHeader`, `perplexityCookie`, `pplxCookie`
+          # cover the Perplexity session-cookie variable names introduced in
+          # PR 8-BE. `[Cc]ookie` already catches most, but the more specific
+          # names guard against a rename that would still slip past the
+          # generic alternation.
+          SECRETS='(adminKey|inferenceKey|managementKey|apiKey|accessToken|refreshKey|refreshToken|idToken|sessionCookie|sessionCookieInput|cookieValue|cookieHeader|perplexityCookie|pplxCookie|bearer|accessKey|secret|[Cc]ookie)'
           # Match a sink call that contains a Swift string-interpolation of a
           # secret variable: SINK( ... \( ...secret... ) ... )
           if grep -rnE "${SINKS}\([^)]*\\\\\\(.*${SECRETS}" -- app/ ; then

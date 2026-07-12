@@ -81,7 +81,10 @@ let package = Package(
                 "XAIUsageStore.swift",
                 // OpenAI Platform: admin key, three org endpoints.
                 "OpenAIUsageFetcher.swift",
-                "OpenAIUsageStore.swift"
+                "OpenAIUsageStore.swift",
+                // Perplexity: cookie in Keychain, three cookie-authed endpoints.
+                "PerplexityUsageFetcher.swift",
+                "PerplexityUsageStore.swift"
                 // AnthropicUsageStore.swift depends on UsageManager
                 // (defined in ClaudeUsageBar.swift), so it stays in the
                 // app-bundle compile only, not in the SwiftPM library
