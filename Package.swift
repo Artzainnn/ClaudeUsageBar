@@ -84,7 +84,11 @@ let package = Package(
                 "OpenAIUsageStore.swift",
                 // Perplexity: cookie in Keychain, three cookie-authed endpoints.
                 "PerplexityUsageFetcher.swift",
-                "PerplexityUsageStore.swift"
+                "PerplexityUsageStore.swift",
+                // GitHub Copilot: fine-grained PAT in Keychain, /user +
+                // /users/{login}/settings/billing/ai_credit/usage.
+                "CopilotUsageFetcher.swift",
+                "CopilotUsageStore.swift"
                 // AnthropicUsageStore.swift depends on UsageManager
                 // (defined in ClaudeUsageBar.swift), so it stays in the
                 // app-bundle compile only, not in the SwiftPM library

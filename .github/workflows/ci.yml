@@ -73,7 +73,11 @@ jobs:
           # PR 8-BE. `[Cc]ookie` already catches most, but the more specific
           # names guard against a rename that would still slip past the
           # generic alternation.
-          SECRETS='(adminKey|inferenceKey|managementKey|apiKey|accessToken|refreshKey|refreshToken|idToken|sessionCookie|sessionCookieInput|cookieValue|cookieHeader|perplexityCookie|pplxCookie|bearer|accessKey|secret|[Cc]ookie)'
+          # `pat`, `patToken`, `authHeader` cover the GitHub Copilot
+          # variable names introduced in PR 9-BE (fine-grained PAT →
+          # Authorization: Bearer …). `safeToken` is the RequestSafety-
+          # sanitised local; still refuse to log it.
+          SECRETS='(adminKey|inferenceKey|managementKey|apiKey|accessToken|refreshKey|refreshToken|idToken|sessionCookie|sessionCookieInput|cookieValue|cookieHeader|perplexityCookie|pplxCookie|patToken|safeToken|authHeader|bearer|accessKey|secret|[Cc]ookie)'
           # Match a sink call that contains a Swift string-interpolation of a
           # secret variable: SINK( ... \( ...secret... ) ... )
           if grep -rnE "${SINKS}\([^)]*\\\\\\(.*${SECRETS}" -- app/ ; then

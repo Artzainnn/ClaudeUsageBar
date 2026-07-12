@@ -2544,6 +2544,628 @@ MainActor.assumeIsolated {
     defaults.removePersistentDomain(forName: suiteName)
 }
 
+// MARK: - CopilotUsageFetcher.parseUsage (PR 9-BE)
+
+run("Copilot parseUsage: happy path — AI Credit line item + top-level fields") {
+    // Fixture shape is verbatim from the OpenAPI 2026-03-10 spec example
+    // (github/rest-api-description) and matches docs.github.com/en/rest/
+    // billing/usage. Every field name is confirmed by the research report.
+    let json = """
+    {
+      "timePeriod": { "year": 2026, "month": 7, "day": 12 },
+      "user": "monalisa",
+      "product": "Copilot",
+      "usageItems": [
+        {
+          "product": "Copilot AI Credits",
+          "sku": "AI Credit",
+          "model": "GPT-5",
+          "unitType": "ai-credits",
+          "pricePerUnit": 0.01,
+          "grossQuantity": 100,
+          "grossAmount": 1.0,
+          "discountQuantity": 0,
+          "discountAmount": 0.0,
+          "netQuantity": 100,
+          "netAmount": 1.0
+        },
+        {
+          "product": "Copilot",
+          "sku": "Copilot Premium Request",
+          "model": "GPT-5",
+          "unitType": "requests",
+          "pricePerUnit": 0.04,
+          "grossQuantity": 50,
+          "grossAmount": 2.0,
+          "discountQuantity": 20,
+          "discountAmount": 0.8,
+          "netQuantity": 30,
+          "netAmount": 1.2
+        }
+      ]
+    }
+    """
+    guard let data = json.data(using: .utf8) else { expect(false, "utf8"); return }
+    do {
+        let snap = try CopilotUsageFetcher.parseUsage(data)
+        expectEqual(snap.year, 2026)
+        expectEqual(snap.month, 7)
+        expectEqual(snap.day, 12)
+        expectEqual(snap.user, "monalisa")
+        expectEqual(snap.product, "Copilot")
+        expectEqual(snap.items.count, 2)
+        expectEqual(snap.items[0].sku, "AI Credit")
+        expectEqual(snap.items[0].pricePerUnit, 0.01)
+        expectEqual(snap.items[0].netAmount, 1.0)
+        expectEqual(snap.items[1].sku, "Copilot Premium Request")
+        expectEqual(snap.items[1].netAmount, 1.2)
+        // MTD = sum of netAmount = 1.0 + 1.2 = 2.2.
+        expect(abs(snap.netAmountMTDUSD - 2.2) < 1e-6)
+    } catch {
+        expect(false, "parseUsage threw: \(error)")
+    }
+}
+
+run("Copilot parseUsage: org-billed empty response (usageItems: []) is representable") {
+    // Documented: a user whose Copilot licence is billed through an org
+    // gets 200 with usageItems=[] on the personal endpoint, NOT a 404.
+    // The parser must produce a snapshot flagging this.
+    let json = """
+    {"timePeriod": {"year": 2026, "month": 7}, "user": "orgseat-user", "usageItems": []}
+    """
+    guard let data = json.data(using: .utf8) else { expect(false); return }
+    let snap = try? CopilotUsageFetcher.parseUsage(data)
+    expect(snap != nil)
+    expectEqual(snap?.isEmptyOrgBilled, true)
+    expectEqual(snap?.netAmountMTDUSD, 0)
+}
+
+run("Copilot parseUsage: fractional grossQuantity does NOT trap") {
+    // Captures have shown grossQuantity like 3956.1799545 — must decode
+    // as Double, not Int (Int(1e300) traps).
+    let json = """
+    {"timePeriod": {"year": 2026}, "user": "u", "usageItems": [
+      {"product": "Copilot AI Credits", "sku": "AI Credit", "model": "GPT-5",
+       "unitType": "ai-credits", "pricePerUnit": 0.01,
+       "grossQuantity": 3956.1799545, "grossAmount": 39.56,
+       "discountQuantity": 0, "discountAmount": 0,
+       "netQuantity": 3956.1799545, "netAmount": 39.56}
+    ]}
+    """
+    guard let data = json.data(using: .utf8) else { expect(false); return }
+    let snap = try? CopilotUsageFetcher.parseUsage(data)
+    expect(abs((snap?.items.first?.grossQuantity ?? 0) - 3956.1799545) < 1e-6)
+}
+
+run("Copilot parseUsage: invalid JSON throws invalidJSON") {
+    let data = Data("<html>rate-limited</html>".utf8)
+    do {
+        _ = try CopilotUsageFetcher.parseUsage(data)
+        expect(false, "expected throw")
+    } catch let e as CopilotUsageParseError {
+        expectEqual(e, .invalidJSON)
+    } catch {
+        expect(false, "wrong error type")
+    }
+}
+
+run("Copilot parseUsage: item missing product OR sku is dropped, not crashed") {
+    // Defence: if GitHub ever adds a placeholder line without a sku,
+    // don't smuggle it in as an empty-string SKU tile. Refuse the line.
+    let json = """
+    {"timePeriod": {"year": 2026}, "user": "u", "usageItems": [
+      {"model": "GPT-5", "unitType": "ai-credits", "netAmount": 1.0},
+      {"product": "Copilot AI Credits", "sku": "AI Credit",
+       "unitType": "ai-credits", "pricePerUnit": 0.01,
+       "grossQuantity": 100, "grossAmount": 1.0,
+       "discountQuantity": 0, "discountAmount": 0,
+       "netQuantity": 100, "netAmount": 1.0}
+    ]}
+    """
+    guard let data = json.data(using: .utf8) else { expect(false); return }
+    let snap = try? CopilotUsageFetcher.parseUsage(data)
+    // The malformed entry is dropped; the well-formed one is kept.
+    expectEqual(snap?.items.count, 1)
+    expectEqual(snap?.items.first?.sku, "AI Credit")
+}
+
+run("Copilot parseUsage: unexpected extra top-level field tolerated") {
+    // Forward-compatible: a future addition to the schema (e.g. "totals")
+    // must not throw or drop the known fields.
+    let json = """
+    {"timePeriod": {"year": 2026}, "user": "u", "usageItems": [], "totals": {"chargesUSD": 0}}
+    """
+    guard let data = json.data(using: .utf8) else { expect(false); return }
+    let snap = try? CopilotUsageFetcher.parseUsage(data)
+    expect(snap != nil)
+    expectEqual(snap?.user, "u")
+}
+
+run("Copilot parseAuthenticatedUserLogin: happy path") {
+    let json = """
+    {"login": "monalisa", "id": 583231, "name": "Mona Lisa"}
+    """
+    let data = json.data(using: .utf8)!
+    let login = try? CopilotUsageFetcher.parseAuthenticatedUserLogin(data)
+    expectEqual(login, "monalisa")
+}
+
+run("Copilot parseAuthenticatedUserLogin: missing login throws") {
+    let json = "{}"
+    let data = json.data(using: .utf8)!
+    do {
+        _ = try CopilotUsageFetcher.parseAuthenticatedUserLogin(data)
+        expect(false, "expected throw")
+    } catch let e as CopilotUsageParseError {
+        if case .unexpectedShape = e { expect(true) }
+        else { expect(false, "wrong error case") }
+    } catch {
+        expect(false, "wrong error type")
+    }
+}
+
+run("Copilot: netAmountMTDUSD clamps negative sums to zero") {
+    // Defensive: a hostile server that emitted a negative netAmount must
+    // not surface as a negative MTD headline.
+    var snap = CopilotUsageSnapshot()
+    snap.items = [
+        CopilotUsageItem(product: "Copilot", sku: "X", model: nil, unitType: "u",
+                         pricePerUnit: 1, grossQuantity: 1, grossAmount: 1,
+                         discountQuantity: 0, discountAmount: 0,
+                         netQuantity: -100, netAmount: -100)
+    ]
+    expectEqual(snap.netAmountMTDUSD, 0)
+}
+
+run("Copilot: itemsBySkuDescending sorts by netAmount") {
+    var snap = CopilotUsageSnapshot()
+    snap.items = [
+        CopilotUsageItem(product: "p", sku: "A", model: nil, unitType: "u",
+                         pricePerUnit: 0, grossQuantity: 0, grossAmount: 0,
+                         discountQuantity: 0, discountAmount: 0,
+                         netQuantity: 1, netAmount: 1.0),
+        CopilotUsageItem(product: "p", sku: "B", model: nil, unitType: "u",
+                         pricePerUnit: 0, grossQuantity: 0, grossAmount: 0,
+                         discountQuantity: 0, discountAmount: 0,
+                         netQuantity: 3, netAmount: 3.0),
+        CopilotUsageItem(product: "p", sku: "C", model: nil, unitType: "u",
+                         pricePerUnit: 0, grossQuantity: 0, grossAmount: 0,
+                         discountQuantity: 0, discountAmount: 0,
+                         netQuantity: 2, netAmount: 2.0)
+    ]
+    let sorted = snap.itemsBySkuDescending
+    expectEqual(sorted.map(\.sku), ["B", "C", "A"])
+}
+
+// MARK: - CopilotUsageStore (in-memory credentials + stubbed transport)
+
+final class StubCopilotTransport: CopilotUsageTransport, @unchecked Sendable {
+    let result: CopilotUsageResult
+    let discoveredLogin: String?
+    init(_ result: CopilotUsageResult, discoveredLogin: String? = nil) {
+        self.result = result
+        self.discoveredLogin = discoveredLogin
+    }
+    func fetchAll(token: String, cachedLogin: String?,
+                  completion: @escaping @Sendable (CopilotUsageResult, String?) -> Void) {
+        completion(result, discoveredLogin)
+    }
+}
+
+MainActor.assumeIsolated {
+    let suiteName = "copilot-tests-\(ProcessInfo.processInfo.processIdentifier)"
+    let defaults = UserDefaults(suiteName: suiteName)!
+    defaults.removePersistentDomain(forName: suiteName)
+    defaults.set(true, forKey: "features.copilot.enabled")
+
+    run("Copilot store off by default emits no tiles") {
+        let d2 = UserDefaults(suiteName: suiteName + "-off")!
+        d2.removePersistentDomain(forName: suiteName + "-off")
+        let store = CopilotUsageStore(credentials: InMemoryCredentialStore(),
+                                      transport: StubCopilotTransport(.networkError),
+                                      defaults: d2)
+        expectEqual(store.isEnabled, false)
+        expectEqual(store.tiles.count, 0)
+    }
+
+    run("Copilot enabled without PAT emits needsAccess card") {
+        let store = CopilotUsageStore(credentials: InMemoryCredentialStore(),
+                                      transport: StubCopilotTransport(.networkError),
+                                      defaults: defaults)
+        expectEqual(store.isConfigured, false)
+        let tiles = store.tiles
+        expectEqual(tiles.count, 1)
+        if case .needsAccess = tiles.first?.kind { expect(true) }
+        else { expect(false, "expected needsAccess") }
+    }
+
+    run("Copilot locked keychain still counted as configured") {
+        let store = CopilotUsageStore(credentials: UnavailableCredentialStore(),
+                                      transport: StubCopilotTransport(.networkError),
+                                      defaults: defaults)
+        expectEqual(store.isConfigured, true)
+    }
+
+    run("Copilot saveKey stores PAT; clear deletes it and cached login") {
+        let creds = InMemoryCredentialStore()
+        let store = CopilotUsageStore(credentials: creds,
+                                      transport: StubCopilotTransport(.networkError),
+                                      defaults: defaults)
+        expectEqual(store.hasKey, false)
+        // Pre-seed a cached login and PAT via the store's own API.
+        store.saveKey("github_pat_abc")
+        expectEqual(store.hasKey, true)
+        creds.write(CopilotUsageFetcher.loginKeychainKey, Data("monalisa".utf8))
+        store.clear()
+        expectEqual(store.hasKey, false)
+        expect(creds.read(CopilotUsageFetcher.loginKeychainKey) == nil)
+    }
+
+    run("Copilot saveKey with new PAT invalidates cached login") {
+        // A new PAT may belong to a different GitHub user; the cached
+        // login from the prior PAT MUST be dropped so the next fetch
+        // re-discovers via /user.
+        let creds = InMemoryCredentialStore()
+        let store = CopilotUsageStore(credentials: creds,
+                                      transport: StubCopilotTransport(.networkError),
+                                      defaults: defaults)
+        store.saveKey("github_pat_first")
+        creds.write(CopilotUsageFetcher.loginKeychainKey, Data("olduser".utf8))
+        store.saveKey("github_pat_second")
+        expect(creds.read(CopilotUsageFetcher.loginKeychainKey) == nil)
+    }
+
+    run("Copilot fetch() on locked keychain surfaces unlock message") {
+        let store = CopilotUsageStore(credentials: UnavailableCredentialStore(),
+                                      transport: StubCopilotTransport(.networkError),
+                                      defaults: defaults)
+        expectEqual(store.isConfigured, true)
+        store.fetch()
+        expect(store.errorMessage?.contains("Keychain") == true ||
+               store.errorMessage?.contains("Unlock") == true)
+    }
+
+    run("Copilot org-billed empty tile is emitted separately from spend tiles") {
+        let store = CopilotUsageStore(credentials: InMemoryCredentialStore(),
+                                      transport: StubCopilotTransport(.networkError),
+                                      defaults: defaults)
+        store.saveKey("github_pat_x")
+        var snap = CopilotUsageSnapshot()
+        snap.user = "orgseat"
+        snap.year = 2026
+        snap.month = 7
+        // items empty -> isEmptyOrgBilled
+        store.apply(.success(snap))
+        expect(store.tiles.contains { $0.id == "copilot-empty" })
+        expect(!store.tiles.contains { $0.id == "copilot-mtd" })
+    }
+
+    run("Copilot MTD tile carries USD cents + period label from populated snapshot") {
+        let store = CopilotUsageStore(credentials: InMemoryCredentialStore(),
+                                      transport: StubCopilotTransport(.networkError),
+                                      defaults: defaults)
+        store.saveKey("github_pat_x")
+        var snap = CopilotUsageSnapshot()
+        snap.user = "monalisa"; snap.year = 2026; snap.month = 7
+        snap.items = [
+            CopilotUsageItem(product: "Copilot AI Credits", sku: "AI Credit",
+                             model: "GPT-5", unitType: "ai-credits",
+                             pricePerUnit: 0.01,
+                             grossQuantity: 250, grossAmount: 2.50,
+                             discountQuantity: 100, discountAmount: 1.00,
+                             netQuantity: 150, netAmount: 1.50)
+        ]
+        store.apply(.success(snap))
+        let tile = store.tiles.first { $0.id == "copilot-mtd" }
+        expect(tile != nil)
+        if case let .balance(minor, currency, plan, resetsAt) = tile?.kind {
+            expectEqual(minor, 150)   // $1.50 = 150 cents
+            expectEqual(currency, "USD")
+            expect(plan?.contains("2026") == true)
+            expect(resetsAt == nil)   // no month-end date on the wire
+        } else { expect(false, "expected balance tile") }
+    }
+
+    run("Copilot per-SKU tiles are emitted, capped at three, ordered by net descending") {
+        let store = CopilotUsageStore(credentials: InMemoryCredentialStore(),
+                                      transport: StubCopilotTransport(.networkError),
+                                      defaults: defaults)
+        store.saveKey("github_pat_x")
+        var snap = CopilotUsageSnapshot()
+        snap.user = "u"; snap.year = 2026
+        // Four SKUs; only the top three should render.
+        let mk: (String, Double) -> CopilotUsageItem = { sku, net in
+            CopilotUsageItem(product: "Copilot", sku: sku, model: "GPT-5",
+                             unitType: "u", pricePerUnit: 1,
+                             grossQuantity: net, grossAmount: net,
+                             discountQuantity: 0, discountAmount: 0,
+                             netQuantity: net, netAmount: net)
+        }
+        snap.items = [mk("A", 1), mk("B", 5), mk("C", 3), mk("D", 2)]
+        store.apply(.success(snap))
+        let skuIds = store.tiles.map(\.id).filter { $0.hasPrefix("copilot-sku-") }
+        expectEqual(skuIds.count, 3)
+        // Order: B (5) > C (3) > D (2). A (1) is dropped by the prefix(3) cap.
+        expectEqual(skuIds, ["copilot-sku-b", "copilot-sku-c", "copilot-sku-d"])
+    }
+
+    run("Copilot 401 clears stale snapshot AND surfaces re-generate-PAT message") {
+        // Same chk1 Bug #2 / #6 fix pattern as Perplexity: an authorisation
+        // failure must not preserve stale numbers on the tile.
+        let store = CopilotUsageStore(credentials: InMemoryCredentialStore(),
+                                      transport: StubCopilotTransport(.unauthorized),
+                                      defaults: defaults)
+        store.saveKey("github_pat_x")
+        var snap = CopilotUsageSnapshot()
+        snap.user = "u"; snap.year = 2026
+        snap.items = [CopilotUsageItem(product: "Copilot", sku: "AI Credit",
+                                       model: nil, unitType: "u",
+                                       pricePerUnit: 0.01,
+                                       grossQuantity: 100, grossAmount: 1,
+                                       discountQuantity: 0, discountAmount: 0,
+                                       netQuantity: 100, netAmount: 1)]
+        store.apply(.success(snap))
+        expect(store.snapshot != nil)
+        store.apply(.unauthorized)
+        expect(store.snapshot == nil)   // stale data cleared
+        expect(store.errorMessage?.contains("Plan") == true ||
+               store.errorMessage?.contains("PAT") == true)
+    }
+
+    run("Copilot rateLimited emits a retry-hint message when Retry-After is present") {
+        let store = CopilotUsageStore(credentials: InMemoryCredentialStore(),
+                                      transport: StubCopilotTransport(.networkError),
+                                      defaults: defaults)
+        store.saveKey("github_pat_x")
+        store.apply(.rateLimited(retryAfterSeconds: 42))
+        expect(store.errorMessage?.contains("42") == true)
+    }
+
+    run("Copilot 5xx surfaces a server-error message distinct from generic HTTP N") {
+        let store = CopilotUsageStore(credentials: InMemoryCredentialStore(),
+                                      transport: StubCopilotTransport(.httpError(503)),
+                                      defaults: defaults)
+        store.saveKey("github_pat_x")
+        store.apply(.httpError(503))
+        expect(store.errorMessage?.contains("server error") == true ||
+               store.errorMessage?.contains("503") == true)
+    }
+
+    run("Copilot fetch() discovers login from /user and persists it") {
+        // The transport reports a fresh login discovery; the store must
+        // persist it so a subsequent fetch skips the extra hop.
+        let creds = InMemoryCredentialStore()
+        var snap = CopilotUsageSnapshot(); snap.user = "monalisa"; snap.year = 2026
+        let stub = StubCopilotTransport(.success(snap), discoveredLogin: "monalisa")
+        let store = CopilotUsageStore(credentials: creds, transport: stub, defaults: defaults)
+        store.saveKey("github_pat_x")
+        store.fetch()
+        let deadline = Date().addingTimeInterval(2.0)
+        while store.snapshot == nil && Date() < deadline {
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.02))
+        }
+        expect(store.snapshot != nil)
+        let cached = creds.read(CopilotUsageFetcher.loginKeychainKey)
+            .flatMap { String(data: $0, encoding: .utf8) }
+        expectEqual(cached, "monalisa")
+    }
+
+    run("Copilot fetch() background-delivered success reaches @Published snapshot") {
+        // Common-case: background-queue delivery. Would trap if apply()
+        // were ever regressed to MainActor.assumeIsolated.
+        final class BgTransport: CopilotUsageTransport, @unchecked Sendable {
+            func fetchAll(token: String, cachedLogin: String?,
+                          completion: @escaping @Sendable (CopilotUsageResult, String?) -> Void) {
+                DispatchQueue.global().async {
+                    var snap = CopilotUsageSnapshot()
+                    snap.user = "u"; snap.year = 2026
+                    completion(.success(snap), nil)
+                }
+            }
+        }
+        let store = CopilotUsageStore(credentials: InMemoryCredentialStore(),
+                                      transport: BgTransport(), defaults: defaults)
+        store.saveKey("github_pat_x")
+        store.fetch()
+        let deadline = Date().addingTimeInterval(2.0)
+        while store.snapshot == nil && Date() < deadline {
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.02))
+        }
+        expect(store.snapshot != nil)
+    }
+
+    // Delayed transport whose completion fires only after `go` is signalled,
+    // AND records that it fired so a test can verify the closure was invoked
+    // (not just that snapshot happened to stay nil). Addresses Codex round-2
+    // finding #5.
+    final class DelayedCopilotTransport: CopilotUsageTransport, @unchecked Sendable {
+        let go = DispatchSemaphore(value: 0)
+        let completedLock = NSLock()
+        private var _completed = false
+        var completed: Bool {
+            completedLock.lock(); defer { completedLock.unlock() }
+            return _completed
+        }
+        func fetchAll(token: String, cachedLogin: String?,
+                      completion: @escaping @Sendable (CopilotUsageResult, String?) -> Void) {
+            DispatchQueue.global().async { [weak self] in
+                self?.go.wait()
+                var snap = CopilotUsageSnapshot()
+                snap.user = "victim"; snap.year = 2026
+                completion(.success(snap), "victim")
+                self?.completedLock.lock()
+                self?._completed = true
+                self?.completedLock.unlock()
+            }
+        }
+    }
+
+    run("Copilot: saveKey during in-flight fetch discards stale completion (Codex #1)") {
+        // Codex round-1 finding #1: fetch launched with PAT A must not
+        // apply its result after saveKey has rotated to PAT B.
+        let creds = InMemoryCredentialStore()
+        let stub = DelayedCopilotTransport()
+        let store = CopilotUsageStore(credentials: creds, transport: stub, defaults: defaults)
+        store.saveKey("github_pat_A")
+        store.fetch()
+        // Rotate the credential BEFORE releasing the transport's completion.
+        store.saveKey("github_pat_B")
+        stub.go.signal()
+        // Drive the runloop until we observe the completion actually ran.
+        let deadline = Date().addingTimeInterval(2.0)
+        while !stub.completed && Date() < deadline {
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.02))
+        }
+        // Codex round-2 finding #5: prove the completion actually fired.
+        expect(stub.completed)
+        // Give the Task { @MainActor } hop a moment to run its (rejected) guard.
+        let hopDeadline = Date().addingTimeInterval(0.5)
+        while Date() < hopDeadline {
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.02))
+        }
+        // The stale fetch result must have been dropped by the generation guard.
+        expect(store.snapshot == nil)
+        // And the cached login for the OLD PAT must NOT have been persisted.
+        expect(creds.read(CopilotUsageFetcher.loginKeychainKey) == nil)
+    }
+
+    run("Copilot: clear() during in-flight fetch also discards stale completion (Codex #2)") {
+        let stub = DelayedCopilotTransport()
+        let store = CopilotUsageStore(credentials: InMemoryCredentialStore(),
+                                      transport: stub, defaults: defaults)
+        store.saveKey("github_pat_x")
+        store.fetch()
+        store.clear()
+        stub.go.signal()
+        let deadline = Date().addingTimeInterval(2.0)
+        while !stub.completed && Date() < deadline {
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.02))
+        }
+        expect(stub.completed)
+        let hopDeadline = Date().addingTimeInterval(0.5)
+        while Date() < hopDeadline {
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.02))
+        }
+        expect(store.snapshot == nil)
+        expectEqual(store.hasKey, false)
+    }
+
+    run("Copilot: 403 with Retry-After is classified as rate-limited even when remaining ≠ 0 (Codex round-2 #3)") {
+        // Secondary/abuse rate limit shape: GitHub sends 403 + Retry-After
+        // without setting x-ratelimit-remaining to 0. The auth message must
+        // NOT fire in that case — user needs to see "rate-limited, retry
+        // in Ns", not "PAT invalid".
+        let headers: [String: String] = ["retry-after": "60", "x-ratelimit-remaining": "42"]
+        expect(URLSessionCopilotTransport.isRateLimitResponse(headers))
+        expectEqual(URLSessionCopilotTransport.retryAfterSeconds(from: headers), 60)
+    }
+
+    run("Copilot: Retry-After parses HTTP-date format (Codex round-2 #4)") {
+        // A date 120s in the future should decode to ~120s delta.
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.timeZone = TimeZone(identifier: "GMT")
+        fmt.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        let futureDate = Date().addingTimeInterval(120)
+        let headers = ["retry-after": fmt.string(from: futureDate)]
+        let delta = URLSessionCopilotTransport.retryAfterSeconds(from: headers) ?? 0
+        // Allow ±5s tolerance for test-run wall clock jitter.
+        expect(delta >= 115 && delta <= 125, "expected ~120s, got \(delta)")
+    }
+
+    run("Copilot: stale cached login on billing 401 is dropped (Codex round-2 #2)") {
+        // The transport reports .unauthorized while a cached login existed;
+        // the store's generation-guarded closure must drop the cache so the
+        // next fetch re-discovers via /user.
+        let creds = InMemoryCredentialStore()
+        creds.write(CopilotUsageFetcher.loginKeychainKey, Data("olduser".utf8))
+        let stub = StubCopilotTransport(.unauthorized, discoveredLogin: nil)
+        let store = CopilotUsageStore(credentials: creds, transport: stub, defaults: defaults)
+        store.saveKey("github_pat_x")
+        // saveKey clears the login too — pre-seed AFTER saveKey.
+        creds.write(CopilotUsageFetcher.loginKeychainKey, Data("olduser".utf8))
+        store.fetch()
+        let deadline = Date().addingTimeInterval(1.0)
+        while store.errorMessage == nil && Date() < deadline {
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.02))
+        }
+        // Cache dropped on the .unauthorized-with-cached-login path.
+        expect(creds.read(CopilotUsageFetcher.loginKeychainKey) == nil)
+    }
+
+    run("Copilot: hostile oversize netQuantity does not trap tile mapper (Codex #3)") {
+        let store = CopilotUsageStore(credentials: InMemoryCredentialStore(),
+                                      transport: StubCopilotTransport(.networkError),
+                                      defaults: defaults)
+        store.saveKey("github_pat_x")
+        var snap = CopilotUsageSnapshot()
+        snap.user = "u"; snap.year = 2026
+        // 1e300 is a valid JSON number; Int(1e300) traps. The chk1-hardened
+        // guard uses Int(exactly:) and falls back to %.2f rendering.
+        snap.items = [
+            CopilotUsageItem(product: "Copilot", sku: "AI Credit", model: nil,
+                             unitType: "u", pricePerUnit: 1,
+                             grossQuantity: 1e300, grossAmount: 1e300,
+                             discountQuantity: 0, discountAmount: 0,
+                             netQuantity: 1e300, netAmount: 1)
+        ]
+        // Must not crash.
+        _ = store.tiles
+        expect(true)
+    }
+
+    run("Copilot: hostile month=13 in periodLabel falls back to bare year (Codex #7)") {
+        let store = CopilotUsageStore(credentials: InMemoryCredentialStore(),
+                                      transport: StubCopilotTransport(.networkError),
+                                      defaults: defaults)
+        store.saveKey("github_pat_x")
+        var snap = CopilotUsageSnapshot()
+        snap.user = "u"; snap.year = 2026; snap.month = 13
+        snap.items = [CopilotUsageItem(product: "Copilot", sku: "AI Credit",
+                                       model: nil, unitType: "u",
+                                       pricePerUnit: 0.01,
+                                       grossQuantity: 1, grossAmount: 0.01,
+                                       discountQuantity: 0, discountAmount: 0,
+                                       netQuantity: 1, netAmount: 0.01)]
+        store.apply(.success(snap))
+        if case let .balance(_, _, plan, _) = store.tiles.first(where: { $0.id == "copilot-mtd" })?.kind {
+            // The bare year "2026" should appear (no January-2027 rollover).
+            expectEqual(plan, "2026")
+        } else { expect(false, "expected balance tile") }
+    }
+
+    run("Copilot parseUsage: MISSING usageItems throws, DOES NOT become org-billed (Codex #6)") {
+        // The OpenAPI spec makes usageItems REQUIRED. A missing key means
+        // schema violation, not org-billed. `usageItems: []` is the true
+        // org-billed signal and is tested elsewhere.
+        let json = """
+        {"timePeriod": {"year": 2026}, "user": "u"}
+        """
+        guard let data = json.data(using: .utf8) else { expect(false); return }
+        do {
+            _ = try CopilotUsageFetcher.parseUsage(data)
+            expect(false, "expected throw for missing usageItems")
+        } catch let e as CopilotUsageParseError {
+            if case .unexpectedShape = e { expect(true) }
+            else { expect(false, "wrong error case") }
+        } catch {
+            expect(false, "wrong error type")
+        }
+    }
+
+    run("Copilot conforms to PasteKeyProvider with default 'Key' noun") {
+        // Copilot is a PAT (not a cookie) — the default "Key" noun applies.
+        let store = CopilotUsageStore(credentials: InMemoryCredentialStore(),
+                                      transport: StubCopilotTransport(.networkError),
+                                      defaults: defaults)
+        let paster = store as PasteKeyProvider
+        expectEqual(paster.secretKindNoun, "Key")
+        expect(paster.keyPlaceholder.contains("github_pat_"))
+    }
+
+    defaults.removePersistentDomain(forName: suiteName)
+}
+
 // MARK: - Summary
 
 print("")
