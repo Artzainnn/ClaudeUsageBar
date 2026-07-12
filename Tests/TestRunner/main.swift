@@ -2177,6 +2177,24 @@ MainActor.assumeIsolated {
         }
     }
 
+    run("Perplexity credits tile: recurring grant matched case-insensitively (chk1 Bug #4)") {
+        // Guard against a Perplexity schema tweak that changes the casing
+        // of the grant type from "recurring" to "Recurring". Without a
+        // case-insensitive compare the recurring total would collapse to 0
+        // and the plan hint would silently disappear.
+        let store = PerplexityUsageStore(credentials: InMemoryCredentialStore(), transport: StubPerplexityTransport(.networkError), defaults: defaults)
+        store.saveKey("cookie")
+        var snap = PerplexityUsageSnapshot()
+        snap.credits = PerplexityCredits(
+            balanceCents: 100,
+            grants: [PerplexityCreditGrant(type: "Recurring", amountCents: 50000, expiresAtEpoch: nil)]
+        )
+        store.apply(.success(snap))
+        if case let .balance(_, _, plan, _) = store.tiles.first(where: { $0.id == "perplexity-credits" })?.kind {
+            expectEqual(plan, "Max")
+        } else { expect(false, "expected balance tile") }
+    }
+
     run("Perplexity credits tile: Pro plan hint from a $50-tier recurring grant") {
         // Codex adversarial review #3: the initial 5 000c threshold flipped
         // Pro users to "Max" — a $50 grant must still register as Pro.

@@ -2,9 +2,10 @@
 //
 // Sixth non-Anthropic provider; first cookie-authenticated one. The user's
 // perplexity.ai session cookie is stored in the Keychain (PasteKeyProvider
-// UX; the field ships in PR 8-UI). Three endpoints are polled every 5
-// minutes when enabled: credits, rate-limit/all, user/settings. Bodies are
-// never logged; only HTTP status codes go through Log.info(.count).
+// UX shipped in PR 8-UI). Three endpoints are polled every 60 seconds by
+// the shared AppDelegate timer when enabled: credits, rate-limit/all,
+// user/settings. Bodies are never logged; only HTTP status codes go
+// through Log.info(.count).
 //
 // Feature posture: features.perplexity.enabled defaults false. Nothing
 // registers a store into the live registry yet — the tile + Settings sheet
@@ -150,8 +151,13 @@ public final class PerplexityUsageStore: @preconcurrency UsageProvider, PasteKey
             // published Pro/Max plan comparisons (CodexBar comment) —
             // NB: the initial draft used 5 000 which flipped Pro users to
             // "Max" one order of magnitude too early.
+            // Defensive lowercase compare: Perplexity has been observed
+            // returning "recurring" verbatim, but a future casing change
+            // ("Recurring") would silently drop the recurring total and
+            // blank out the plan hint. Match case-insensitively so a
+            // schema tweak does not cause a silent regression.
             let recurring = credits.grants
-                .filter { $0.type == "recurring" }
+                .filter { $0.type.lowercased() == "recurring" }
                 .reduce(0.0) { $0 + max(0, $1.amountCents) }
             let planHint: String? = recurring <= 0
                 ? nil
