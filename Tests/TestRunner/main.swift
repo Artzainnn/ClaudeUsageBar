@@ -1325,6 +1325,202 @@ MainActor.assumeIsolated {
     defaults.removePersistentDomain(forName: suiteName)
 }
 
+// MARK: - OpenAIUsageFetcher (PR 7-BE)
+
+// Completions usage — bucketed page envelope (verified vs OpenAI Admin API).
+// results grouped by model; multiple buckets aggregate per model.
+let fixtureOpenAICompletions = #"""
+{
+  "object": "page",
+  "has_more": false,
+  "next_page": null,
+  "data": [
+    {
+      "object": "bucket",
+      "start_time": 1751000000,
+      "end_time": 1751003600,
+      "results": [
+        {"object": "organization.usage.completions.result", "input_tokens": 1000, "output_tokens": 500, "num_model_requests": 10, "model": "gpt-4o"},
+        {"object": "organization.usage.completions.result", "input_tokens": 200, "output_tokens": 100, "num_model_requests": 3, "model": "gpt-4o-mini"}
+      ]
+    },
+    {
+      "object": "bucket",
+      "start_time": 1751003600,
+      "end_time": 1751007200,
+      "results": [
+        {"object": "organization.usage.completions.result", "input_tokens": 3000, "output_tokens": 1500, "num_model_requests": 20, "model": "gpt-4o"}
+      ]
+    }
+  ]
+}
+"""#
+
+run("parse OpenAI completions: aggregate tokens by model across buckets") {
+    let tokens = try! OpenAIUsageFetcher.parseCompletions(fixtureOpenAICompletions.data(using: .utf8)!)
+    expectEqual(tokens.count, 2)
+    // gpt-4o: 1000+3000 input, 500+1500 output, 10+20 requests -> highest total, first.
+    expectEqual(tokens[0].model, "gpt-4o")
+    expectEqual(tokens[0].inputTokens, 4000)
+    expectEqual(tokens[0].outputTokens, 2000)
+    expectEqual(tokens[0].requests, 30)
+    expectEqual(tokens[0].totalTokens, 6000)
+    expectEqual(tokens[1].model, "gpt-4o-mini")
+    expectEqual(tokens[1].totalTokens, 300)
+}
+
+run("parse OpenAI completions: results with null model fold into 'all'") {
+    let bytes = #"""
+    {"object": "page", "data": [{"object": "bucket", "results": [{"input_tokens": 5, "output_tokens": 5, "num_model_requests": 1}]}]}
+    """#.data(using: .utf8)!
+    let tokens = try! OpenAIUsageFetcher.parseCompletions(bytes)
+    expectEqual(tokens.count, 1)
+    expectEqual(tokens[0].model, "all")
+    expectEqual(tokens[0].totalTokens, 10)
+}
+
+// Costs — amount.value is a float in USD dollars; currency lowercase "usd".
+let fixtureOpenAICosts = #"""
+{
+  "object": "page",
+  "has_more": false,
+  "data": [
+    {"object": "bucket", "start_time": 1751000000, "end_time": 1751086400, "results": [
+      {"object": "organization.costs.result", "amount": {"value": 0.13080438, "currency": "usd"}, "line_item": "gpt-4o"},
+      {"object": "organization.costs.result", "amount": {"value": 1.25, "currency": "usd"}, "line_item": "gpt-4o-mini"}
+    ]}
+  ]
+}
+"""#
+
+run("parse OpenAI costs: sum amount.value across line items") {
+    let cost = try! OpenAIUsageFetcher.parseCosts(fixtureOpenAICosts.data(using: .utf8)!)
+    expect(abs(cost.usd - 1.38080438) < 0.0001)
+    expectEqual(cost.currency, "usd")
+}
+
+run("parse OpenAI costs: empty buckets -> zero") {
+    let bytes = #"{"object": "page", "data": []}"#.data(using: .utf8)!
+    let cost = try! OpenAIUsageFetcher.parseCosts(bytes)
+    expectEqual(cost.usd, 0.0)
+    expect(cost.currency == nil)
+}
+
+// Rate limits — {object:"list", data:[{model, max_requests_per_1_minute, ...}]}
+let fixtureOpenAIRateLimits = #"""
+{
+  "object": "list",
+  "has_more": false,
+  "data": [
+    {"object": "project.rate_limit", "id": "rl-gpt-4o", "model": "gpt-4o", "max_requests_per_1_minute": 10000, "max_tokens_per_1_minute": 2000000},
+    {"object": "project.rate_limit", "id": "rl-gpt-4o-mini", "model": "gpt-4o-mini", "max_requests_per_1_minute": 30000, "max_tokens_per_1_minute": 150000000}
+  ]
+}
+"""#
+
+run("parse OpenAI rate_limits: per-model ceilings") {
+    let limits = try! OpenAIUsageFetcher.parseRateLimits(fixtureOpenAIRateLimits.data(using: .utf8)!)
+    expectEqual(limits.count, 2)
+    expectEqual(limits[0].model, "gpt-4o")
+    expectEqual(limits[0].maxRequestsPerMinute, 10000)
+    expectEqual(limits[0].maxTokensPerMinute, 2000000)
+}
+
+run("parse OpenAI completions throws on array top-level") {
+    do {
+        _ = try OpenAIUsageFetcher.parseCompletions("[]".data(using: .utf8)!)
+        expect(false, "expected throw")
+    } catch { expect(true) }
+}
+
+run("OpenAI startOfUTCMonth returns a month boundary") {
+    // 2026-07-12 -> start of 2026-07-01 UTC. Just assert it is <= the input
+    // and a plausible epoch (non-zero).
+    let mid = Date(timeIntervalSince1970: 1752300000) // 2026-07-12ish
+    let start = URLSessionOpenAITransport.startOfUTCMonth(mid)
+    expect(start > 0)
+    expect(start <= Int(mid.timeIntervalSince1970))
+}
+
+// MARK: - OpenAIUsageStore
+
+final class StubOpenAITransport: OpenAIUsageTransport, @unchecked Sendable {
+    let result: OpenAIUsageResult
+    init(_ result: OpenAIUsageResult) { self.result = result }
+    func fetchAll(adminKey: String, completion: @escaping @Sendable (OpenAIUsageResult) -> Void) {
+        completion(result)
+    }
+}
+
+MainActor.assumeIsolated {
+    let suiteName = "openai-tests-\(ProcessInfo.processInfo.processIdentifier)"
+    let defaults = UserDefaults(suiteName: suiteName)!
+    defaults.removePersistentDomain(forName: suiteName)
+    defaults.set(true, forKey: "features.openai.enabled")
+
+    run("OpenAI store off by default emits no tiles") {
+        let d2 = UserDefaults(suiteName: suiteName + "-off")!
+        d2.removePersistentDomain(forName: suiteName + "-off")
+        let store = OpenAIUsageStore(credentials: InMemoryCredentialStore(), transport: StubOpenAITransport(.networkError), defaults: d2)
+        expectEqual(store.isEnabled, false)
+        expectEqual(store.tiles.count, 0)
+    }
+
+    run("OpenAI enabled without key emits needsAccess card") {
+        let store = OpenAIUsageStore(credentials: InMemoryCredentialStore(), transport: StubOpenAITransport(.networkError), defaults: defaults)
+        expectEqual(store.isConfigured, false)
+        let tiles = store.tiles
+        expectEqual(tiles.count, 1)
+        if case .needsAccess = tiles.first?.kind { expect(true) }
+        else { expect(false, "expected needsAccess") }
+    }
+
+    run("OpenAI conforms to PasteKeyProvider with sk-admin placeholder") {
+        let store = OpenAIUsageStore(credentials: InMemoryCredentialStore(), transport: StubOpenAITransport(.networkError), defaults: defaults)
+        let kp = store as PasteKeyProvider
+        expect(kp.keyPlaceholder.contains("sk-admin"))
+    }
+
+    run("OpenAI applies snapshot: cost + token + ceiling tiles") {
+        let creds = InMemoryCredentialStore()
+        let store = OpenAIUsageStore(credentials: creds, transport: StubOpenAITransport(.networkError), defaults: defaults)
+        store.saveKey("sk-admin-fake")
+        let snap = OpenAIUsageSnapshot(
+            tokensByModel: [OpenAIModelTokens(model: "gpt-4o", inputTokens: 4000, outputTokens: 2000, requests: 30)],
+            costMTDUSD: 12.34,
+            costCurrency: "usd",
+            rateLimits: [OpenAIRateLimit(model: "gpt-4o", maxRequestsPerMinute: 10000, maxTokensPerMinute: 2000000)]
+        )
+        store.apply(.success(snap))
+        let tiles = store.tiles
+        expect(tiles.contains { $0.id == "openai-cost-mtd" })
+        expect(tiles.contains { $0.id == "openai-tokens-gpt-4o" })
+        expect(tiles.contains { $0.id == "openai-ceiling-gpt-4o" })
+        // MTD cost tile shows the currency + amount.
+        let costTile = tiles.first { $0.id == "openai-cost-mtd" }
+        if case let .text(status, _) = costTile?.kind { expect(status.contains("12.34")) }
+        else { expect(false, "expected cost text tile") }
+    }
+
+    run("OpenAI 401 maps to invalid-admin-key error") {
+        let store = OpenAIUsageStore(credentials: InMemoryCredentialStore(), transport: StubOpenAITransport(.unauthorized), defaults: defaults)
+        store.saveKey("sk-admin-bad")
+        store.fetch()
+        expectEqual(store.errorMessage, "Invalid OpenAI Admin key")
+    }
+
+    run("OpenAI clear deletes the key and state") {
+        let creds = InMemoryCredentialStore()
+        let store = OpenAIUsageStore(credentials: creds, transport: StubOpenAITransport(.networkError), defaults: defaults)
+        store.saveKey("sk-admin-fake")
+        store.clear()
+        expectEqual(store.hasKey, false)
+        expect(creds.read(OpenAIUsageFetcher.adminKeyKeychainKey) == nil)
+    }
+
+    defaults.removePersistentDomain(forName: suiteName)
+}
+
 // MARK: - Summary
 
 print("")

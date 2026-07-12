@@ -78,7 +78,10 @@ let package = Package(
                 "ZedUsageStore.swift",
                 // xAI Developer: two-key, two-host; same rationale.
                 "XAIUsageFetcher.swift",
-                "XAIUsageStore.swift"
+                "XAIUsageStore.swift",
+                // OpenAI Platform: admin key, three org endpoints.
+                "OpenAIUsageFetcher.swift",
+                "OpenAIUsageStore.swift"
                 // AnthropicUsageStore.swift depends on UsageManager
                 // (defined in ClaudeUsageBar.swift), so it stays in the
                 // app-bundle compile only, not in the SwiftPM library
