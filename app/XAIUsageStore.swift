@@ -148,13 +148,20 @@ public final class XAIUsageStore: @preconcurrency UsageProvider, PasteKeyProvide
         }
 
         // Tier 2: rolled-up recent spend as a text tile (the small chart is a
-        // UI concern for PR 6-UI; the backend surfaces the total here).
+        // UI concern for PR 6-UI; the backend surfaces the total here). The
+        // amount is shown with its reported currency code rather than a bare
+        // "$" — the daily-usage shape is undocumented and may bill in CNY, so
+        // we do not assume USD. When no currency is reported, show a neutral
+        // amount with no symbol.
         if !snap.daily.isEmpty {
-            let total = snap.daily.reduce(0.0) { $0 + $1.usdSpent }
+            let total = snap.daily.reduce(0.0) { $0 + $1.amountSpent }
+            let currency = snap.daily.compactMap { $0.currency }.first
+            let status = currency.map { String(format: "%@ %.2f", $0, total) }
+                ?? String(format: "%.2f", total)
             out.append(UsageTile(
                 id: "xai-daily-usd",
                 title: "xAI usage (recent)",
-                kind: .text(status: String(format: "$%.2f", total), subtitle: "\(snap.daily.count) days")
+                kind: .text(status: status, subtitle: "\(snap.daily.count) days")
             ))
         }
 

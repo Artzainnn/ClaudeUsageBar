@@ -91,8 +91,10 @@ public final class OpenAIUsageStore: @preconcurrency UsageProvider, PasteKeyProv
         var out: [UsageTile] = []
 
         // Month-to-date cost as a balance-style tile (a spend total, so no
-        // reset; shown as an amount).
-        let currency = snap.costCurrency ?? "USD"
+        // reset; shown as an amount). The costs API returns the currency
+        // lowercase ("usd"); uppercase it for display consistency with the
+        // "USD" fallback.
+        let currency = snap.costCurrency?.uppercased() ?? "USD"
         out.append(UsageTile(
             id: "openai-cost-mtd",
             title: "OpenAI spend (month to date)",
@@ -197,20 +199,9 @@ public struct URLSessionOpenAITransport: OpenAIUsageTransport {
             DispatchQueue.main.async { completion(result) }
         }
 
-        // Query windows: last ~24h of completions grouped by model; costs
-        // from the start of the current UTC month. start_time is computed by
-        // the caller-agnostic helper so tests can stub the transport entirely.
         let now = Date()
-        let dayAgo = Int(now.timeIntervalSince1970) - 24 * 3600
-        let monthStart = Self.startOfUTCMonth(now)
-
-        // `limit=31` is the max for bucket_width=1d and covers a full month in
-        // a SINGLE page, so neither the 24h nor the month-to-date window ever
-        // spans multiple pages — we do not need to follow has_more/next_page
-        // here. (Multi-page pagination would only matter for windows longer
-        // than 31 daily buckets, which these tiles never request.)
-        let completionsURL = "\(base)/usage/completions?bucket_width=1d&group_by=model&limit=31&start_time=\(dayAgo)"
-        let costsURL = "\(base)/costs?bucket_width=1d&group_by=line_item&limit=31&start_time=\(monthStart)"
+        let completionsURL = base + Self.completionsQuery(now: now)
+        let costsURL = base + Self.costsQuery(now: now)
 
         get(completionsURL, bearer: adminKey) { compData, compStatus in
             guard compStatus == 200, let compData = compData,
@@ -251,6 +242,28 @@ public struct URLSessionOpenAITransport: OpenAIUsageTransport {
                 }
             }
         }
+    }
+
+    /// Query path (relative to `base`) for the completions/token-usage tile.
+    ///
+    /// Uses `bucket_width=1h` with `limit=24` for a TRUE rolling 24-hour
+    /// window. A previous version used `bucket_width=1d`, which returns whole
+    /// UTC-day buckets: with `start_time=now-24h` that folds in usage from
+    /// 00:00 UTC of the prior day, so a tile labelled "(24h)" could sum up to
+    /// ~48h of tokens. Hourly buckets bounded to 24 give exactly the last 24h.
+    /// 24 hourly buckets fit a single page (the 1h max is 168), so no
+    /// pagination is needed.
+    public static func completionsQuery(now: Date) -> String {
+        let dayAgo = Int(now.timeIntervalSince1970) - 24 * 3600
+        return "/usage/completions?bucket_width=1h&group_by=model&limit=24&start_time=\(dayAgo)"
+    }
+
+    /// Query path (relative to `base`) for the month-to-date cost tile.
+    /// `bucket_width=1d` from the start of the UTC month; `limit=31` is the
+    /// 1d max and covers every day of the longest month in a single page.
+    public static func costsQuery(now: Date) -> String {
+        let monthStart = startOfUTCMonth(now)
+        return "/costs?bucket_width=1d&group_by=line_item&limit=31&start_time=\(monthStart)"
     }
 
     /// Start of the current month in UTC, as a Unix timestamp.

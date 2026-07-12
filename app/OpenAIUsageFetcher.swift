@@ -8,8 +8,9 @@
 // a store into the live registry yet (tile + admin-key sheet land in PR 7-UI).
 //
 // Endpoints (all officially documented, Authorization: Bearer sk-admin-...):
-//   GET /v1/organization/usage/completions?bucket_width=1d&group_by=model
-//       -> tokens + request counts by model, bucketed by time.
+//   GET /v1/organization/usage/completions?bucket_width=1h&group_by=model
+//       -> tokens + request counts by model, hourly buckets over a rolling
+//          24h window (see URLSessionOpenAITransport.completionsQuery).
 //   GET /v1/organization/costs?bucket_width=1d&start_time=<month start>
 //       -> spend by line item, bucketed; amount.value is USD dollars.
 //   GET /v1/organization/projects/{project_id}/rate_limits

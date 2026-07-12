@@ -1221,8 +1221,25 @@ run("parse xAI usage daily buckets (dollar and cents forms)") {
     """#.data(using: .utf8)!
     let daily = try! XAIUsageFetcher.parseUsage(bytes)
     expectEqual(daily.count, 2)
-    expect(abs(daily[0].usdSpent - 1.50) < 0.001)
-    expect(abs(daily[1].usdSpent - 2.75) < 0.001)  // 275 cents
+    expect(abs(daily[0].amountSpent - 1.50) < 0.001)
+    expect(abs(daily[1].amountSpent - 2.75) < 0.001)  // 275 cents
+    // No currency reported in this fixture.
+    expect(daily[0].currency == nil)
+}
+
+run("parse xAI usage carries a non-USD currency when reported") {
+    // The daily-usage shape is undocumented and may bill in CNY. When a
+    // currency is present the parser must surface it so the tile does not
+    // assume a "$" symbol (audit finding: hardcoded $ on the daily tile).
+    let bytes = #"""
+    {"usage": [
+      {"date": "2026-07-10", "amount": 12.50, "currency": "CNY"}
+    ]}
+    """#.data(using: .utf8)!
+    let daily = try! XAIUsageFetcher.parseUsage(bytes)
+    expectEqual(daily.count, 1)
+    expect(abs(daily[0].amountSpent - 12.50) < 0.001)
+    expectEqual(daily[0].currency, "CNY")
 }
 
 run("parse xAI api-key throws on array top-level") {
@@ -1445,13 +1462,34 @@ run("parse OpenAI completions throws on array top-level") {
     } catch { expect(true) }
 }
 
-run("OpenAI startOfUTCMonth returns a month boundary") {
-    // 2026-07-12 -> start of 2026-07-01 UTC. Just assert it is <= the input
-    // and a plausible epoch (non-zero).
-    let mid = Date(timeIntervalSince1970: 1752300000) // 2026-07-12ish
+run("OpenAI startOfUTCMonth returns the exact 1st-of-month UTC epoch") {
+    // 1752300000 = 2025-07-12T06:00:00Z. Start of 2025-07 UTC = 1751328000.
+    // Assert the EXACT boundary, not just start <= input (a loose bound would
+    // pass even for a wrong value — audit finding on the prior test).
+    let mid = Date(timeIntervalSince1970: 1752300000) // 2025-07-12T06:00:00Z
     let start = URLSessionOpenAITransport.startOfUTCMonth(mid)
-    expect(start > 0)
-    expect(start <= Int(mid.timeIntervalSince1970))
+    expectEqual(start, 1751328000)  // 2025-07-01T00:00:00Z
+}
+
+run("OpenAI completionsQuery uses a TRUE rolling 24h (1h buckets, limit 24)") {
+    // Audit finding: bucket_width=1d + start_time=now-24h returns up to ~48h.
+    // The fixed query must use hourly buckets bounded to 24 for a real 24h.
+    let now = Date(timeIntervalSince1970: 1752300000)
+    let q = URLSessionOpenAITransport.completionsQuery(now: now)
+    expect(q.contains("bucket_width=1h"))
+    expect(q.contains("limit=24"))
+    expect(q.contains("group_by=model"))
+    expect(q.contains("start_time=1752213600"))  // now - 24h
+    // It must NOT use the day-bucket that caused the over-count.
+    expect(!q.contains("bucket_width=1d"))
+}
+
+run("OpenAI costsQuery covers month-to-date from the UTC month start") {
+    let now = Date(timeIntervalSince1970: 1752300000)
+    let q = URLSessionOpenAITransport.costsQuery(now: now)
+    expect(q.contains("bucket_width=1d"))
+    expect(q.contains("limit=31"))               // covers the longest month in one page
+    expect(q.contains("start_time=1751328000"))  // start of 2025-07 UTC
 }
 
 // MARK: - OpenAIUsageStore
@@ -1508,10 +1546,14 @@ MainActor.assumeIsolated {
         expect(tiles.contains { $0.id == "openai-cost-mtd" })
         expect(tiles.contains { $0.id == "openai-tokens-gpt-4o" })
         expect(tiles.contains { $0.id == "openai-ceiling-gpt-4o" })
-        // MTD cost tile shows the currency + amount.
+        // MTD cost tile shows the currency + amount, with the API's lowercase
+        // "usd" uppercased for display (audit finding on currency case).
         let costTile = tiles.first { $0.id == "openai-cost-mtd" }
-        if case let .text(status, _) = costTile?.kind { expect(status.contains("12.34")) }
-        else { expect(false, "expected cost text tile") }
+        if case let .text(status, _) = costTile?.kind {
+            expect(status.contains("12.34"))
+            expect(status.contains("USD"))       // uppercased
+            expect(!status.contains("usd"))      // not the raw lowercase
+        } else { expect(false, "expected cost text tile") }
     }
 
     run("OpenAI 401 maps to invalid-admin-key error") {

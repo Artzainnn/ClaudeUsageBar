@@ -107,11 +107,16 @@ public struct XAIBalance: Equatable, Sendable {
 /// One day's usage from the management usage endpoint.
 public struct XAIDailyUsage: Equatable, Sendable {
     public var date: String   // ISO date (YYYY-MM-DD) as returned
-    public var usdSpent: Double
+    public var amountSpent: Double
+    /// Currency code if the response carries one (e.g. "USD", "CNY"). Nil
+    /// when the endpoint does not report a currency — the tile then shows a
+    /// neutral amount rather than assuming a "$" symbol.
+    public var currency: String?
 
-    public init(date: String, usdSpent: Double) {
+    public init(date: String, amountSpent: Double, currency: String? = nil) {
         self.date = date
-        self.usdSpent = usdSpent
+        self.amountSpent = amountSpent
+        self.currency = currency
     }
 }
 
@@ -218,19 +223,22 @@ public struct XAIUsageFetcher: Sendable {
             ?? []
         return buckets.compactMap { bucket in
             guard let date = (bucket["date"] as? String) ?? (bucket["day"] as? String) else { return nil }
-            // USD may be a dollar Double, or a cents Int (same unit as the
-            // balance total). Prefer an explicit dollar field; fall back to a
-            // cents field divided by 100. The exact daily-usage field names
-            // are not documented, so this stays tolerant.
-            let usd: Double
-            if let d = doubleOrNil(bucket["usd"] ?? bucket["total_usd"] ?? bucket["amount_usd"]) {
-                usd = d
+            // The amount may be a dollar Double, or a cents Int (same unit as
+            // the balance total). Prefer an explicit dollar field; fall back
+            // to a cents field divided by 100. The exact daily-usage field
+            // names are undocumented, so this stays tolerant — and it reads a
+            // currency when one is present rather than assuming USD.
+            let amount: Double
+            if let d = doubleOrNil(bucket["usd"] ?? bucket["total_usd"] ?? bucket["amount_usd"] ?? bucket["amount"]) {
+                amount = d
             } else if let cents = intOrNil(bucket["cents"] ?? bucket["usd_cents"] ?? bucket["amount_cents"]) {
-                usd = Double(cents) / 100.0
+                amount = Double(cents) / 100.0
             } else {
-                usd = 0
+                amount = 0
             }
-            return XAIDailyUsage(date: date, usdSpent: usd)
+            let currency = (bucket["currency"] as? String)
+                ?? ((bucket["amount"] as? [String: Any])?["currency"] as? String)
+            return XAIDailyUsage(date: date, amountSpent: amount, currency: currency)
         }
     }
 
