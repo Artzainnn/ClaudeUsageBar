@@ -1,0 +1,264 @@
+// PR 2c — UsageProvider protocol and supporting types.
+//
+// This PR introduces the multi-provider surface without adding any new
+// provider. It ships:
+//
+//   1. A `UsageProvider` protocol every provider will conform to.
+//   2. A `UsageTile` value type for popover rendering.
+//   3. A `ProviderBox` type-erasing wrapper so SwiftUI can observe a
+//      collection of heterogeneous providers via a single ObservableObject.
+//   4. `AnthropicUsageStore` — the first conformer, wrapping the existing
+//      UsageManager. Behaviour identical to v1.3.1.
+//
+// Everything is additive. UsageManager is not removed. The popover is not
+// yet driven by `[UsageProvider]` — that switch lands in a follow-up PR
+// once at least one non-Anthropic provider exists.
+//
+// The two-layer split (Fetcher value type + Store observable class) is
+// documented in EXPANSION_PLAN.md § 2. Fetchers are Sendable value types
+// with no observable state (see AnthropicUsageFetcher in PR 2b). Stores
+// hold @Published state on the main actor and are what SwiftUI observes.
+
+import Foundation
+import SwiftUI
+import Combine
+
+// MARK: - UsageTile
+
+/// One renderable tile in the popover. A provider may contribute zero or
+/// more tiles. The `Kind` enum encodes the presentation semantics without
+/// coupling to a specific SwiftUI view; downstream PRs render each kind
+/// with the appropriate component.
+public struct UsageTile: Identifiable, Equatable, Sendable {
+    public let id: String                   // "anthropic-5h", "codex-weekly"
+    public let title: String                // "Session (5 hour)"
+    public let kind: Kind
+
+    public enum Kind: Equatable, Sendable {
+        /// Progress-bar tile with a 0.0…1.0 fraction and optional reset time.
+        case bar(fraction: Double, resetsAt: Date?, badge: String?)
+
+        /// Balance tile — displayed as a monetary amount plus an optional
+        /// plan label and reset time.
+        case balance(remainingMinorUnits: Int, currency: String, plan: String?, resetsAt: Date?)
+
+        /// Counter tile — used / limit with optional reset time.
+        case counter(used: Int, limit: Int?, resetsAt: Date?)
+
+        /// Freeform text tile — plan info, status warnings, "needs access".
+        case text(status: String, subtitle: String?)
+
+        /// The provider needs a permission the user has not granted.
+        case needsAccess(path: String, guidance: String)
+    }
+
+    public init(id: String, title: String, kind: Kind) {
+        self.id = id
+        self.title = title
+        self.kind = kind
+    }
+}
+
+// MARK: - UsageProvider
+
+/// Every provider (Anthropic, Codex, DeepSeek, Zed, xAI, OpenAI Platform,
+/// Perplexity, Copilot, local-file readers) conforms to this protocol.
+/// Providers are held in `AppDelegate.providers` as a heterogeneous
+/// collection wrapped in `ProviderBox` for SwiftUI observation.
+public protocol UsageProvider: AnyObject, ObservableObject {
+    /// Stable identifier used for feature flags, notification-threshold
+    /// tracking, and log correlation. Examples: "anthropic", "codex",
+    /// "deepseek".
+    var id: String { get }
+
+    /// Display name in the popover section header and Settings toggle.
+    var displayName: String { get }
+
+    /// UserDefaults key that gates activation. Defaulted false. Reading and
+    /// writing this flag is the provider's responsibility.
+    var featureFlagKey: String { get }
+
+    /// True when the user has activated the provider via Settings.
+    var isEnabled: Bool { get }
+
+    /// True when the provider has valid credentials or file access to
+    /// operate. False means the tile should render a first-run onboarding
+    /// state (paste key, grant access, etc.).
+    var isConfigured: Bool { get }
+
+    /// Timestamp of the most recent successful fetch. Nil before the
+    /// first fetch.
+    var lastUpdated: Date? { get }
+
+    /// One-line human-readable error if the last fetch failed. Nil on
+    /// success or when idle.
+    var errorMessage: String? { get }
+
+    /// Tiles this provider currently renders in the popover. Empty when
+    /// the provider is disabled.
+    var tiles: [UsageTile] { get }
+
+    /// Kick off a fetch. Providers are responsible for their own cadence
+    /// (5-minute Anthropic, 60-second Codex, hourly OpenAI Platform,
+    /// etc.). This method is called by the shared timer in AppDelegate
+    /// and may be called manually via the popover's Refresh button.
+    func fetch()
+
+    /// Clear stored state and (optionally) credentials. Called by the
+    /// per-provider "Clear credentials" button in Settings.
+    func clear()
+}
+
+// MARK: - ProviderBox
+
+/// Type-erasing wrapper for SwiftUI. `@ObservedObject var: any UsageProvider`
+/// does not compile in Swift 6 mode (existential + associated type) — the
+/// box forwards `objectWillChange` from the underlying provider so views
+/// can observe it uniformly.
+///
+/// This is one of the load-bearing catches from the pre-PR adversarial
+/// review; the underlying protocol trial compiled fine, but the SwiftUI
+/// observation site did not. `ProviderBox` is the fix.
+@MainActor
+public final class ProviderBox: ObservableObject, Identifiable {
+    // `nonisolated` so consumers that are not themselves main-actor-isolated
+    // (e.g. ProvidersModel.fetchEnabled, called from AppDelegate timer and
+    // lifecycle closures) can read it without an actor hop. It is an
+    // immutable `let` set once at init; the underlying provider's own methods
+    // remain main-actor-isolated, so this only exposes the reference, not
+    // unsynchronised mutable state.
+    public nonisolated let provider: any UsageProvider
+    // Cached at construction rather than reaching through `provider.id` on
+    // every access — keeps `id` a nonisolated stored property so the
+    // Identifiable conformance is Swift-6-strict-concurrency clean.
+    public nonisolated let id: String
+
+    private var cancellable: AnyCancellable?
+
+    public init<P: UsageProvider>(_ provider: P) {
+        self.provider = provider
+        self.id = provider.id
+        // Forward the underlying provider's change notifications so
+        // SwiftUI redraws views observing this box.
+        self.cancellable = provider.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
+            }
+    }
+}
+
+// MARK: - CredentialStore
+
+/// Storage abstraction for provider credentials. Two backends:
+/// `DefaultsStore` (for the legacy Anthropic cookie, retained for
+/// backwards compatibility) and `KeychainStore` (for spending credentials
+/// and any new provider going forward).
+///
+/// Concrete Keychain implementation lands in a follow-up PR once at
+/// least one provider actually needs it. PR 2c ships the abstraction so
+/// downstream PRs have a stable target.
+public protocol CredentialStore {
+    func read(_ key: String) -> Data?
+    func write(_ key: String, _ value: Data)
+    func delete(_ key: String)
+}
+
+// MARK: - PasteKeyProvider
+
+/// Optional capability for providers configured by pasting a secret (an API
+/// key, a session cookie). The Settings toggle row shows a secure entry
+/// field for any provider that conforms. Providers configured another way
+/// (Codex reads a CLI file; Anthropic uses the cookie sheet) do not conform.
+///
+/// @MainActor because conformers are main-actor stores; the entry field is
+/// itself on the main actor.
+@MainActor
+public protocol PasteKeyProvider {
+    /// Placeholder shown in the entry field (e.g. "sk-…").
+    var keyPlaceholder: String { get }
+    /// True when a secret is currently stored.
+    var hasKey: Bool { get }
+    /// Store a pasted secret. Empty input clears it.
+    func saveKey(_ raw: String)
+}
+
+// MARK: - SecondaryKeyProvider
+
+/// Optional capability for providers that accept a SECOND, higher-privilege
+/// secret gated behind a warning (e.g. xAI's management key, which can
+/// create/rotate/delete API keys). The Settings row renders a second, opt-in
+/// entry field with the warning text for any provider that conforms.
+///
+/// A provider adopting this must also adopt PasteKeyProvider for its primary
+/// (required) key.
+@MainActor
+public protocol SecondaryKeyProvider {
+    /// Placeholder for the secondary field.
+    var secondaryKeyPlaceholder: String { get }
+    /// Short label for the opt-in row (e.g. "Enable balance + history").
+    var secondaryKeyLabel: String { get }
+    /// Warning shown before the field (e.g. what the key can do).
+    var secondaryKeyWarning: String { get }
+    /// True when a secondary secret is stored.
+    var hasSecondaryKey: Bool { get }
+    /// Store a pasted secondary secret. Empty input clears it.
+    func saveSecondaryKey(_ raw: String)
+}
+
+// MARK: - ProviderCopy
+
+/// Per-provider help and disclosure copy for the Settings toggles. Kept in
+/// the library (not the app view file) so the strings are unit-testable —
+/// they are user-facing and must not silently change. Returns nil for a
+/// provider with no bespoke copy.
+public enum ProviderCopy {
+    /// Explanatory help shown under a provider's Settings toggle.
+    public static func help(for id: String) -> String? {
+        switch id {
+        case "codex":
+            return "Codex counters cover the Codex CLI, IDE extensions, Slack, and Cloud tasks — one shared 5-hour and weekly pool. General GPT chat is not counted. Reads your existing `codex auth login` session; run it in a terminal if prompted."
+        case "deepseek":
+            return "Shows your DeepSeek platform balance (granted + topped-up), per currency. Paste a DeepSeek API key below; it is stored in your macOS Keychain and used only to read the balance."
+        case "zed":
+            return "Shows your Zed plan and edit-prediction usage. Reads the login Zed already saved in your Keychain — macOS will ask once to allow it. Sign in to Zed first, then click Refresh."
+        case "xai":
+            return "Shows your xAI (Grok) API key permissions. Paste an inference key (xai-…) below. Add a management key too to also see prepaid balance and daily usage. Both are stored in your Keychain."
+        default:
+            return nil
+        }
+    }
+
+    /// A warning line shown for providers backed by a private/undocumented
+    /// API that may break without notice. Rendered in an accent colour.
+    public static func disclosure(for id: String) -> String? {
+        switch id {
+        case "codex":
+            return "Uses OpenAI's private Codex API. It may stop working without notice."
+        default:
+            return nil
+        }
+    }
+}
+
+/// UserDefaults-backed credential store. Used only for the legacy
+/// Anthropic session cookie. New providers must use `KeychainStore`.
+public struct DefaultsStore: CredentialStore {
+    private let defaults: UserDefaults
+
+    public init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
+
+    public func read(_ key: String) -> Data? {
+        defaults.data(forKey: key)
+    }
+
+    public func write(_ key: String, _ value: Data) {
+        defaults.set(value, forKey: key)
+    }
+
+    public func delete(_ key: String) {
+        defaults.removeObject(forKey: key)
+    }
+}
