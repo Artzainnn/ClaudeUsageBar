@@ -71,6 +71,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // PR 7-UI: register OpenAI Platform. Opt-in; requires a pasted Admin
         // key (sk-admin-). Inert until enabled and configured.
         providers.append(ProviderBox(OpenAIUsageStore()))
+        // PR 8-UI: register Perplexity Pro/Max. Opt-in
+        // (features.perplexity.enabled defaults false); requires a pasted
+        // session cookie from perplexity.ai. Doubly inert until the user
+        // both enables and configures it. Backend from PR #61.
+        providers.append(ProviderBox(PerplexityUsageStore()))
         // Model SwiftUI observes for the generic (non-Anthropic) provider
         // tiles. Anthropic continues to render through usageManager directly.
         providersModel = ProvidersModel(providers: providers)
@@ -2421,7 +2426,9 @@ struct ProviderToggleRow: View {
                             .controlSize(.small)
                         }
                     }
-                    Text(hasStoredKey ? "Key saved in Keychain." : "No key saved yet.")
+                    // Use the provider's declared noun ("Key" / "Cookie") so
+                    // the status line reflects what the user actually pasted.
+                    Text(hasStoredKey ? "\(keyProvider.secretKindNoun) saved in Keychain." : "No \(keyProvider.secretKindNoun.lowercased()) saved yet.")
                         .font(.caption2)
                         .foregroundColor(.secondary)
 

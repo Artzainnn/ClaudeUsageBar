@@ -30,6 +30,10 @@ public final class PerplexityUsageStore: @preconcurrency UsageProvider, PasteKey
     // or a full cookie header string (browser DevTools "Copy value" or
     // "Copy string"). Extraction runs at fetch time.
     public let keyPlaceholder: String = "__Secure-next-auth.session-token=… (or paste the cookie value)"
+    /// Override the default noun so the generic ProviderToggleRow renders
+    /// "Cookie saved in Keychain" rather than "Key saved in Keychain",
+    /// matching what the user actually pasted.
+    public var secretKindNoun: String { "Cookie" }
 
     // MARK: Observable state
 

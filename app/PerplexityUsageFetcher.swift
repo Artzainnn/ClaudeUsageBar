@@ -230,7 +230,21 @@ public enum PerplexityCookie {
     ///     attacks.
     /// Returns nil when the input yields no usable cookie.
     public static func extract(from rawInput: String) -> (name: String, token: String)? {
-        let trimmed = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        var trimmed = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        // Strip an optional leading "Cookie:" header prefix in any casing
+        // (Cookie:, cookie:, CoOkIe:, …). Some browsers' "Copy as HAR" /
+        // "Copy request headers" tools return the whole header line; the
+        // user should not have to hand-strip it. Truly ASCII case-insensitive
+        // so no spelling permutation falls through into the bare-token
+        // fallback and stores the header line as a token.
+        let prefixToken = "cookie:"
+        if trimmed.count >= prefixToken.count {
+            let head = trimmed.prefix(prefixToken.count)
+            if head.lowercased() == prefixToken {
+                trimmed = String(trimmed.dropFirst(prefixToken.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
         guard !trimmed.isEmpty else { return nil }
 
         // Bare token — no `=`, no `;`. Send under the default name.

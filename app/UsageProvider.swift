@@ -247,6 +247,18 @@ public protocol PasteKeyProvider {
     var hasKey: Bool { get }
     /// Store a pasted secret. Empty input clears it.
     func saveKey(_ raw: String)
+    /// Human word for what the user pasted, used in status text like
+    /// "Key saved in Keychain" or "Cookie saved in Keychain". Defaults to
+    /// "Key" for API-key providers via the extension below; override on a
+    /// concrete conformer for cookie/session providers (e.g. Perplexity).
+    /// Declared as a protocol requirement — not just an extension — so
+    /// existential dispatch (`box.provider as PasteKeyProvider`) picks up
+    /// the concrete override rather than the default.
+    var secretKindNoun: String { get }
+}
+
+public extension PasteKeyProvider {
+    var secretKindNoun: String { "Key" }
 }
 
 // MARK: - SecondaryKeyProvider
@@ -292,6 +304,8 @@ public enum ProviderCopy {
             return "Shows your xAI (Grok) API key permissions. Paste an inference key (xai-…) below. Add a management key too to also see prepaid balance and daily usage. Both are stored in your Keychain."
         case "openai":
             return "Shows your OpenAI organisation's month-to-date spend, token usage by model, and configured rate limits. Paste an Organization Admin key (sk-admin-…); it is stored in your Keychain."
+        case "perplexity":
+            return "Can show your Perplexity plan, credit balance, and per-mode remaining queries (Pro Search, Deep Research, Labs, Agentic) when available. Sign in on perplexity.ai, open your browser's cookie inspector, and paste your __Secure-next-auth.session-token cookie below — the bare value, a name=value pair, or the full copied Cookie header all work. It is stored in your Keychain."
         default:
             return nil
         }
@@ -305,6 +319,8 @@ public enum ProviderCopy {
             return "Uses OpenAI's private Codex API. It may stop working without notice."
         case "openai":
             return "An Admin key can view billing and manage users in your OpenAI organisation. It cannot make inference calls. Store yours only if you are comfortable with this app holding it."
+        case "perplexity":
+            return "Uses Perplexity's private web-app endpoints. They may stop working without notice. The pasted value is a full Perplexity web session cookie — it can let this app act as your signed-in account, including spending or purchasing credits your plan allows, until it expires or is revoked (for example by signing out or clearing sessions on perplexity.ai)."
         default:
             return nil
         }

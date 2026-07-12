@@ -690,6 +690,56 @@ run("ProviderCopy: OpenAI help + admin-key disclosure") {
     expect(disc?.contains("cannot make inference") == true)
 }
 
+run("ProviderCopy: Perplexity help names the cookie, Keychain, and multiple paste forms (PR 8-UI)") {
+    // The user needs to know exactly which cookie to copy from DevTools;
+    // the guidance MUST name it verbatim so a search inside the browser's
+    // cookie inspector finds it. It also must mention the paste flexibility
+    // (bare value, name=value, or full Cookie header) or valid pastes will
+    // look wrong to the user.
+    let help = ProviderCopy.help(for: "perplexity")
+    expect(help != nil)
+    expect(help?.contains("__Secure-next-auth.session-token") == true)
+    expect(help?.contains("perplexity.ai") == true)
+    expect(help?.contains("Keychain") == true)
+    // At least one of the four Perplexity modes is named so the user knows
+    // what they'll see once configured.
+    expect(help?.contains("Pro Search") == true || help?.contains("Deep Research") == true)
+    // Codex adversarial review #5: copy softened from "Shows" to "Can show"
+    // so we do not over-promise tiles that may be Cloudflare-challenged.
+    expect(help?.contains("Can show") == true || help?.contains("When available") == true)
+    // Codex adversarial review #4: paste flexibility must be documented.
+    expect(help?.contains("name=value") == true || help?.contains("Cookie header") == true || help?.contains("bare") == true)
+}
+
+run("ProviderCopy: Perplexity disclosure warns about undocumented API and cookie power") {
+    // The Perplexity cookie is a spending credential AND the endpoints are
+    // undocumented — both facts must be surfaced before the user pastes.
+    // Codex adversarial review #1: the disclosure must not under-state the
+    // cookie's authority ("Sonar credits" alone is too narrow — it is a
+    // full web session cookie). #2: the revocation promise must be
+    // conditional, not absolute.
+    let disc = ProviderCopy.disclosure(for: "perplexity")
+    expect(disc != nil)
+    expect(disc?.contains("private") == true || disc?.contains("undocumented") == true || disc?.contains("may stop") == true)
+    // Framed as a full session cookie, not just a Sonar-credit token.
+    expect(disc?.contains("session cookie") == true || disc?.contains("act as your signed-in account") == true)
+    // Revocation described conditionally, not absolutely.
+    expect(disc?.contains("until it expires") == true || disc?.contains("revoked") == true)
+}
+
+run("PasteKeyProvider.secretKindNoun defaults to Key and Perplexity overrides to Cookie") {
+    // Codex adversarial review #3: the generic Settings row would have
+    // said "Key saved in Keychain" even for Perplexity's cookie paste.
+    // The optional secretKindNoun on PasteKeyProvider lets a provider
+    // rename that noun without any downstream code change.
+    MainActor.assumeIsolated {
+        let deepseek = DeepSeekUsageStore(credentials: InMemoryCredentialStore())
+        let perplexity = PerplexityUsageStore(credentials: InMemoryCredentialStore())
+        expectEqual((deepseek as PasteKeyProvider).secretKindNoun, "Key")
+        expectEqual((perplexity as PasteKeyProvider).secretKindNoun, "Cookie")
+    }
+}
+
 // MARK: - DeepSeekUsageFetcher.parse (PR 4-BE)
 
 // Fixture shapes match api-docs.deepseek.com/api/get-user-balance: is_available
@@ -1787,6 +1837,33 @@ run("Perplexity cookie: paste with `;` but no supported session cookie → nil (
     // whole blob as a token.
     let raw = "_ga=1; theme=dark"
     expect(PerplexityCookie.extract(from: raw) == nil)
+}
+
+run("Perplexity cookie: strips a leading Cookie: header prefix (PR 8-UI Codex round 2)") {
+    // Browsers' "Copy request headers" often prefixes the line with "Cookie:".
+    // The extractor must tolerate that so pasted HAR fragments still work
+    // — matching what the Perplexity ProviderCopy help text now promises.
+    let raw = "Cookie: __Secure-next-auth.session-token=HEADERTOK; _ga=1"
+    let extracted = PerplexityCookie.extract(from: raw)
+    expectEqual(extracted?.name, "__Secure-next-auth.session-token")
+    expectEqual(extracted?.token, "HEADERTOK")
+}
+
+run("Perplexity cookie: strips a case-varied cookie: prefix and extra whitespace") {
+    let raw = "  cookie:   __Secure-next-auth.session-token=WSTOK  "
+    let extracted = PerplexityCookie.extract(from: raw)
+    expectEqual(extracted?.name, "__Secure-next-auth.session-token")
+    expectEqual(extracted?.token, "WSTOK")
+}
+
+run("Perplexity cookie: strips a MiXeD-case Cookie: prefix (PR 8-UI Codex round 3)") {
+    // Codex round-3 caught that enumerating spellings ("Cookie:"/"cookie:"/"COOKIE:")
+    // let a MiXeD casing slip through the strip logic and fall into the
+    // bare-token fallback. The strip is now truly case-insensitive.
+    let raw = "CoOkIe: __Secure-next-auth.session-token=MIXTOK"
+    let extracted = PerplexityCookie.extract(from: raw)
+    expectEqual(extracted?.name, "__Secure-next-auth.session-token")
+    expectEqual(extracted?.token, "MIXTOK")
 }
 
 // MARK: - PerplexityUsageFetcher.parseCredits
