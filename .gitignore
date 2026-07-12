@@ -67,3 +67,19 @@ temp/
 # Internal docs (kept local, not on public GitHub)
 NOTIFICATIONS.md
 internal-docs/
+
+# Contributor-side planning artefacts — never pushed to any remote
+EXPANSION_PLAN.md
+docs/tracking-issue-draft.md
+.pr-bodies/
+
+# SwiftPM build artefacts
+.build/
+Package.resolved
+
+# Local credentials and probe transcripts — NEVER pushed to any remote
+secrets/
+.env
+.env.*
+probes/
+*.probe.json
