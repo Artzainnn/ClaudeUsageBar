@@ -58,6 +58,33 @@ jobs:
             exit 1
           fi
 
+      - name: Reject any logging sink that interpolates a provider credential
+        run: |
+          # Defence-in-depth for every provider's spending credentials, not
+          # just the original Anthropic cookie. Any logging/printing sink
+          # (NSLog, print, debugPrint, dump, os_log, Logger) that interpolates
+          # a credential-bearing variable is forbidden. Credentials must only
+          # ever reach the Authorization header and the Keychain; only status
+          # codes go through Log.info(.count). New providers add new secret
+          # variable names — extend this alternation when you add one.
+          SINKS='(NSLog|print|debugPrint|dump|os_log|Logger|Log\.debug|Log\.info)'
+          SECRETS='(adminKey|inferenceKey|managementKey|apiKey|accessToken|refreshKey|refreshToken|idToken|sessionCookie|sessionCookieInput|bearer|accessKey|secret|[Cc]ookie)'
+          # Match a sink call that contains a Swift string-interpolation of a
+          # secret variable: SINK( ... \( ...secret... ) ... )
+          if grep -rnE "${SINKS}\([^)]*\\\\\\(.*${SECRETS}" -- app/ ; then
+            echo "::error::A logging sink interpolates a credential variable. Credentials must never be logged; only Log.info(.count(status)) is allowed." >&2
+            exit 1
+          fi
+
+      - name: Reject logging of full request URLs (may embed org/team/project ids)
+        run: |
+          # A full URL string can embed an org id, team id, or project id.
+          # Log an endpoint name + status code instead, never the URL.
+          if grep -rnE '(NSLog|print|Log\.(info|debug))\([^)]*\\\(urlString' -- app/ ; then
+            echo "::error::Logging a full request URL is forbidden (can embed identifiers). Log an endpoint label + status instead." >&2
+            exit 1
+          fi
+
       - name: Reject NSLog on cookie/response tokens
         run: |
           # Broader net: any NSLog that mentions cookie or response bodies.

@@ -54,10 +54,16 @@ public final class DeepSeekUsageStore: @preconcurrency UsageProvider, PasteKeyPr
 
     // MARK: - Credential management
 
-    /// True when an API key is stored. The key itself is never exposed.
+    /// True when an API key is stored. The key itself is never exposed. A
+    /// keychain that is present but temporarily unreadable (locked) counts as
+    /// configured, so a locked screen does not drop the provider back to the
+    /// paste-key onboarding card.
     public var hasKey: Bool {
-        guard let data = credentials.read(Self.apiKeyKeychainKey) else { return false }
-        return !data.isEmpty
+        switch credentials.readResult(Self.apiKeyKeychainKey) {
+        case .found(let data): return !data.isEmpty
+        case .unavailable:     return true
+        case .missing:         return false
+        }
     }
 
     /// Store a pasted API key (trimmed). Empty input clears the key instead.
@@ -177,10 +183,9 @@ public final class DeepSeekUsageStore: @preconcurrency UsageProvider, PasteKeyPr
         }
 
         transport.fetchBalance(apiKey: key) { [weak self] result in
-            guard let self else { return }
-            MainActor.assumeIsolated {
-                self.apply(result)
-            }
+            // Task { @MainActor } is safe on any delivery queue (cannot trap
+            // like assumeIsolated if a transport calls back off-main).
+            Task { @MainActor [weak self] in self?.apply(result) }
         }
     }
 

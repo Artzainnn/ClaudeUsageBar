@@ -79,9 +79,16 @@ public struct ZedCredentials: Equatable, Sendable {
     }
 
     /// The Authorization header value Zed's client uses: user id and token
-    /// separated by a single space (not the Bearer scheme).
-    public var authorizationHeaderValue: String {
-        "\(userId) \(accessToken)"
+    /// separated by a single space (not the Bearer scheme). Returns nil if
+    /// either component contains a control character (CR/LF/etc.) that could
+    /// split or inject an HTTP header — the values come from Zed's Keychain
+    /// item, which we do not control, so they are validated before use.
+    public var authorizationHeaderValue: String? {
+        guard let uid = RequestSafety.headerValue(userId),
+              let tok = RequestSafety.headerValue(accessToken) else {
+            return nil
+        }
+        return "\(uid) \(tok)"
     }
 }
 
@@ -161,8 +168,8 @@ public struct ZedUsageFetcher: Sendable {
             var ep = ZedEditPredictionUsage()
             if let used = edit["used"] as? Int {
                 ep.used = used
-            } else if let used = edit["used"] as? Double {
-                ep.used = Int(used)
+            } else if let used = safeInt(edit["used"]) {
+                ep.used = used
             }
             // limit is Zed's UsageLimit enum, whose wire encoding is
             // non-obvious: Limited(N) serializes as the OBJECT {"limited": N},
@@ -190,7 +197,7 @@ public struct ZedUsageFetcher: Sendable {
     public static func parseUsageLimit(_ value: Any?) -> Int? {
         if let obj = value as? [String: Any] {
             if let n = obj["limited"] as? Int { return n }
-            if let n = obj["limited"] as? Double { return Int(n) }
+            if let n = safeInt(obj["limited"]) { return n }
             return nil
         }
         if let s = value as? String {
@@ -199,7 +206,18 @@ public struct ZedUsageFetcher: Sendable {
             return Int(s)
         }
         if let n = value as? Int { return n }
-        if let n = value as? Double { return Int(n) }
+        return safeInt(value)
+    }
+
+    /// Convert a value that may be a Double to Int WITHOUT trapping. Int(d)
+    /// crashes on a non-finite or out-of-range Double, which a hostile API
+    /// could send (e.g. 1e300 as valid JSON); Int(exactly:) returns nil.
+    static func safeInt(_ value: Any?) -> Int? {
+        if let i = value as? Int { return i }
+        if let d = value as? Double {
+            guard d.isFinite else { return nil }
+            return Int(exactly: d.rounded())
+        }
         return nil
     }
 
@@ -214,7 +232,10 @@ public struct ZedUsageFetcher: Sendable {
             return iso.date(from: s)
         }
         if let epoch = value as? Int { return Date(timeIntervalSince1970: TimeInterval(epoch)) }
-        if let epoch = value as? Double { return Date(timeIntervalSince1970: epoch) }
+        // A non-finite epoch Double would produce an invalid Date; guard it.
+        if let epoch = value as? Double, epoch.isFinite {
+            return Date(timeIntervalSince1970: epoch)
+        }
         return nil
     }
 }

@@ -246,13 +246,19 @@ public struct XAIUsageFetcher: Sendable {
 
     private static func intOrNil(_ value: Any?) -> Int? {
         if let i = value as? Int { return i }
-        if let d = value as? Double { return Int(d) }
+        // Int(Double) TRAPS on a non-finite or out-of-range value (a hostile
+        // API can send 1e300 as a valid JSON number). Int(exactly:) on the
+        // rounded value is crash-safe: it returns nil rather than trapping.
+        if let d = value as? Double {
+            guard d.isFinite else { return nil }
+            return Int(exactly: d.rounded())
+        }
         if let s = value as? String { return Int(s) }
         return nil
     }
 
     private static func doubleOrNil(_ value: Any?) -> Double? {
-        if let d = value as? Double { return d }
+        if let d = value as? Double { return d.isFinite ? d : nil }
         if let i = value as? Int { return Double(i) }
         if let s = value as? String { return Double(s) }
         return nil

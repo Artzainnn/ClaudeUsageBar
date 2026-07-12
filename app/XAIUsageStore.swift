@@ -49,14 +49,25 @@ public final class XAIUsageStore: @preconcurrency UsageProvider, PasteKeyProvide
 
     // MARK: - Credential management
 
+    /// True when a credential is stored, treating an unreadable (locked)
+    /// keychain as "still configured" so a locked screen does not drop the
+    /// provider back to onboarding.
+    private func hasStoredKey(_ keychainKey: String) -> Bool {
+        switch credentials.readResult(keychainKey) {
+        case .found(let data): return !data.isEmpty
+        case .unavailable:     return true
+        case .missing:         return false
+        }
+    }
+
     /// Tier 1 — the inference key (required).
     public var hasInferenceKey: Bool {
-        !(credentials.read(XAIUsageFetcher.inferenceKeyKeychainKey)?.isEmpty ?? true)
+        hasStoredKey(XAIUsageFetcher.inferenceKeyKeychainKey)
     }
 
     /// Tier 2 — the management key (optional; unlocks balance + history).
     public var hasManagementKey: Bool {
-        !(credentials.read(XAIUsageFetcher.managementKeyKeychainKey)?.isEmpty ?? true)
+        hasStoredKey(XAIUsageFetcher.managementKeyKeychainKey)
     }
 
     public func saveInferenceKey(_ raw: String) {
@@ -200,10 +211,9 @@ public final class XAIUsageStore: @preconcurrency UsageProvider, PasteKeyProvide
         let management = readKey(XAIUsageFetcher.managementKeyKeychainKey)
 
         transport.fetchAll(inferenceKey: inference, managementKey: management) { [weak self] result in
-            guard let self else { return }
-            MainActor.assumeIsolated {
-                self.apply(result)
-            }
+            // Task { @MainActor } is safe on any delivery queue (cannot trap
+            // like assumeIsolated if a transport calls back off-main).
+            Task { @MainActor [weak self] in self?.apply(result) }
         }
     }
 
@@ -272,8 +282,12 @@ public struct URLSessionXAITransport: XAIUsageTransport {
                 let tier1 = XAIUsageSnapshot(apiKeyInfo: info, models: models)
 
                 // Tier 2 (optional): balance + usage, only with a management
-                // key and a bootstrapped team id.
-                guard let mgmt = managementKey, let team = info.teamId else {
+                // key and a bootstrapped team id. The team id comes from the
+                // api-key response (semi-trusted), so it is percent-encoded as
+                // a single path segment — an id containing "/" or "?" cannot
+                // alter the request path.
+                guard let mgmt = managementKey, let rawTeam = info.teamId,
+                      let team = RequestSafety.pathSegment(rawTeam) else {
                     deliver(.success(tier1))
                     return
                 }

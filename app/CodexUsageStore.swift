@@ -275,14 +275,11 @@ public final class CodexUsageStore: @preconcurrency UsageProvider {
         hasCredentials = true
 
         transport.fetchUsage(credentials: creds) { [weak self] result in
-            // Transport guarantees the completion is delivered on the main
-            // queue; applying @Published state here is main-actor safe. The
-            // application logic lives in `apply(_:)` so the TestRunner can
-            // drive every branch synchronously.
-            guard let self else { return }
-            MainActor.assumeIsolated {
-                self.apply(result)
-            }
+            // Hop to the main actor to apply @Published state. Task {
+            // @MainActor } is safe whichever queue the transport delivers on
+            // (cannot trap like assumeIsolated). The application logic lives
+            // in `apply(_:)` so the TestRunner can drive every branch directly.
+            Task { @MainActor [weak self] in self?.apply(result) }
         }
     }
 

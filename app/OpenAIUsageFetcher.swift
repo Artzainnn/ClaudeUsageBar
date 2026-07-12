@@ -92,13 +92,22 @@ public struct OpenAIUsageFetcher: Sendable {
 
     public static let adminKeyKeychainKey = "openai.admin_key"
 
+    /// Defensive caps on how much of a response we traverse. A hostile or
+    /// buggy API could return an enormous data[]/results[] after
+    /// JSONSerialization has already materialised it; capping the traversal
+    /// bounds the CPU spent aggregating. The real endpoint returns at most
+    /// ~31 buckets (limit=31) each with a handful of per-model results, so
+    /// these caps are far above any legitimate response.
+    private static let maxBuckets = 400
+    private static let maxResultsPerBucket = 2000
+
     /// Iterate the `data[].results[]` buckets of a page response, calling
     /// `handle` for each result dictionary. Shared by usage and costs.
     private static func forEachResult(_ json: [String: Any], _ handle: ([String: Any]) -> Void) {
         guard let buckets = json["data"] as? [[String: Any]] else { return }
-        for bucket in buckets {
+        for bucket in buckets.prefix(maxBuckets) {
             guard let results = bucket["results"] as? [[String: Any]] else { continue }
-            for result in results { handle(result) }
+            for result in results.prefix(maxResultsPerBucket) { handle(result) }
         }
     }
 
@@ -113,9 +122,11 @@ public struct OpenAIUsageFetcher: Sendable {
         forEachResult(json) { result in
             let model = (result["model"] as? String) ?? "all"
             var entry = byModel[model] ?? OpenAIModelTokens(model: model)
-            entry.inputTokens += intOr0(result["input_tokens"])
-            entry.outputTokens += intOr0(result["output_tokens"])
-            entry.requests += intOr0(result["num_model_requests"])
+            // Clamp negatives to 0: a negative token/request count is
+            // meaningless and would corrupt the sort and the tile total.
+            entry.inputTokens += max(0, intOr0(result["input_tokens"]))
+            entry.outputTokens += max(0, intOr0(result["output_tokens"]))
+            entry.requests += max(0, intOr0(result["num_model_requests"]))
             byModel[model] = entry
         }
         // Stable order: highest total tokens first.
@@ -161,12 +172,17 @@ public struct OpenAIUsageFetcher: Sendable {
 
     private static func intOrNil(_ v: Any?) -> Int? {
         if let i = v as? Int { return i }
-        if let d = v as? Double { return Int(d) }
+        // Int(Double) TRAPS on a non-finite or out-of-range value; a hostile
+        // API can send 1e300 as valid JSON. Int(exactly:) is crash-safe.
+        if let d = v as? Double {
+            guard d.isFinite else { return nil }
+            return Int(exactly: d.rounded())
+        }
         if let s = v as? String { return Int(s) }
         return nil
     }
     private static func doubleOrNil(_ v: Any?) -> Double? {
-        if let d = v as? Double { return d }
+        if let d = v as? Double { return d.isFinite ? d : nil }
         if let i = v as? Int { return Double(i) }
         if let s = v as? String { return Double(s) }
         return nil

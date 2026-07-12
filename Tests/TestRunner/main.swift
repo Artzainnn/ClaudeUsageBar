@@ -797,6 +797,42 @@ final class InMemoryCredentialStore: CredentialStore {
     func delete(_ key: String) { storage[key] = nil }
 }
 
+/// A CredentialStore that always reports the keychain as present-but-locked,
+/// to exercise the ".unavailable means still configured" hardening.
+final class UnavailableCredentialStore: CredentialStore {
+    func read(_ key: String) -> Data? { nil }
+    func write(_ key: String, _ value: Data) {}
+    func delete(_ key: String) {}
+    func readResult(_ key: String) -> CredentialReadResult {
+        .unavailable(-25308)  // errSecInteractionNotAllowed
+    }
+}
+
+run("CredentialStore.readResult default maps read() to found/missing") {
+    let store = InMemoryCredentialStore()
+    expectEqual(store.readResult("k"), .missing)
+    store.write("k", Data("v".utf8))
+    expectEqual(store.readResult("k"), .found(Data("v".utf8)))
+}
+
+MainActor.assumeIsolated {
+    let suite = "credavail-\(ProcessInfo.processInfo.processIdentifier)"
+    let d = UserDefaults(suiteName: suite)!
+    d.removePersistentDomain(forName: suite)
+    d.set(true, forKey: "features.deepseek.enabled")
+
+    run("Locked keychain keeps a provider configured (not onboarding)") {
+        // Regression: a locked keychain must NOT look like "no key" and drop
+        // the provider back to the paste-key card.
+        let store = DeepSeekUsageStore(credentials: UnavailableCredentialStore(), defaults: d)
+        expectEqual(store.hasKey, true)         // unavailable == still configured
+        expectEqual(store.isConfigured, true)
+        // No needsAccess onboarding tile while merely locked.
+        expect(!store.tiles.contains { if case .needsAccess = $0.kind { return true }; return false })
+    }
+    d.removePersistentDomain(forName: suite)
+}
+
 MainActor.assumeIsolated {
     let suiteName = "deepseek-tests-\(ProcessInfo.processInfo.processIdentifier)"
     let defaults = UserDefaults(suiteName: suiteName)!
@@ -1051,7 +1087,35 @@ run("ZedCredentials builds a space-delimited Authorization value") {
     let creds = ZedCredentials(userId: "12345", accessToken: "tok-abc")
     expectEqual(creds.authorizationHeaderValue, "12345 tok-abc")
     // Explicitly NOT the Bearer scheme.
-    expect(!creds.authorizationHeaderValue.hasPrefix("Bearer"))
+    expect(creds.authorizationHeaderValue?.hasPrefix("Bearer") == false)
+}
+
+run("ZedCredentials rejects header injection via control chars") {
+    // A user id or token containing CR/LF must not produce a header value
+    // (would allow header splitting/injection).
+    let crlf = ZedCredentials(userId: "12345\r\nX-Evil: 1", accessToken: "tok")
+    expect(crlf.authorizationHeaderValue == nil)
+    let newlineTok = ZedCredentials(userId: "12345", accessToken: "tok\nInjected")
+    expect(newlineTok.authorizationHeaderValue == nil)
+}
+
+run("RequestSafety.pathSegment encodes path-altering characters") {
+    // A benign id passes through (only unreserved chars).
+    expectEqual(RequestSafety.pathSegment("team_abc-123"), "team_abc-123")
+    // Path-structure characters are encoded, not passed through.
+    expectEqual(RequestSafety.pathSegment("a/b"), "a%2Fb")
+    expectEqual(RequestSafety.pathSegment("../admin"), "..%2Fadmin")
+    expectEqual(RequestSafety.pathSegment("x?y#z"), "x%3Fy%23z")
+    // Control characters are rejected entirely.
+    expect(RequestSafety.pathSegment("a\nb") == nil)
+    expect(RequestSafety.pathSegment("") == nil)
+}
+
+run("RequestSafety.headerValue rejects control chars, passes clean values") {
+    expectEqual(RequestSafety.headerValue("user-123"), "user-123")
+    expect(RequestSafety.headerValue("a\rb") == nil)
+    expect(RequestSafety.headerValue("a\nb") == nil)
+    expect(RequestSafety.headerValue("") == nil)
 }
 
 // MARK: - ZedUsageStore (injected credential reader, no real Keychain)
@@ -1321,9 +1385,12 @@ MainActor.assumeIsolated {
     }
 
     run("xAI 401 maps to invalid-key error") {
+        // Assert via the synchronous apply() seam; fetch() now hops through
+        // Task { @MainActor } (safe on any queue) so its effect is not
+        // observable synchronously in this runner.
         let store = XAIUsageStore(credentials: InMemoryCredentialStore(), transport: StubXAITransport(.unauthorized), defaults: defaults)
         store.saveInferenceKey("xai-bad")
-        store.fetch()
+        store.apply(.unauthorized)
         expectEqual(store.errorMessage, "Invalid xAI API key")
     }
 
@@ -1455,6 +1522,53 @@ run("parse OpenAI rate_limits: per-model ceilings") {
     expectEqual(limits[0].maxTokensPerMinute, 2000000)
 }
 
+run("parse OpenAI survives an out-of-range JSON number without trapping") {
+    // A hostile API sends 1e300 where a token count is expected. Int(Double)
+    // would TRAP; the safe conversion must yield nil -> 0, no crash.
+    let bytes = #"""
+    {"object":"page","data":[{"object":"bucket","results":[
+      {"input_tokens": 1e300, "output_tokens": 5, "num_model_requests": 1, "model": "gpt-4o"}
+    ]}]}
+    """#.data(using: .utf8)!
+    let tokens = try! OpenAIUsageFetcher.parseCompletions(bytes)
+    expectEqual(tokens.count, 1)
+    // input_tokens (1e300) -> nil -> 0; output stays 5.
+    expectEqual(tokens[0].inputTokens, 0)
+    expectEqual(tokens[0].outputTokens, 5)
+}
+
+run("parse OpenAI clamps negative token counts to zero") {
+    let bytes = #"""
+    {"object":"page","data":[{"object":"bucket","results":[
+      {"input_tokens": -100, "output_tokens": 50, "num_model_requests": -3, "model": "gpt-4o"}
+    ]}]}
+    """#.data(using: .utf8)!
+    let tokens = try! OpenAIUsageFetcher.parseCompletions(bytes)
+    expectEqual(tokens[0].inputTokens, 0)   // clamped
+    expectEqual(tokens[0].outputTokens, 50)
+    expectEqual(tokens[0].requests, 0)      // clamped
+}
+
+run("parse xAI balance survives an out-of-range string val without trapping") {
+    // A gigantic numeric string overflows Int -> nil -> parseBalance throws,
+    // rather than trapping or producing a garbage value.
+    let bytes = #"{"total": {"val": "999999999999999999999999999999"}}"#.data(using: .utf8)!
+    do {
+        _ = try XAIUsageFetcher.parseBalance(bytes)
+        expect(false, "expected throw on overflowing val")
+    } catch { expect(true) }
+}
+
+run("parse Zed safeInt handles out-of-range Double without trapping") {
+    // edit_predictions.used = 1e300 must not trap.
+    let bytes = #"""
+    {"plan": {"plan_v3": "zed_free", "usage": {"edit_predictions": {"used": 1e300, "limit": "unlimited"}}}}
+    """#.data(using: .utf8)!
+    let snap = try! ZedUsageFetcher.parse(bytes)
+    // used could not be represented -> stays at the default 0, no crash.
+    expectEqual(snap.editPredictions?.used, 0)
+}
+
 run("parse OpenAI completions throws on array top-level") {
     do {
         _ = try OpenAIUsageFetcher.parseCompletions("[]".data(using: .utf8)!)
@@ -1557,9 +1671,11 @@ MainActor.assumeIsolated {
     }
 
     run("OpenAI 401 maps to invalid-admin-key error") {
+        // Assert via the synchronous apply() seam (fetch() now hops through
+        // Task { @MainActor }, not observable synchronously here).
         let store = OpenAIUsageStore(credentials: InMemoryCredentialStore(), transport: StubOpenAITransport(.unauthorized), defaults: defaults)
         store.saveKey("sk-admin-bad")
-        store.fetch()
+        store.apply(.unauthorized)
         expectEqual(store.errorMessage, "Invalid OpenAI Admin key")
     }
 

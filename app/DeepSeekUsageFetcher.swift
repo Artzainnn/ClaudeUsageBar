@@ -147,34 +147,73 @@ public struct KeychainStore: CredentialStore {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: key,
+            // Use the modern data-protection keychain for every item, as the
+            // security standard requires for spending credentials. Set on the
+            // base query so read/update/delete all target the same keychain
+            // the item was written to.
+            kSecUseDataProtectionKeychain as String: true,
         ]
     }
 
     public func read(_ key: String) -> Data? {
+        if case .found(let data) = readResult(key) { return data }
+        return nil
+    }
+
+    /// Richer read that distinguishes a missing item from a keychain that is
+    /// present but unavailable (locked, access denied). Callers that gate a
+    /// "not configured" onboarding state should use this so a transient
+    /// unavailability is not mistaken for "no credential", which would wrongly
+    /// prompt the user to re-paste. `read` remains for the common case.
+    public func readResult(_ key: String) -> CredentialReadResult {
         var query = baseQuery(key)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
 
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
-        guard status == errSecSuccess else { return nil }
-        return item as? Data
+        switch status {
+        case errSecSuccess:
+            if let data = item as? Data { return .found(data) }
+            return .missing
+        case errSecItemNotFound:
+            return .missing
+        default:
+            // errSecInteractionNotAllowed (locked), errSecAuthFailed, etc.
+            return .unavailable(status)
+        }
     }
 
     public func write(_ key: String, _ value: Data) {
-        // Upsert: try to update an existing item first; if none exists, add.
+        // Upsert. Update first; if the item does not exist, add it. Crucially,
+        // the update path ALSO refreshes kSecAttrAccessible so an item created
+        // by an older build with a weaker accessibility class is upgraded to
+        // the current one (rather than silently keeping the weak attribute).
         let query = baseQuery(key)
-        let attributes: [String: Any] = [kSecValueData as String: value]
+        let attributes: [String: Any] = [
+            kSecValueData as String: value,
+            // WhenUnlockedThisDeviceOnly: the credential is inaccessible
+            // whenever the device is locked, never syncs to iCloud Keychain,
+            // and does not migrate to a new device. This is the least-
+            // privilege class mandated for spending credentials (stricter than
+            // AfterFirstUnlock, which stays readable while locked).
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+        ]
         let updateStatus = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
 
         if updateStatus == errSecItemNotFound {
             var addQuery = baseQuery(key)
             addQuery[kSecValueData as String] = value
-            // Only unlocked-while-this-device flags; the credential never
-            // syncs to iCloud Keychain and is unavailable before first
-            // unlock. Matches least-privilege for a spending credential.
-            addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-            SecItemAdd(addQuery as CFDictionary, nil)
+            addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+            let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+            if addStatus != errSecSuccess {
+                // The item was neither updated nor added (e.g. locked keychain
+                // or a duplicate race). Log the failure category (never the
+                // value) so a silently-dropped write is diagnosable.
+                Log.info("Keychain write failed", .count(Int(addStatus)))
+            }
+        } else if updateStatus != errSecSuccess {
+            Log.info("Keychain update failed", .count(Int(updateStatus)))
         }
     }
 

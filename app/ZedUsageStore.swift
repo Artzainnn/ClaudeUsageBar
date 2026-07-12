@@ -184,10 +184,9 @@ public final class ZedUsageStore: @preconcurrency UsageProvider {
         }
 
         transport.fetchUser(credentials: creds) { [weak self] result in
-            guard let self else { return }
-            MainActor.assumeIsolated {
-                self.apply(result)
-            }
+            // Task { @MainActor } is safe on any delivery queue (cannot trap
+            // like assumeIsolated if a transport calls back off-main).
+            Task { @MainActor [weak self] in self?.apply(result) }
         }
     }
 
@@ -227,17 +226,26 @@ public struct URLSessionZedTransport: ZedUsageTransport {
         credentials: ZedCredentials,
         completion: @escaping @Sendable (ZedUsageResult) -> Void
     ) {
+        let deliver: @Sendable (ZedUsageResult) -> Void = { result in
+            DispatchQueue.main.async { completion(result) }
+        }
+
+        // Zed's client auth: "{user_id} {access_token}", NOT Bearer. The value
+        // is validated (no control chars) before use; if the Keychain item is
+        // malformed, treat it as unauthorized rather than sending a header
+        // that could be split/injected.
+        guard let authValue = credentials.authorizationHeaderValue else {
+            deliver(.unauthorized)
+            return
+        }
+
         var request = URLRequest(url: usersMeURL)
         request.httpMethod = "GET"
-        // Zed's client auth: "{user_id} {access_token}", NOT Bearer.
-        request.setValue(credentials.authorizationHeaderValue, forHTTPHeaderField: "Authorization")
+        request.setValue(authValue, forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("ClaudeUsageBar", forHTTPHeaderField: "User-Agent")
 
         URLSession.shared.dataTask(with: request) { data, response, error in
-            let deliver: (ZedUsageResult) -> Void = { result in
-                DispatchQueue.main.async { completion(result) }
-            }
 
             if error != nil {
                 deliver(.networkError)

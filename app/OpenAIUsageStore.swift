@@ -49,8 +49,15 @@ public final class OpenAIUsageStore: @preconcurrency UsageProvider, PasteKeyProv
 
     // MARK: - Credential (PasteKeyProvider)
 
+    /// True when the admin key is stored. An unreadable (locked) keychain
+    /// counts as configured so a locked screen does not drop the provider
+    /// back to the paste-key onboarding card.
     public var hasKey: Bool {
-        !(credentials.read(OpenAIUsageFetcher.adminKeyKeychainKey)?.isEmpty ?? true)
+        switch credentials.readResult(OpenAIUsageFetcher.adminKeyKeychainKey) {
+        case .found(let data): return !data.isEmpty
+        case .unavailable:     return true
+        case .missing:         return false
+        }
     }
 
     public func saveKey(_ raw: String) {
@@ -154,8 +161,11 @@ public final class OpenAIUsageStore: @preconcurrency UsageProvider, PasteKeyProv
         }
 
         transport.fetchAll(adminKey: key) { [weak self] result in
-            guard let self else { return }
-            MainActor.assumeIsolated { self.apply(result) }
+            // Hop to the main actor to apply state. Task { @MainActor } is
+            // safe whichever queue the transport delivers on — unlike
+            // assumeIsolated, it cannot trap if a future/custom transport
+            // calls back off-main.
+            Task { @MainActor [weak self] in self?.apply(result) }
         }
     }
 
@@ -225,7 +235,11 @@ public struct URLSessionOpenAITransport: OpenAIUsageTransport {
                           let projJSON = try? JSONSerialization.jsonObject(with: projData) as? [String: Any],
                           let projects = projJSON["data"] as? [[String: Any]],
                           let firstProject = projects.first,
-                          let projectId = firstProject["id"] as? String else {
+                          let rawProjectId = firstProject["id"] as? String,
+                          // The project id comes from the API response; encode
+                          // it as a single path segment so it cannot alter the
+                          // request path.
+                          let projectId = RequestSafety.pathSegment(rawProjectId) else {
                         deliver(.success(base))
                         return
                     }

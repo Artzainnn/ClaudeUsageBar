@@ -23,6 +23,47 @@ import Foundation
 import SwiftUI
 import Combine
 
+// MARK: - RequestSafety
+
+/// Small hardening helpers for building credentialed requests from values
+/// that originate in an API response (a team id, project id) or a keychain
+/// account attribute (a user id). Server-issued strings are only semi-trusted:
+/// a compromised or buggy endpoint could return an id containing "/", "?",
+/// "#", or control characters that would alter the request path or split an
+/// HTTP header. These helpers reject or encode such input.
+public enum RequestSafety {
+    /// Percent-encode a single URL PATH segment, rejecting characters that
+    /// would change the path structure. Returns nil if the input is empty or
+    /// contains characters not valid in a path segment even after encoding
+    /// (control characters). "/" and "?" and "#" are encoded, not passed
+    /// through, so an id like "../admin" cannot traverse the path.
+    public static func pathSegment(_ raw: String) -> String? {
+        guard !raw.isEmpty else { return nil }
+        // Reject control characters outright — they have no business in an id.
+        if raw.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7F }) {
+            return nil
+        }
+        // Encode everything that is not an unreserved path character. This
+        // encodes "/", "?", "#", "%", etc., so the segment cannot escape its
+        // position in the path.
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")   // RFC 3986 unreserved
+        return raw.addingPercentEncoding(withAllowedCharacters: allowed)
+    }
+
+    /// Validate a value destined for an HTTP header (e.g. a user id in an
+    /// Authorization header). Rejects CR, LF, and other control characters
+    /// that could split or inject headers. Returns the value unchanged when
+    /// safe, or nil when it must not be sent.
+    public static func headerValue(_ raw: String) -> String? {
+        guard !raw.isEmpty else { return nil }
+        if raw.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7F }) {
+            return nil
+        }
+        return raw
+    }
+}
+
 // MARK: - UsageTile
 
 /// One renderable tile in the popover. A provider may contribute zero or
@@ -162,6 +203,31 @@ public protocol CredentialStore {
     func read(_ key: String) -> Data?
     func write(_ key: String, _ value: Data)
     func delete(_ key: String)
+
+    /// Read that distinguishes a genuinely absent credential (`.missing`)
+    /// from a keychain that is present but unreadable (`.unavailable`, e.g.
+    /// locked or access-denied). Only `.missing` should drive a provider's
+    /// "not configured" onboarding state. The default implementation maps the
+    /// plain `read` (found → `.found`, nil → `.missing`); `KeychainStore`
+    /// overrides it to report the real status.
+    func readResult(_ key: String) -> CredentialReadResult
+}
+
+public extension CredentialStore {
+    func readResult(_ key: String) -> CredentialReadResult {
+        if let data = read(key) { return .found(data) }
+        return .missing
+    }
+}
+
+/// Outcome of a credential read that separates a genuinely absent credential
+/// (`.missing`) from a store that is present but unreadable (`.unavailable`,
+/// e.g. a locked keychain). Only `.missing` should drive a "not configured"
+/// onboarding state. `OSStatus` is Foundation's `Int32` security-result code.
+public enum CredentialReadResult: Equatable {
+    case found(Data)
+    case missing
+    case unavailable(OSStatus)
 }
 
 // MARK: - PasteKeyProvider

@@ -576,7 +576,11 @@ class UsageManager: ObservableObject {
         request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
         request.setValue("claude.ai", forHTTPHeaderField: "authority")
 
-        NSLog("🔍 Fetching from: \(urlString)")
+        // Do NOT log the full URL: it embeds the org id (a sensitive
+        // account identifier). Log a fixed endpoint label plus the org id
+        // through the categorical logger, which emits only a short SHA-256
+        // prefix rather than the plaintext id.
+        Log.info("Fetching Anthropic usage", .identifier(orgId))
 
         URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             DispatchQueue.main.async {
