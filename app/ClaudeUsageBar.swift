@@ -64,6 +64,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // it reads Zed's own Keychain login on first fetch (one-time macOS
         // prompt), so it is inert until enabled and the prompt is allowed.
         providers.append(ProviderBox(ZedUsageStore()))
+        // PR 6-UI: register xAI. Opt-in; requires a pasted inference key, with
+        // an optional gated management key for balance/history. Inert until
+        // enabled and configured.
+        providers.append(ProviderBox(XAIUsageStore()))
         // Model SwiftUI observes for the generic (non-Anthropic) provider
         // tiles. Anthropic continues to render through usageManager directly.
         providersModel = ProvidersModel(providers: providers)
@@ -2338,11 +2342,20 @@ struct ProviderToggleRow: View {
     // with the stored secret — we only ever write, never read it back out.
     @State private var keyInput: String = ""
     @State private var hasStoredKey: Bool = false
+    // Secondary (gated, higher-privilege) key state — xAI's management key.
+    @State private var secondaryInput: String = ""
+    @State private var hasStoredSecondaryKey: Bool = false
 
     /// The provider as a PasteKeyProvider, when it is configured by pasting a
     /// secret; nil otherwise.
     private var pasteKeyProvider: PasteKeyProvider? {
         box.provider as? PasteKeyProvider
+    }
+
+    /// The provider as a SecondaryKeyProvider, when it accepts an optional
+    /// second (gated) key; nil otherwise.
+    private var secondaryKeyProvider: SecondaryKeyProvider? {
+        box.provider as? SecondaryKeyProvider
     }
 
     var body: some View {
@@ -2404,12 +2417,53 @@ struct ProviderToggleRow: View {
                     Text(hasStoredKey ? "Key saved in Keychain." : "No key saved yet.")
                         .font(.caption2)
                         .foregroundColor(.secondary)
+
+                    // Secondary (gated, higher-privilege) key. Shown only once
+                    // the primary key is stored, and only for providers that
+                    // accept one (xAI's management key). Carries an explicit
+                    // warning before the field.
+                    if hasStoredKey, let secondary = secondaryKeyProvider {
+                        Divider()
+                        Text(secondary.secondaryKeyLabel)
+                            .font(.caption2)
+                            .fontWeight(.semibold)
+                        Text(secondary.secondaryKeyWarning)
+                            .font(.caption2)
+                            .foregroundColor(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                        HStack(spacing: 6) {
+                            SecureField(secondary.secondaryKeyPlaceholder, text: $secondaryInput)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.caption2)
+                            Button("Save") {
+                                secondary.saveSecondaryKey(secondaryInput)
+                                secondaryInput = ""
+                                hasStoredSecondaryKey = secondary.hasSecondaryKey
+                                onChange(true)
+                            }
+                            .controlSize(.small)
+                            .disabled(secondaryInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                            if hasStoredSecondaryKey {
+                                Button("Clear") {
+                                    secondary.saveSecondaryKey("")
+                                    hasStoredSecondaryKey = secondary.hasSecondaryKey
+                                    onChange(true)
+                                }
+                                .controlSize(.small)
+                            }
+                        }
+                        Text(hasStoredSecondaryKey ? "Management key saved in Keychain." : "No management key saved.")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
                 }
             }
         }
         .onAppear {
             enabled = UserDefaults.standard.bool(forKey: box.provider.featureFlagKey)
             hasStoredKey = pasteKeyProvider?.hasKey ?? false
+            hasStoredSecondaryKey = secondaryKeyProvider?.hasSecondaryKey ?? false
         }
     }
 }

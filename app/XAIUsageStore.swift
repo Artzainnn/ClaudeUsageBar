@@ -14,11 +14,18 @@ import SwiftUI
 import Combine
 
 @MainActor
-public final class XAIUsageStore: @preconcurrency UsageProvider {
+public final class XAIUsageStore: @preconcurrency UsageProvider, PasteKeyProvider, SecondaryKeyProvider {
 
     public let id: String = "xai"
     public let displayName: String = "xAI (Grok)"
     public let featureFlagKey: String = "features.xai.enabled"
+
+    // PasteKeyProvider — the required Tier-1 inference key.
+    public let keyPlaceholder: String = "xai-… (inference key)"
+    // SecondaryKeyProvider — the optional, spending-capable management key.
+    public let secondaryKeyPlaceholder: String = "xai-… (management key)"
+    public let secondaryKeyLabel: String = "Enable balance + usage history (needs a management key)"
+    public let secondaryKeyWarning: String = "A management key can create, rotate, and delete your xAI API keys. Only paste one if you understand that. It is stored in your Keychain and used only to read billing."
 
     // MARK: Observable state
 
@@ -59,6 +66,14 @@ public final class XAIUsageStore: @preconcurrency UsageProvider {
     public func saveManagementKey(_ raw: String) {
         saveOrClear(raw, key: XAIUsageFetcher.managementKeyKeychainKey)
     }
+
+    // PasteKeyProvider conformance (primary = inference key).
+    public var hasKey: Bool { hasInferenceKey }
+    public func saveKey(_ raw: String) { saveInferenceKey(raw) }
+
+    // SecondaryKeyProvider conformance (secondary = management key).
+    public var hasSecondaryKey: Bool { hasManagementKey }
+    public func saveSecondaryKey(_ raw: String) { saveManagementKey(raw) }
 
     private func saveOrClear(_ raw: String, key: String) {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)

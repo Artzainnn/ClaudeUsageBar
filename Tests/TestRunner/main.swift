@@ -671,6 +671,13 @@ run("ProviderCopy.help returns Zed guidance and no disclosure") {
     expect(ProviderCopy.disclosure(for: "zed") == nil)
 }
 
+run("ProviderCopy.help returns xAI two-key guidance") {
+    let xai = ProviderCopy.help(for: "xai")
+    expect(xai != nil)
+    expect(xai?.contains("inference key") == true)
+    expect(xai?.contains("management key") == true)
+}
+
 // MARK: - DeepSeekUsageFetcher.parse (PR 4-BE)
 
 // Fixture shapes match api-docs.deepseek.com/api/get-user-balance: is_available
@@ -1289,6 +1296,21 @@ MainActor.assumeIsolated {
         store.saveInferenceKey("xai-bad")
         store.fetch()
         expectEqual(store.errorMessage, "Invalid xAI API key")
+    }
+
+    run("xAI conforms to PasteKeyProvider and SecondaryKeyProvider") {
+        let store = XAIUsageStore(credentials: InMemoryCredentialStore(), transport: StubXAITransport(.networkError), defaults: defaults)
+        let primary = store as PasteKeyProvider
+        let secondary = store as SecondaryKeyProvider
+        expect(primary.keyPlaceholder.contains("inference"))
+        expect(secondary.secondaryKeyPlaceholder.contains("management"))
+        expect(secondary.secondaryKeyWarning.contains("delete"))  // warns about key power
+        expectEqual(primary.hasKey, false)
+        expectEqual(secondary.hasSecondaryKey, false)
+        primary.saveKey("xai-inference")
+        secondary.saveSecondaryKey("xai-mgmt")
+        expectEqual(primary.hasKey, true)
+        expectEqual(secondary.hasSecondaryKey, true)
     }
 
     run("xAI clear deletes both keys") {

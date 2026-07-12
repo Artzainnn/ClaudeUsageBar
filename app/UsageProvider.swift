@@ -183,6 +183,29 @@ public protocol PasteKeyProvider {
     func saveKey(_ raw: String)
 }
 
+// MARK: - SecondaryKeyProvider
+
+/// Optional capability for providers that accept a SECOND, higher-privilege
+/// secret gated behind a warning (e.g. xAI's management key, which can
+/// create/rotate/delete API keys). The Settings row renders a second, opt-in
+/// entry field with the warning text for any provider that conforms.
+///
+/// A provider adopting this must also adopt PasteKeyProvider for its primary
+/// (required) key.
+@MainActor
+public protocol SecondaryKeyProvider {
+    /// Placeholder for the secondary field.
+    var secondaryKeyPlaceholder: String { get }
+    /// Short label for the opt-in row (e.g. "Enable balance + history").
+    var secondaryKeyLabel: String { get }
+    /// Warning shown before the field (e.g. what the key can do).
+    var secondaryKeyWarning: String { get }
+    /// True when a secondary secret is stored.
+    var hasSecondaryKey: Bool { get }
+    /// Store a pasted secondary secret. Empty input clears it.
+    func saveSecondaryKey(_ raw: String)
+}
+
 // MARK: - ProviderCopy
 
 /// Per-provider help and disclosure copy for the Settings toggles. Kept in
@@ -199,6 +222,8 @@ public enum ProviderCopy {
             return "Shows your DeepSeek platform balance (granted + topped-up), per currency. Paste a DeepSeek API key below; it is stored in your macOS Keychain and used only to read the balance."
         case "zed":
             return "Shows your Zed plan and edit-prediction usage. Reads the login Zed already saved in your Keychain — macOS will ask once to allow it. Sign in to Zed first, then click Refresh."
+        case "xai":
+            return "Shows your xAI (Grok) API key permissions. Paste an inference key (xai-…) below. Add a management key too to also see prepaid balance and daily usage. Both are stored in your Keychain."
         default:
             return nil
         }
