@@ -306,6 +306,8 @@ public enum ProviderCopy {
             return "Shows your OpenAI organisation's month-to-date spend, token usage by model, and configured rate limits. Paste an Organization Admin key (sk-admin-…); it is stored in your Keychain."
         case "perplexity":
             return "Can show your Perplexity plan, credit balance, and per-mode remaining queries (Pro Search, Deep Research, Labs, Agentic) when available. Sign in on perplexity.ai, open your browser's cookie inspector, and paste your __Secure-next-auth.session-token cookie below — the bare value, a name=value pair, or the full copied Cookie header all work. It is stored in your Keychain."
+        case "copilot":
+            return "Shows your GitHub Copilot chargeable AI-Credit overage (net) month-to-date, plus the top SKU line items. Note: usage covered by your plan's included allowance shows as $0 — only overage is charged. Create a fine-grained PAT on github.com (Settings → Developer settings → Personal access tokens → Fine-grained tokens), set the resource owner to your own account, then under Account permissions grant 'Plan: Read-only'. Paste the github_pat_… token below; it is stored in your Keychain."
         default:
             return nil
         }
@@ -321,6 +323,8 @@ public enum ProviderCopy {
             return "An Admin key can view billing and manage users in your OpenAI organisation. It cannot make inference calls. Store yours only if you are comfortable with this app holding it."
         case "perplexity":
             return "Uses Perplexity's private web-app endpoints. They may stop working without notice. The pasted value is a full Perplexity web session cookie — it can let this app act as your signed-in account, including spending or purchasing credits your plan allows, until it expires or is revoked (for example by signing out or clearing sessions on perplexity.ai)."
+        case "copilot":
+            return "Use a fine-grained PAT (github_pat_…), NOT a classic token. Grant only 'Plan: Read' under Account permissions — nothing else. Set an expiry so an accidentally-leaked token becomes worthless. Classic PATs with broader scopes can spend money on your GitHub account; do not paste one here. Treat a PAT like a password — anyone with it can act as you without triggering your 2FA prompt. Clearing this key deletes it from your Mac's Keychain but does NOT revoke it on GitHub — to revoke, visit github.com Settings → Developer settings → Personal access tokens and delete it there."
         default:
             return nil
         }

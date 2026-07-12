@@ -76,6 +76,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // session cookie from perplexity.ai. Doubly inert until the user
         // both enables and configures it. Backend from PR #61.
         providers.append(ProviderBox(PerplexityUsageStore()))
+        // PR 9-UI: register GitHub Copilot. Opt-in
+        // (features.copilot.enabled defaults false); requires a pasted
+        // fine-grained PAT (Plan: Read). Doubly inert until the user
+        // both enables and configures it. Backend from PR #64.
+        providers.append(ProviderBox(CopilotUsageStore()))
         // Model SwiftUI observes for the generic (non-Anthropic) provider
         // tiles. Anthropic continues to render through usageManager directly.
         providersModel = ProvidersModel(providers: providers)

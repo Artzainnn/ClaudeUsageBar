@@ -711,6 +711,49 @@ run("ProviderCopy: Perplexity help names the cookie, Keychain, and multiple past
     expect(help?.contains("name=value") == true || help?.contains("Cookie header") == true || help?.contains("bare") == true)
 }
 
+run("ProviderCopy: Copilot help names the exact PAT path (PR 9-UI)") {
+    // The help text MUST tell the user which token type, which permission,
+    // and where to configure it — otherwise they'll paste a classic PAT
+    // with broader scopes (bad) or won't find the Plan permission at all.
+    let help = ProviderCopy.help(for: "copilot")
+    expect(help != nil)
+    // Token type discriminator: the fine-grained prefix.
+    expect(help?.contains("github_pat_") == true)
+    expect(help?.contains("fine-grained") == true || help?.contains("Fine-grained") == true)
+    // Permission location + name + level — all three must be present, and
+    // must NOT drift to e.g. "Repository permissions" or "Plan: Write".
+    expect(help?.contains("Account permissions") == true)
+    expect(help?.contains("Plan: Read-only") == true)
+    // Codex round-1 finding #3: lock in the resource-owner requirement.
+    // Without this the user can pick an org resource owner and hit the
+    // "Account permissions cannot be selected on org PATs" error.
+    expect(help?.contains("resource owner") == true)
+    expect(help?.contains("your own account") == true)
+    // Codex round-1 finding #2: overage vs allowance disclosure.
+    expect(help?.contains("overage") == true || help?.contains("allowance") == true)
+    // Storage location.
+    expect(help?.contains("Keychain") == true)
+}
+
+run("ProviderCopy: Copilot disclosure warns about classic PATs, expiry, and non-revocation on clear (PR 9-UI)") {
+    // Classic PATs with broad scopes CAN spend money on GitHub; the
+    // disclosure must warn against pasting one, recommend an expiry so a
+    // leak becomes bounded, AND (Codex round-1 finding #1) clarify that
+    // clearing this app's Keychain entry does NOT revoke the token on
+    // GitHub — the user must visit github.com to revoke.
+    let disc = ProviderCopy.disclosure(for: "copilot")
+    expect(disc != nil)
+    expect(disc?.contains("fine-grained") == true)
+    expect(disc?.contains("classic") == true || disc?.contains("Classic") == true)
+    expect(disc?.contains("expiry") == true || disc?.contains("expire") == true)
+    // Explicit call-out that broader scopes can spend money.
+    expect(disc?.contains("broader") == true)
+    expect(disc?.contains("spend") == true || disc?.contains("money") == true)
+    // Codex round-1 finding #1: revocation clarity.
+    expect(disc?.contains("revoke") == true)
+    expect(disc?.contains("github.com") == true)
+}
+
 run("ProviderCopy: Perplexity disclosure warns about undocumented API and cookie power") {
     // The Perplexity cookie is a spending credential AND the endpoints are
     // undocumented — both facts must be surfaced before the user pastes.
