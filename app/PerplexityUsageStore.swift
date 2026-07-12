@@ -372,14 +372,19 @@ public struct URLSessionPerplexityTransport: PerplexityUsageTransport {
     ///   2. `URLSessionConfiguration.default.timeoutIntervalForResource` is
     ///      604 800 seconds (7 days). A stalled Perplexity response would
     ///      park its callback for a week.
-    /// Our explicit `Cookie:` header is the ONLY source of session state for
-    /// this transport; the response cookie jar is nulled so nothing sticks.
+    /// This session uses `.ephemeral` configuration — Apple's documented
+    /// pattern for a URLSession with in-memory-only cookie storage isolated
+    /// from `URLSession.shared`. `.ephemeral` gives us a per-session cookie
+    /// jar that:
+    ///   - Cloudflare's per-poll `__cf_bm` challenge cookies still work
+    ///     inside a single fetchAll() cycle (chk1-fix Codex round 4: nulling
+    ///     the store entirely could break Cloudflare challenge flows).
+    ///   - Nothing persists to disk (unlike the shared session's default
+    ///     store under ~/Library/Cookies/).
+    ///   - Nothing leaks into the shared jar or any other provider.
     /// Timeouts are matched to the 60s poll cadence.
     private let session: URLSession = {
-        let config = URLSessionConfiguration.default
-        config.httpShouldSetCookies = false
-        config.httpCookieAcceptPolicy = .never
-        config.httpCookieStorage = nil
+        let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 15
         config.timeoutIntervalForResource = 30
         return URLSession(configuration: config)

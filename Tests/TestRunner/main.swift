@@ -2450,23 +2450,43 @@ MainActor.assumeIsolated {
     }
     #endif
 
-    run("Perplexity multi-endpoint partial success emits available tiles (chk1 Omission #2)") {
-        // Locks in the "success-when-any-endpoint-succeeded" behaviour.
-        // Concretely: even if rate-limits and settings return non-2xx, a
-        // 200 on credits still surfaces the credits tile — the failure of
-        // the others is not permitted to blank the whole provider.
+    run("Perplexity partial-success snapshot renders only the tiles it carries (chk1 Omission #2 — store apply)") {
+        // Store-layer assertion: given a snapshot that carries only credits
+        // (as the accumulator would produce when rateLimits and settings
+        // endpoints failed), the tile mapper must not paper over the gap
+        // with plan/mode tiles. Complements the accumulator-side test below.
         let store = PerplexityUsageStore(credentials: InMemoryCredentialStore(), transport: StubPerplexityTransport(.networkError), defaults: defaults)
         store.saveKey("cookie")
         var snap = PerplexityUsageSnapshot()
         snap.credits = PerplexityCredits(balanceCents: 4235.50, renewalEpoch: 1770000000)
-        // rateLimits and settings intentionally left nil (as though those
-        // endpoints returned 429/500 and were dropped by the accumulator).
         store.apply(.success(snap))
         expect(store.tiles.contains { $0.id == "perplexity-credits" })
         expect(!store.tiles.contains { $0.id == "perplexity-plan" })
         expect(!store.tiles.contains { $0.id == "perplexity-pro" })
         expect(!store.tiles.contains { $0.id == "perplexity-research" })
     }
+
+    #if DEBUG
+    run("Perplexity accumulator finalizes partial-success correctly (chk1 Omission #2 — accumulator)") {
+        // Transport-layer assertion (Codex round-4 finding #3): the
+        // accumulator itself, given credits-set + rateLimits-not-set +
+        // settings-not-set + one rateLimits httpError(429), returns
+        // (unauthorized: false, httpError: 429 remembered, snapshot with
+        // only credits populated). This exercises the code path the
+        // production transport uses, complementing the store-level test.
+        let acc = PerplexityFetchAccumulator()
+        acc.setCredits(PerplexityCredits(balanceCents: 4235.50, renewalEpoch: 1770000000))
+        acc.recordHttpError(429)                    // rate-limit endpoint 429'd
+        acc.recordHttpError(500)                    // settings endpoint 5xx'd
+        let (unauthorized, httpError, snap) = acc.finalize()
+        expectEqual(unauthorized, false)
+        // 429 wins the priority ranking over the 500.
+        expectEqual(httpError, 429)
+        expect(snap.credits != nil)
+        expect(snap.rateLimits == nil)
+        expect(snap.settings == nil)
+    }
+    #endif
 
     run("Perplexity fetch() background-delivered success reaches @Published snapshot (chk1 Omission #3)") {
         // Round-1 tests covered background-queue delivery of .unauthorized,
