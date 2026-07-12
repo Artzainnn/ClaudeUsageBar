@@ -2433,6 +2433,66 @@ MainActor.assumeIsolated {
         }
     }
 
+    #if DEBUG
+    run("Perplexity accumulator priority: 429 beats 5xx beats other 4xx (chk1 Omission #1)") {
+        // Locks in the priority ordering so a future edit that flipped
+        // the recordHttpError branches would fail this test.
+        let acc = PerplexityFetchAccumulator()
+        expect(acc.currentHttpError == nil)
+        acc.recordHttpError(418)
+        expectEqual(acc.currentHttpError, 418)
+        acc.recordHttpError(500)
+        expectEqual(acc.currentHttpError, 500)   // 5xx > other 4xx
+        acc.recordHttpError(429)
+        expectEqual(acc.currentHttpError, 429)   // 429 > 5xx
+        acc.recordHttpError(503)
+        expectEqual(acc.currentHttpError, 429)   // 429 sticks (does not degrade)
+    }
+    #endif
+
+    run("Perplexity multi-endpoint partial success emits available tiles (chk1 Omission #2)") {
+        // Locks in the "success-when-any-endpoint-succeeded" behaviour.
+        // Concretely: even if rate-limits and settings return non-2xx, a
+        // 200 on credits still surfaces the credits tile — the failure of
+        // the others is not permitted to blank the whole provider.
+        let store = PerplexityUsageStore(credentials: InMemoryCredentialStore(), transport: StubPerplexityTransport(.networkError), defaults: defaults)
+        store.saveKey("cookie")
+        var snap = PerplexityUsageSnapshot()
+        snap.credits = PerplexityCredits(balanceCents: 4235.50, renewalEpoch: 1770000000)
+        // rateLimits and settings intentionally left nil (as though those
+        // endpoints returned 429/500 and were dropped by the accumulator).
+        store.apply(.success(snap))
+        expect(store.tiles.contains { $0.id == "perplexity-credits" })
+        expect(!store.tiles.contains { $0.id == "perplexity-plan" })
+        expect(!store.tiles.contains { $0.id == "perplexity-pro" })
+        expect(!store.tiles.contains { $0.id == "perplexity-research" })
+    }
+
+    run("Perplexity fetch() background-delivered success reaches @Published snapshot (chk1 Omission #3)") {
+        // Round-1 tests covered background-queue delivery of .unauthorized,
+        // but not of .success. Cover the common-case path so a future edit
+        // that reintroduced MainActor.assumeIsolated in apply() would trap
+        // and fail this test.
+        final class BackgroundSuccessTransport: PerplexityUsageTransport, @unchecked Sendable {
+            func fetchAll(cookieName: String, cookieValue: String, completion: @escaping @Sendable (PerplexityUsageResult) -> Void) {
+                DispatchQueue.global().async {
+                    var s = PerplexityUsageSnapshot()
+                    s.credits = PerplexityCredits(balanceCents: 500, renewalEpoch: 1770000000)
+                    completion(.success(s))
+                }
+            }
+        }
+        let store = PerplexityUsageStore(credentials: InMemoryCredentialStore(), transport: BackgroundSuccessTransport(), defaults: defaults)
+        store.saveKey("cookie")
+        store.fetch()
+        let deadline = Date().addingTimeInterval(2.0)
+        while store.snapshot == nil && Date() < deadline {
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.02))
+        }
+        expect(store.snapshot != nil)
+        expectEqual(store.snapshot?.credits?.balanceCents, 500)
+    }
+
     run("Perplexity transport rejects a semicolon-injected cookie value") {
         // Codex adversarial review #5. A hostile paste like "real; other=evil"
         // is caught by extract() when the paste is parsed (it becomes a full

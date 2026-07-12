@@ -515,8 +515,11 @@ private enum PerplexityEndpointKind {
 /// Thread-safe accumulator for the three concurrent GETs. A final call to
 /// `finalize()` collapses the state into a single snapshot + unauthorized
 /// flag. Lock-protected because `dataTask` completions can land on any
-/// queue.
-private final class PerplexityFetchAccumulator: @unchecked Sendable {
+/// queue. `public` (rather than `private`) so TestRunner can lock in the
+/// httpError priority ordering without going through a live URL session
+/// (chk1 Omission #1). The type is otherwise an internal implementation
+/// detail — not re-exported, not part of the store's public API surface.
+public final class PerplexityFetchAccumulator: @unchecked Sendable {
     private let lock = NSLock()
     private var credits: PerplexityCredits?
     private var rateLimits: PerplexityRateLimits?
@@ -528,23 +531,25 @@ private final class PerplexityFetchAccumulator: @unchecked Sendable {
     /// failed.
     private var httpError: Int?
 
-    func setCredits(_ value: PerplexityCredits) {
+    public init() {}
+
+    public func setCredits(_ value: PerplexityCredits) {
         lock.lock(); defer { lock.unlock() }
         credits = value
     }
-    func setRateLimits(_ value: PerplexityRateLimits) {
+    public func setRateLimits(_ value: PerplexityRateLimits) {
         lock.lock(); defer { lock.unlock() }
         rateLimits = value
     }
-    func setSettings(_ value: PerplexityUserSettings) {
+    public func setSettings(_ value: PerplexityUserSettings) {
         lock.lock(); defer { lock.unlock() }
         settings = value
     }
-    func setUnauthorized() {
+    public func setUnauthorized() {
         lock.lock(); defer { lock.unlock() }
         unauthorized = true
     }
-    func recordHttpError(_ status: Int) {
+    public func recordHttpError(_ status: Int) {
         lock.lock(); defer { lock.unlock() }
         // Priority: 429 > 5xx > anything else. Only replace when the new
         // code carries strictly more signal.
@@ -561,7 +566,7 @@ private final class PerplexityFetchAccumulator: @unchecked Sendable {
             httpError = status
         }
     }
-    func finalize() -> (Bool, Int?, PerplexityUsageSnapshot) {
+    public func finalize() -> (Bool, Int?, PerplexityUsageSnapshot) {
         lock.lock(); defer { lock.unlock() }
         return (unauthorized, httpError, PerplexityUsageSnapshot(
             credits: credits,
@@ -569,4 +574,14 @@ private final class PerplexityFetchAccumulator: @unchecked Sendable {
             settings: settings
         ))
     }
+
+    #if DEBUG
+    /// Test-only accessor for the current httpError. Guarded behind DEBUG
+    /// so it cannot be reached from production paths and stays out of
+    /// release-binary symbol tables.
+    public var currentHttpError: Int? {
+        lock.lock(); defer { lock.unlock() }
+        return httpError
+    }
+    #endif
 }

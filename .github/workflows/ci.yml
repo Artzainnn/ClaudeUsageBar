@@ -81,6 +81,21 @@ jobs:
             exit 1
           fi
 
+      - name: Reject logging sinks that interpolate a credential property path
+        run: |
+          # chk1 Risk #3: the identifier-name-based SECRETS alternation
+          # above matches `\(cookieValue)` but NOT `\(cookie.token)` — a
+          # tuple / struct property path. A future maintainer who logged
+          # `Log.info("...\(cookie.token)")` would silently bypass the
+          # guard. This step catches the property-path pattern for a set
+          # of names a maintainer might reasonably reach for.
+          SINKS='(NSLog|print|debugPrint|dump|os_log|Logger|Log\.debug|Log\.info)'
+          FIELDS='\.(token|cookie|session|secret|key|jwt|bearer)'
+          if grep -rnE "${SINKS}\([^)]*\\\\\\([^)]*${FIELDS}" -- app/ ; then
+            echo "::error::A logging sink interpolates a credential property path (e.g. cookie.token). Log a status code via Log.info(.count) instead." >&2
+            exit 1
+          fi
+
       - name: Reject logging of full request URLs (may embed org/team/project ids)
         run: |
           # A full URL string can embed an org id, team id, or project id.
