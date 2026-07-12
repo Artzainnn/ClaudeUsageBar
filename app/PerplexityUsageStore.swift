@@ -520,10 +520,17 @@ private enum PerplexityEndpointKind {
 /// Thread-safe accumulator for the three concurrent GETs. A final call to
 /// `finalize()` collapses the state into a single snapshot + unauthorized
 /// flag. Lock-protected because `dataTask` completions can land on any
-/// queue. `public` (rather than `private`) so TestRunner can lock in the
-/// httpError priority ordering without going through a live URL session
-/// (chk1 Omission #1). The type is otherwise an internal implementation
-/// detail — not re-exported, not part of the store's public API surface.
+/// queue.
+///
+/// `public` (rather than `private`) so TestRunner — a separate SwiftPM
+/// target — can lock in the httpError priority ordering and multi-endpoint
+/// partial-success shapes without going through a live URL session
+/// (chk1 Omission #1 + #2). Codex round-4 flagged this as a small API
+/// surface leak; we accept the leak because ClaudeUsageBar is an app-only
+/// module with no external library consumers, so no downstream code can
+/// depend on this shape. If the module ever gains an external API contract,
+/// switch TestRunner to `@testable import ClaudeUsageBar` and revert this
+/// to `internal`.
 public final class PerplexityFetchAccumulator: @unchecked Sendable {
     private let lock = NSLock()
     private var credits: PerplexityCredits?
