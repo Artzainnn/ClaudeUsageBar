@@ -224,6 +224,8 @@ public enum ProviderCopy {
             return "Shows your Zed plan and edit-prediction usage. Reads the login Zed already saved in your Keychain — macOS will ask once to allow it. Sign in to Zed first, then click Refresh."
         case "xai":
             return "Shows your xAI (Grok) API key permissions. Paste an inference key (xai-…) below. Add a management key too to also see prepaid balance and daily usage. Both are stored in your Keychain."
+        case "openai":
+            return "Shows your OpenAI organisation's month-to-date spend, token usage by model, and configured rate limits. Paste an Organization Admin key (sk-admin-…); it is stored in your Keychain."
         default:
             return nil
         }
@@ -235,6 +237,8 @@ public enum ProviderCopy {
         switch id {
         case "codex":
             return "Uses OpenAI's private Codex API. It may stop working without notice."
+        case "openai":
+            return "An Admin key can view billing and manage users in your OpenAI organisation. It cannot make inference calls. Store yours only if you are comfortable with this app holding it."
         default:
             return nil
         }

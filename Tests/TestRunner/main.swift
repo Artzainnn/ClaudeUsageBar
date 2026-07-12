@@ -678,6 +678,18 @@ run("ProviderCopy.help returns xAI two-key guidance") {
     expect(xai?.contains("management key") == true)
 }
 
+run("ProviderCopy: OpenAI help + admin-key disclosure") {
+    let help = ProviderCopy.help(for: "openai")
+    expect(help != nil)
+    expect(help?.contains("Admin key") == true)
+    expect(help?.contains("month-to-date") == true)
+    // Admin keys are high-privilege — a disclosure warning is required.
+    let disc = ProviderCopy.disclosure(for: "openai")
+    expect(disc != nil)
+    expect(disc?.contains("manage users") == true)
+    expect(disc?.contains("cannot make inference") == true)
+}
+
 // MARK: - DeepSeekUsageFetcher.parse (PR 4-BE)
 
 // Fixture shapes match api-docs.deepseek.com/api/get-user-balance: is_available

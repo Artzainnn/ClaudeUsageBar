@@ -68,6 +68,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // an optional gated management key for balance/history. Inert until
         // enabled and configured.
         providers.append(ProviderBox(XAIUsageStore()))
+        // PR 7-UI: register OpenAI Platform. Opt-in; requires a pasted Admin
+        // key (sk-admin-). Inert until enabled and configured.
+        providers.append(ProviderBox(OpenAIUsageStore()))
         // Model SwiftUI observes for the generic (non-Anthropic) provider
         // tiles. Anthropic continues to render through usageManager directly.
         providersModel = ProvidersModel(providers: providers)
