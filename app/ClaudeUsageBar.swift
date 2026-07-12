@@ -2,6 +2,12 @@ import SwiftUI
 import AppKit
 import WebKit
 import Carbon
+import Combine
+
+// The categorical logger (enum Log, enum LogValue) lives in Log.swift so
+// the SwiftPM library target can compile it without also compiling this
+// file's @main entry point. Both files are compiled together by
+// app/build.sh into the final .app bundle.
 
 // Main entry point
 class AppDelegate: NSObject, NSApplicationDelegate {
@@ -10,6 +16,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var usageManager: UsageManager!
     var statusManager: StatusManager!
     var updateManager: UpdateManager!
+
+    // PR 2c: multi-provider registry. Anthropic is the only provider today;
+    // subsequent PRs register additional stores (Codex, DeepSeek, Zed, ...)
+    // via `providers.append(...)`. The existing UsageManager continues to
+    // drive Anthropic tiles — providers[0] is a thin wrapper around it.
+    var providers: [ProviderBox] = []
+    // PR 3-UI: the ObservableObject SwiftUI watches for generic provider
+    // tiles. Holds the same ProviderBox instances as `providers`.
+    var providersModel: ProvidersModel!
     var eventMonitor: Any?
     var hotKeyRef: EventHotKeyRef?
 
@@ -34,6 +49,36 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Initialize managers
         usageManager = UsageManager(statusItem: statusItem, delegate: self)
+        // Wrap the manager in a UsageProvider so additional providers can
+        // register alongside it without disturbing the Anthropic path.
+        providers.append(ProviderBox(AnthropicUsageStore(manager: usageManager)))
+        // PR 3-UI: register the Codex provider. It is opt-in (feature flag
+        // features.codex.enabled defaults false), so registering it here is
+        // inert for existing users — it contributes no tiles until enabled.
+        providers.append(ProviderBox(CodexUsageStore()))
+        // PR 4-UI: register DeepSeek. Also opt-in (features.deepseek.enabled
+        // defaults false) and additionally requires a pasted API key, so it
+        // is doubly inert until the user both enables and configures it.
+        providers.append(ProviderBox(DeepSeekUsageStore()))
+        // PR 5-UI: register Zed. Opt-in (features.zed.enabled defaults false);
+        // it reads Zed's own Keychain login on first fetch (one-time macOS
+        // prompt), so it is inert until enabled and the prompt is allowed.
+        providers.append(ProviderBox(ZedUsageStore()))
+        // PR 6-UI: register xAI. Opt-in; requires a pasted inference key, with
+        // an optional gated management key for balance/history. Inert until
+        // enabled and configured.
+        providers.append(ProviderBox(XAIUsageStore()))
+        // PR 7-UI: register OpenAI Platform. Opt-in; requires a pasted Admin
+        // key (sk-admin-). Inert until enabled and configured.
+        providers.append(ProviderBox(OpenAIUsageStore()))
+        // PR 8-UI: register Perplexity Pro/Max. Opt-in
+        // (features.perplexity.enabled defaults false); requires a pasted
+        // session cookie from perplexity.ai. Doubly inert until the user
+        // both enables and configures it. Backend from PR #61.
+        providers.append(ProviderBox(PerplexityUsageStore()))
+        // Model SwiftUI observes for the generic (non-Anthropic) provider
+        // tiles. Anthropic continues to render through usageManager directly.
+        providersModel = ProvidersModel(providers: providers)
         statusManager = StatusManager()
         updateManager = UpdateManager()
 
@@ -45,13 +90,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         popover.contentViewController = NSHostingController(rootView: UsageView(
             usageManager: usageManager,
             statusManager: statusManager,
-            updateManager: updateManager
+            updateManager: updateManager,
+            providersModel: providersModel
         ))
 
         // Fetch initial data
         usageManager.fetchUsage()
         statusManager.fetch()
         updateManager.fetch()
+        // Fetch any enabled non-Anthropic providers (Codex, etc.) on launch.
+        providersModel.fetchEnabled()
+
+        // Non-Anthropic providers poll on their own cadence. Codex documents
+        // 60s while active; a single 60s timer drives every enabled provider.
+        Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in
+            self.providersModel.fetchEnabled()
+        }
 
         // Usage + Anthropic status are time-sensitive — poll every 5 min.
         Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { _ in
@@ -208,6 +262,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 self.usageManager.updatePercentages()
             }
+            // Refresh enabled non-Anthropic providers (Codex, etc.) so their
+            // tiles are current when the popover appears.
+            providersModel?.fetchEnabled()
 
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
 
@@ -403,15 +460,15 @@ class UsageManager: ObservableObject {
     }
 
     func saveSessionCookie(_ cookie: String) {
-        NSLog("ClaudeUsage: Saving cookie, length: \(cookie.count)")
+        Log.info("ClaudeUsage: saving cookie", .count(cookie.count))
         sessionCookie = cookie
         UserDefaults.standard.set(cookie, forKey: "claude_session_cookie")
         UserDefaults.standard.synchronize()
-        NSLog("ClaudeUsage: Cookie saved successfully")
+        Log.info("ClaudeUsage: cookie saved successfully")
     }
 
     func clearSessionCookie() {
-        NSLog("ClaudeUsage: Clearing cookie")
+        Log.info("ClaudeUsage: clearing cookie")
         sessionCookie = ""
         UserDefaults.standard.removeObject(forKey: "claude_session_cookie")
         UserDefaults.standard.synchronize()
@@ -435,20 +492,18 @@ class UsageManager: ObservableObject {
         // Update status bar to show 0%
         delegate?.updateStatusIcon(percentage: 0)
 
-        NSLog("ClaudeUsage: Cookie cleared, data reset")
+        Log.info("ClaudeUsage: cookie cleared, data reset")
     }
 
     func fetchOrganizationId(completion: @escaping (String?) -> Void) {
-        // Get org ID from the lastActiveOrg cookie value
-        let cookieParts = sessionCookie.components(separatedBy: ";")
-        for part in cookieParts {
-            let trimmed = part.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("lastActiveOrg=") {
-                let orgId = trimmed.replacingOccurrences(of: "lastActiveOrg=", with: "")
-                NSLog("📋 Found org ID in cookie: \(orgId)")
-                completion(orgId)
-                return
-            }
+        // PR 2b: parsing lives in AnthropicUsageFetcher. UsageManager keeps
+        // ownership of the network call (which needs to be in the manager
+        // for delegate/main-actor reasons) but delegates the string
+        // parsing.
+        if let orgId = AnthropicUsageFetcher.orgId(fromCookieString: sessionCookie) {
+            Log.info("Found org ID in cookie", .identifier(orgId))
+            completion(orgId)
+            return
         }
 
         // If not in cookie, fetch from bootstrap
@@ -526,7 +581,11 @@ class UsageManager: ObservableObject {
         request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
         request.setValue("claude.ai", forHTTPHeaderField: "authority")
 
-        NSLog("🔍 Fetching from: \(urlString)")
+        // Do NOT log the full URL: it embeds the org id (a sensitive
+        // account identifier). Log a fixed endpoint label plus the org id
+        // through the categorical logger, which emits only a short SHA-256
+        // prefix rather than the plaintext id.
+        Log.info("Fetching Anthropic usage", .identifier(orgId))
 
         URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             DispatchQueue.main.async {
@@ -545,11 +604,17 @@ class UsageManager: ObservableObject {
                     return
                 }
 
-                NSLog("📡 Status: \(httpResponse.statusCode)")
+                Log.info("Usage API response", .count(httpResponse.statusCode))
 
+                // Response body is intentionally NOT logged. It contains the
+                // full usage JSON tied to the user's cookie and would land in
+                // unified log. Diagnostics for debugging live parse issues
+                // must go through the DEBUG-only path.
+                #if DEBUG
                 if let data = data, let responseString = String(data: data, encoding: .utf8) {
-                    NSLog("📦 Response: \(responseString)")
+                    Log.debug("Usage API body (DEBUG only): \(responseString)")
                 }
+                #endif
 
                 if httpResponse.statusCode == 200, let data = data {
                     self?.parseUsageData(data)
@@ -563,113 +628,43 @@ class UsageManager: ObservableObject {
     }
 
     func parseUsageData(_ data: Data) {
+        // PR 2b: parsing extracted into AnthropicUsageFetcher (Sendable
+        // value type, no side effects). UsageManager only applies the
+        // resulting snapshot to observable state. Behaviour is identical
+        // to the pre-refactor code; every branch is locked in by fixture
+        // tests in Tests/TestRunner.
         do {
-            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                errorMessage = "Invalid JSON"
-                return
-            }
+            let snap = try AnthropicUsageFetcher.parse(data)
+            sessionUsage = snap.sessionUsage
+            sessionLimit = 100
+            sessionResetsAt = snap.sessionResetsAt
 
-            NSLog("📊 Parsing usage data...")
+            weeklyUsage = snap.weeklyUsage
+            weeklyLimit = 100
+            weeklyResetsAt = snap.weeklyResetsAt
 
-            let iso8601Formatter = ISO8601DateFormatter()
-            iso8601Formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            hasWeeklySonnet = snap.hasWeeklySonnet
+            weeklySonnetUsage = snap.weeklySonnetUsage
+            weeklySonnetLimit = 100
+            weeklySonnetResetsAt = snap.weeklySonnetResetsAt
 
-            // Parse the actual claude.ai response format
-            if let fiveHour = json["five_hour"] as? [String: Any] {
-                if let sessionUtil = fiveHour["utilization"] as? Double {
-                    sessionUsage = Int(sessionUtil)
-                    sessionLimit = 100
-                }
-                if let resetsAtString = fiveHour["resets_at"] as? String {
-                    NSLog("🕐 Session resets_at string: \(resetsAtString)")
-                    if let resetsAt = iso8601Formatter.date(from: resetsAtString) {
-                        sessionResetsAt = resetsAt
-                        NSLog("✅ Parsed session reset time: \(resetsAt)")
-                    } else {
-                        NSLog("❌ Failed to parse session reset time")
-                    }
-                }
-            }
+            hasWeeklyFable = snap.hasWeeklyFable
+            weeklyFableUsage = snap.weeklyFableUsage
+            weeklyFableLimit = 100
+            weeklyFableResetsAt = snap.weeklyFableResetsAt
 
-            if let sevenDay = json["seven_day"] as? [String: Any] {
-                if let weeklyUtil = sevenDay["utilization"] as? Double {
-                    weeklyUsage = Int(weeklyUtil)
-                    weeklyLimit = 100
-                }
-                if let resetsAtString = sevenDay["resets_at"] as? String {
-                    NSLog("🕐 Weekly resets_at string: \(resetsAtString)")
-                    if let resetsAt = iso8601Formatter.date(from: resetsAtString) {
-                        weeklyResetsAt = resetsAt
-                        NSLog("✅ Parsed weekly reset time: \(resetsAt)")
-                    } else {
-                        NSLog("❌ Failed to parse weekly reset time")
-                    }
-                }
-            }
-
-            // Check for seven_day_sonnet (Pro plan feature)
-            if let sevenDaySonnet = json["seven_day_sonnet"] as? [String: Any] {
-                hasWeeklySonnet = true
-                if let sonnetUtil = sevenDaySonnet["utilization"] as? Double {
-                    weeklySonnetUsage = Int(sonnetUtil)
-                    weeklySonnetLimit = 100
-                }
-                if let resetsAtString = sevenDaySonnet["resets_at"] as? String {
-                    NSLog("🕐 Weekly Sonnet resets_at string: \(resetsAtString)")
-                    if let resetsAt = iso8601Formatter.date(from: resetsAtString) {
-                        weeklySonnetResetsAt = resetsAt
-                        NSLog("✅ Parsed weekly Sonnet reset time: \(resetsAt)")
-                    } else {
-                        NSLog("❌ Failed to parse weekly Sonnet reset time")
-                    }
-                }
-            } else {
-                hasWeeklySonnet = false
-            }
-
-            // Fable is a new, separately-counted model. It isn't a top-level
-            // key like seven_day_sonnet — it lives in the `limits` array as a
-            // model-scoped weekly limit (scope.model.display_name == "Fable").
-            // The bar is only surfaced in the UI when usage is above 1%.
-            hasWeeklyFable = false
-            if let limits = json["limits"] as? [[String: Any]] {
-                let fableLimit = limits.first { entry in
-                    let scope = entry["scope"] as? [String: Any]
-                    let model = scope?["model"] as? [String: Any]
-                    return (model?["display_name"] as? String) == "Fable"
-                }
-                if let fable = fableLimit {
-                    hasWeeklyFable = true
-                    // `percent` may decode as Int or Double depending on payload.
-                    if let p = fable["percent"] as? Int {
-                        weeklyFableUsage = p
-                    } else if let p = fable["percent"] as? Double {
-                        weeklyFableUsage = Int(p)
-                    }
-                    weeklyFableLimit = 100
-                    if let resetsAtString = fable["resets_at"] as? String {
-                        NSLog("🕐 Weekly Fable resets_at string: \(resetsAtString)")
-                        if let resetsAt = iso8601Formatter.date(from: resetsAtString) {
-                            weeklyFableResetsAt = resetsAt
-                            NSLog("✅ Parsed weekly Fable reset time: \(resetsAt)")
-                        } else {
-                            NSLog("❌ Failed to parse weekly Fable reset time")
-                        }
-                    }
-                }
-            }
-
-            // Log what we found
-            NSLog("✅ Parsed: Session \(sessionUsage)%, Weekly \(weeklyUsage)%\(hasWeeklySonnet ? ", Weekly Sonnet \(weeklySonnetUsage)%" : "")\(hasWeeklyFable ? ", Weekly Fable \(weeklyFableUsage)%" : "")")
+            Log.info("Parsed usage",
+                     .public("session"), .count(sessionUsage),
+                     .public("weekly"), .count(weeklyUsage))
 
             lastUpdated = Date()
             errorMessage = nil
             hasFetchedData = true
-
-            // Update percentage values for progress bars
             updatePercentages()
+        } catch AnthropicUsageParseError.invalidJSON {
+            errorMessage = "Invalid JSON"
         } catch {
-            NSLog("❌ Parse error: \(error.localizedDescription)")
+            Log.info("Parse error", .public(error.localizedDescription))
             errorMessage = "Parse error"
         }
     }
@@ -1295,6 +1290,71 @@ struct PasteableTextField: NSViewRepresentable {
     }
 }
 
+// PR 3-UI: the single ObservableObject SwiftUI watches for the generic
+// (non-Anthropic) provider tiles. SwiftUI cannot observe a bare
+// `[ProviderBox]`; it needs one ObservableObject to subscribe to. This model
+// holds the boxes and re-broadcasts each box's objectWillChange, so any
+// provider state change redraws the popover. Anthropic is intentionally
+// excluded from `genericProviders` — it renders through usageManager as
+// before; this model only drives the additional providers.
+//
+// @MainActor because it reads and drives @MainActor providers (ProviderBox,
+// the stores). Every call site (AppDelegate lifecycle, timers on the main
+// runloop, the SwiftUI popover) is already on the main actor, so this adds
+// no friction. AppDelegate is annotated @MainActor to match, which AppKit
+// already guarantees at runtime.
+@MainActor
+final class ProvidersModel: ObservableObject {
+    let providers: [ProviderBox]
+    private var cancellables: [AnyCancellable] = []
+
+    init(providers: [ProviderBox]) {
+        self.providers = providers
+        for box in providers {
+            box.objectWillChange
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] _ in self?.objectWillChange.send() }
+                .store(in: &cancellables)
+        }
+    }
+
+    /// Providers rendered through the generic path — everything except
+    /// Anthropic, which keeps its bespoke rendering in UsageView.content.
+    /// `nonisolated` because `providers` is an immutable `let` and `id` is a
+    /// nonisolated stored property on ProviderBox — no main-actor state is
+    /// touched, so AppDelegate's timer/lifecycle closures can call it.
+    nonisolated var genericProviders: [ProviderBox] {
+        providers.filter { $0.id != "anthropic" }
+    }
+
+    /// The subset of generic providers the user has enabled via Settings.
+    /// Reads each provider's `isEnabled` through the `any UsageProvider`
+    /// existential, whose protocol is not @MainActor (the stores add it with
+    /// @preconcurrency), so this stays nonisolated.
+    nonisolated var enabledGenericProviders: [ProviderBox] {
+        genericProviders.filter { $0.provider.isEnabled }
+    }
+
+    /// Fetch every enabled non-Anthropic provider. Called on launch, on the
+    /// 60s timer, when the popover opens, and from the Refresh button — all
+    /// on the main thread in practice. `nonisolated` so those synchronous
+    /// call sites do not need per-site actor hops.
+    nonisolated func fetchEnabled() {
+        for box in enabledGenericProviders {
+            box.provider.fetch()
+        }
+    }
+
+    /// Force the popover to re-evaluate which provider sections are visible.
+    /// A Settings toggle writes the feature flag straight to UserDefaults,
+    /// which does not itself fire objectWillChange; the toggle calls this so
+    /// a section appears or disappears immediately on both transitions
+    /// (enabling a provider also fetches; disabling it has no other signal).
+    func providersChanged() {
+        objectWillChange.send()
+    }
+}
+
 private struct ContentHeightKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
@@ -1306,6 +1366,8 @@ struct UsageView: View {
     @ObservedObject var usageManager: UsageManager
     @ObservedObject var statusManager: StatusManager
     @ObservedObject var updateManager: UpdateManager
+    // PR 3-UI: drives the generic (non-Anthropic) provider tiles.
+    @ObservedObject var providersModel: ProvidersModel
     @State private var sessionCookieInput: String = ""
     @State private var showingCookieInput: Bool = false
     @State private var showingSettings: Bool = false
@@ -1537,6 +1599,15 @@ struct UsageView: View {
             }
             }
 
+            // PR 3-UI: generic (non-Anthropic) provider tiles. Each enabled
+            // provider contributes a section; Anthropic is rendered above via
+            // usageManager and is excluded here. Renders nothing when no such
+            // provider is enabled, so existing users see no change.
+            ForEach(providersModel.enabledGenericProviders) { box in
+                Divider()
+                ProviderSectionView(box: box)
+            }
+
             if statusManager.hasFetched {
                 Divider()
             }
@@ -1678,6 +1749,7 @@ struct UsageView: View {
                     usageManager.fetchUsage()
                     statusManager.fetch()
                     updateManager.fetch()
+                    providersModel.fetchEnabled()
                 }
                 .buttonStyle(.borderless)
                 .font(.caption)
@@ -1729,7 +1801,7 @@ struct UsageView: View {
 
                             HStack(spacing: 8) {
                                 Button("Save Cookie & Fetch") {
-                                    NSLog("ClaudeUsage: Save clicked, input length: \(sessionCookieInput.count)")
+                                    Log.info("ClaudeUsage: save clicked", .count(sessionCookieInput.count))
                                     if sessionCookieInput.isEmpty {
                                         usageManager.errorMessage = "Cookie field is empty!"
                                     } else {
@@ -1839,6 +1911,30 @@ struct UsageView: View {
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
+                    }
+
+                    Divider()
+
+                    // PR 3-UI: per-provider opt-in toggles. Each non-Anthropic
+                    // provider is off by default; enabling one writes its
+                    // featureFlagKey and triggers an immediate fetch.
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Providers")
+                            .font(.caption)
+                            .fontWeight(.semibold)
+                        Text("Track additional AI services. Each is opt-in; enable only the ones you use.")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        ForEach(providersModel.genericProviders) { box in
+                            ProviderToggleRow(box: box) { enabled in
+                                // Re-evaluate section visibility on both
+                                // transitions; fetch immediately on enable.
+                                if enabled { box.provider.fetch() }
+                                providersModel.providersChanged()
+                            }
+                        }
                     }
 
                     Divider()
@@ -2055,3 +2151,334 @@ struct UsageView: View {
     }
 
 }
+
+// MARK: - Generic provider rendering (PR 3-UI)
+
+/// Renders one non-Anthropic provider: a section header (display name +
+/// optional error / last-updated) followed by one UsageTileView per tile.
+/// Observes the box so provider state changes redraw this section.
+struct ProviderSectionView: View {
+    @ObservedObject var box: ProviderBox
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(box.provider.displayName)
+                    .font(.subheadline)
+                    .fontWeight(.semibold)
+                Spacer()
+                if let updated = box.provider.lastUpdated {
+                    Text("Updated \(shortTime(updated))")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+            }
+
+            if let error = box.provider.errorMessage {
+                Text(error)
+                    .font(.caption)
+                    .foregroundColor(.orange)
+            }
+
+            ForEach(box.provider.tiles) { tile in
+                UsageTileView(tile: tile)
+            }
+        }
+    }
+
+    private func shortTime(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.timeStyle = .short
+        f.dateStyle = .none
+        return f.string(from: date)
+    }
+}
+
+/// Renders a single UsageTile by switching on its Kind. This is the generic
+/// renderer every future provider reuses — adding a provider needs no new UI
+/// as long as it emits one of these kinds.
+struct UsageTileView: View {
+    let tile: UsageTile
+
+    var body: some View {
+        switch tile.kind {
+        case let .bar(fraction, resetsAt, badge):
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text(tile.title)
+                        .font(.caption)
+                    if let badge = badge, !badge.isEmpty {
+                        Text(badge)
+                            .font(.caption2)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(Color.secondary.opacity(0.2))
+                            .cornerRadius(3)
+                    }
+                    Spacer()
+                    if let resetsAt = resetsAt {
+                        Text("Resets \(resetLabel(resetsAt))")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                ProgressView(value: fraction)
+                    .tint(color(for: fraction))
+                Text("\(Int((fraction * 100).rounded()))% used")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+
+        case let .balance(remainingMinorUnits, currency, plan, resetsAt):
+            VStack(alignment: .leading, spacing: 2) {
+                HStack {
+                    Text(tile.title)
+                        .font(.caption)
+                    Spacer()
+                    Text(formatBalance(remainingMinorUnits, currency: currency))
+                        .font(.caption)
+                        .fontWeight(.semibold)
+                }
+                if let plan = plan, !plan.isEmpty {
+                    Text(plan)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+                if let resetsAt = resetsAt {
+                    Text("Resets \(resetLabel(resetsAt))")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+            }
+
+        case let .counter(used, limit, resetsAt):
+            VStack(alignment: .leading, spacing: 2) {
+                HStack {
+                    Text(tile.title)
+                        .font(.caption)
+                    Spacer()
+                    if let limit = limit {
+                        Text("\(used) / \(limit)")
+                            .font(.caption)
+                            .fontWeight(.semibold)
+                    } else {
+                        Text("\(used)")
+                            .font(.caption)
+                            .fontWeight(.semibold)
+                    }
+                }
+                if let resetsAt = resetsAt {
+                    Text("Resets \(resetLabel(resetsAt))")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+            }
+
+        case let .text(status, subtitle):
+            VStack(alignment: .leading, spacing: 2) {
+                HStack {
+                    Text(tile.title)
+                        .font(.caption)
+                    Spacer()
+                    Text(status)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                if let subtitle = subtitle, !subtitle.isEmpty {
+                    Text(subtitle)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+        case let .needsAccess(path, guidance):
+            VStack(alignment: .leading, spacing: 4) {
+                Text(tile.title)
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                Text(guidance)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(path)
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .padding(8)
+            .background(Color.secondary.opacity(0.1))
+            .cornerRadius(6)
+        }
+    }
+
+    private func color(for fraction: Double) -> Color {
+        if fraction < 0.7 { return .green }
+        if fraction < 0.9 { return .orange }
+        return .red
+    }
+
+    private func resetLabel(_ date: Date) -> String {
+        let f = DateFormatter()
+        // Include the date when the reset is more than ~a day out (weekly
+        // windows); otherwise just the time (5-hour windows).
+        if date.timeIntervalSinceNow > 86_400 {
+            f.dateFormat = "d MMM 'at' h:mm a"
+            return "on \(f.string(from: date))"
+        }
+        f.timeStyle = .short
+        f.dateStyle = .none
+        return "at \(f.string(from: date))"
+    }
+
+    private func formatBalance(_ minorUnits: Int, currency: String) -> String {
+        let major = Double(minorUnits) / 100.0
+        return String(format: "%@ %.2f", currency, major)
+    }
+}
+
+/// One opt-in checkbox for a non-Anthropic provider in Settings. Reads and
+/// writes the provider's featureFlagKey directly in UserDefaults; on enable
+/// it fires `onEnable` so the provider fetches immediately rather than
+/// waiting for the next timer tick. Below the toggle it shows provider-
+/// specific help and, where relevant, a private-API disclosure line.
+struct ProviderToggleRow: View {
+    @ObservedObject var box: ProviderBox
+    /// Called after the flag is written, with the new value, on every
+    /// toggle (both enable and disable).
+    let onChange: (Bool) -> Void
+
+    @State private var enabled: Bool = false
+    // Local buffer for a pasted secret (PasteKeyProvider). Never pre-filled
+    // with the stored secret — we only ever write, never read it back out.
+    @State private var keyInput: String = ""
+    @State private var hasStoredKey: Bool = false
+    // Secondary (gated, higher-privilege) key state — xAI's management key.
+    @State private var secondaryInput: String = ""
+    @State private var hasStoredSecondaryKey: Bool = false
+
+    /// The provider as a PasteKeyProvider, when it is configured by pasting a
+    /// secret; nil otherwise.
+    private var pasteKeyProvider: PasteKeyProvider? {
+        box.provider as? PasteKeyProvider
+    }
+
+    /// The provider as a SecondaryKeyProvider, when it accepts an optional
+    /// second (gated) key; nil otherwise.
+    private var secondaryKeyProvider: SecondaryKeyProvider? {
+        box.provider as? SecondaryKeyProvider
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Toggle(isOn: Binding(
+                get: { enabled },
+                set: { newValue in
+                    enabled = newValue
+                    UserDefaults.standard.set(newValue, forKey: box.provider.featureFlagKey)
+                    onChange(newValue)
+                }
+            )) {
+                Text(box.provider.displayName)
+                    .font(.caption)
+            }
+            .toggleStyle(.checkbox)
+
+            if let help = ProviderCopy.help(for: box.id) {
+                Text(help)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let disclosure = ProviderCopy.disclosure(for: box.id) {
+                Text(disclosure)
+                    .font(.caption2)
+                    .foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            // Key-entry affordance for paste-a-secret providers, shown only
+            // when the provider is enabled. Uses a SecureField so the pasted
+            // value is masked on screen; the stored secret is never read back
+            // into the field.
+            if enabled, let keyProvider = pasteKeyProvider {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        SecureField(keyProvider.keyPlaceholder, text: $keyInput)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.caption2)
+                        Button("Save") {
+                            keyProvider.saveKey(keyInput)
+                            keyInput = ""
+                            hasStoredKey = keyProvider.hasKey
+                            onChange(true)  // trigger a fetch now that a key exists
+                        }
+                        .controlSize(.small)
+                        .disabled(keyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                        if hasStoredKey {
+                            Button("Clear") {
+                                keyProvider.saveKey("")  // empty clears
+                                hasStoredKey = keyProvider.hasKey
+                                onChange(false)
+                            }
+                            .controlSize(.small)
+                        }
+                    }
+                    // Use the provider's declared noun ("Key" / "Cookie") so
+                    // the status line reflects what the user actually pasted.
+                    Text(hasStoredKey ? "\(keyProvider.secretKindNoun) saved in Keychain." : "No \(keyProvider.secretKindNoun.lowercased()) saved yet.")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+
+                    // Secondary (gated, higher-privilege) key. Shown only once
+                    // the primary key is stored, and only for providers that
+                    // accept one (xAI's management key). Carries an explicit
+                    // warning before the field.
+                    if hasStoredKey, let secondary = secondaryKeyProvider {
+                        Divider()
+                        Text(secondary.secondaryKeyLabel)
+                            .font(.caption2)
+                            .fontWeight(.semibold)
+                        Text(secondary.secondaryKeyWarning)
+                            .font(.caption2)
+                            .foregroundColor(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                        HStack(spacing: 6) {
+                            SecureField(secondary.secondaryKeyPlaceholder, text: $secondaryInput)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.caption2)
+                            Button("Save") {
+                                secondary.saveSecondaryKey(secondaryInput)
+                                secondaryInput = ""
+                                hasStoredSecondaryKey = secondary.hasSecondaryKey
+                                onChange(true)
+                            }
+                            .controlSize(.small)
+                            .disabled(secondaryInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                            if hasStoredSecondaryKey {
+                                Button("Clear") {
+                                    secondary.saveSecondaryKey("")
+                                    hasStoredSecondaryKey = secondary.hasSecondaryKey
+                                    onChange(true)
+                                }
+                                .controlSize(.small)
+                            }
+                        }
+                        Text(hasStoredSecondaryKey ? "Management key saved in Keychain." : "No management key saved.")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                }
+            }
+        }
+        .onAppear {
+            enabled = UserDefaults.standard.bool(forKey: box.provider.featureFlagKey)
+            hasStoredKey = pasteKeyProvider?.hasKey ?? false
+            hasStoredSecondaryKey = secondaryKeyProvider?.hasSecondaryKey ?? false
+        }
+    }
+}
+
