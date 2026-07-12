@@ -1114,6 +1114,195 @@ MainActor.assumeIsolated {
     defaults.removePersistentDomain(forName: suiteName)
 }
 
+// MARK: - XAIUsageFetcher (PR 6-BE)
+
+// GET /v1/api-key — flat snake_case object (verified against xAI docs).
+let fixtureXaiApiKey = #"""
+{
+  "redacted_api_key": "xai-****b14o",
+  "user_id": "user-123",
+  "name": "prod key",
+  "create_time": "2026-01-01T00:00:00Z",
+  "modify_time": "2026-01-02T00:00:00Z",
+  "team_id": "team-abc",
+  "api_key_id": "key-xyz",
+  "acls": ["api-key:model:*", "api-key:endpoint:*"]
+}
+"""#
+
+run("parse xAI api-key: team_id, acls, redacted key") {
+    let info = try! XAIUsageFetcher.parseApiKey(fixtureXaiApiKey.data(using: .utf8)!)
+    expectEqual(info.teamId, "team-abc")
+    expectEqual(info.acls.count, 2)
+    expectEqual(info.redactedKey, "xai-****b14o")
+    expectEqual(info.name, "prod key")
+}
+
+// GET /v1/language-models — models[] with token prices.
+let fixtureXaiModels = #"""
+{
+  "models": [
+    {"id": "grok-4.5", "prompt_text_token_price": 3000, "completion_text_token_price": 15000},
+    {"id": "grok-4.20", "prompt_text_token_price": 5000, "completion_text_token_price": 25000}
+  ]
+}
+"""#
+
+run("parse xAI language-models catalogue") {
+    let models = try! XAIUsageFetcher.parseLanguageModels(fixtureXaiModels.data(using: .utf8)!)
+    expectEqual(models.count, 2)
+    expectEqual(models[0].id, "grok-4.5")
+    expectEqual(models[0].promptTokenPrice, 3000)
+    expectEqual(models[1].completionTokenPrice, 25000)
+}
+
+run("parse xAI language-models tolerates data[] wrapper") {
+    let bytes = #"{"data": [{"id": "grok-4.5"}]}"#.data(using: .utf8)!
+    let models = try! XAIUsageFetcher.parseLanguageModels(bytes)
+    expectEqual(models.count, 1)
+    expectEqual(models[0].id, "grok-4.5")
+}
+
+// Prepaid balance — total.val is a STRING-encoded int64 in USD CENTS, and is
+// NEGATIVE when credit remains. Verified against xAI's OpenAPI schema.
+let fixtureXaiBalanceCredit = #"""
+{
+  "changes": [],
+  "total": { "val": "-12345" }
+}
+"""#
+
+run("parse xAI balance: negative cents = remaining credit") {
+    let balance = try! XAIUsageFetcher.parseBalance(fixtureXaiBalanceCredit.data(using: .utf8)!)
+    expectEqual(balance.totalValRaw, -12345)
+    // -12345 cents credit => 123.45 USD remaining.
+    expect(abs(balance.remainingUSD - 123.45) < 0.001)
+}
+
+run("parse xAI balance: zero or positive val = depleted (clamped to 0)") {
+    let zero = try! XAIUsageFetcher.parseBalance(#"{"total": {"val": "0"}}"#.data(using: .utf8)!)
+    expectEqual(zero.remainingUSD, 0.0)
+    let positive = try! XAIUsageFetcher.parseBalance(#"{"total": {"val": "500"}}"#.data(using: .utf8)!)
+    expectEqual(positive.remainingUSD, 0.0)   // no remaining prepaid credit
+}
+
+run("parse xAI balance throws when total.val missing") {
+    do {
+        _ = try XAIUsageFetcher.parseBalance(#"{"total": {}}"#.data(using: .utf8)!)
+        expect(false, "expected throw")
+    } catch { expect(true) }
+}
+
+run("parse xAI usage daily buckets (dollar and cents forms)") {
+    let bytes = #"""
+    {"usage": [
+      {"date": "2026-07-10", "usd": 1.50},
+      {"date": "2026-07-11", "usd_cents": 275}
+    ]}
+    """#.data(using: .utf8)!
+    let daily = try! XAIUsageFetcher.parseUsage(bytes)
+    expectEqual(daily.count, 2)
+    expect(abs(daily[0].usdSpent - 1.50) < 0.001)
+    expect(abs(daily[1].usdSpent - 2.75) < 0.001)  // 275 cents
+}
+
+run("parse xAI api-key throws on array top-level") {
+    do {
+        _ = try XAIUsageFetcher.parseApiKey("[]".data(using: .utf8)!)
+        expect(false, "expected throw")
+    } catch { expect(true) }
+}
+
+// MARK: - XAIUsageStore (in-memory credentials + stubbed transport)
+
+final class StubXAITransport: XAIUsageTransport, @unchecked Sendable {
+    let result: XAIUsageResult
+    init(_ result: XAIUsageResult) { self.result = result }
+    func fetchAll(inferenceKey: String, managementKey: String?, completion: @escaping @Sendable (XAIUsageResult) -> Void) {
+        completion(result)
+    }
+}
+
+MainActor.assumeIsolated {
+    let suiteName = "xai-tests-\(ProcessInfo.processInfo.processIdentifier)"
+    let defaults = UserDefaults(suiteName: suiteName)!
+    defaults.removePersistentDomain(forName: suiteName)
+    defaults.set(true, forKey: "features.xai.enabled")
+
+    run("xAI store off by default emits no tiles") {
+        let d2 = UserDefaults(suiteName: suiteName + "-off")!
+        d2.removePersistentDomain(forName: suiteName + "-off")
+        let store = XAIUsageStore(credentials: InMemoryCredentialStore(), transport: StubXAITransport(.networkError), defaults: d2)
+        expectEqual(store.isEnabled, false)
+        expectEqual(store.tiles.count, 0)
+    }
+
+    run("xAI enabled without inference key emits needsAccess card") {
+        let store = XAIUsageStore(credentials: InMemoryCredentialStore(), transport: StubXAITransport(.networkError), defaults: defaults)
+        expectEqual(store.isConfigured, false)
+        let tiles = store.tiles
+        expectEqual(tiles.count, 1)
+        if case .needsAccess = tiles.first?.kind { expect(true) }
+        else { expect(false, "expected needsAccess") }
+    }
+
+    run("xAI two-key management: hasInferenceKey and hasManagementKey") {
+        let creds = InMemoryCredentialStore()
+        let store = XAIUsageStore(credentials: creds, transport: StubXAITransport(.networkError), defaults: defaults)
+        expectEqual(store.hasInferenceKey, false)
+        expectEqual(store.hasManagementKey, false)
+        store.saveInferenceKey("xai-inference")
+        store.saveManagementKey("xai-mgmt-secret")
+        expectEqual(store.hasInferenceKey, true)
+        expectEqual(store.hasManagementKey, true)
+        expectEqual(store.isConfigured, true)
+    }
+
+    run("xAI Tier 1 only: plan tile, no balance tile") {
+        let store = XAIUsageStore(credentials: InMemoryCredentialStore(), transport: StubXAITransport(.networkError), defaults: defaults)
+        store.saveInferenceKey("xai-inference")
+        var snap = XAIUsageSnapshot()
+        snap.apiKeyInfo = XAIApiKeyInfo(teamId: "team-abc", acls: ["api-key:model:*"], redactedKey: "xai-****b14o")
+        store.apply(.success(snap))
+        let tiles = store.tiles
+        expect(tiles.contains { $0.id == "xai-plan" })
+        expect(!tiles.contains { $0.id == "xai-balance" })
+    }
+
+    run("xAI Tier 2: balance tile from negative-cents credit") {
+        let store = XAIUsageStore(credentials: InMemoryCredentialStore(), transport: StubXAITransport(.networkError), defaults: defaults)
+        store.saveInferenceKey("xai-inference")
+        var snap = XAIUsageSnapshot()
+        snap.apiKeyInfo = XAIApiKeyInfo(teamId: "team-abc")
+        snap.balance = XAIBalance(totalValRaw: -12345, currency: "USD")
+        store.apply(.success(snap))
+        let balanceTile = store.tiles.first { $0.id == "xai-balance" }
+        expect(balanceTile != nil)
+        if case let .balance(minor, currency, _, _) = balanceTile?.kind {
+            expectEqual(minor, 12345)   // 123.45 USD => 12345 minor units
+            expectEqual(currency, "USD")
+        } else { expect(false, "expected balance tile") }
+    }
+
+    run("xAI 401 maps to invalid-key error") {
+        let store = XAIUsageStore(credentials: InMemoryCredentialStore(), transport: StubXAITransport(.unauthorized), defaults: defaults)
+        store.saveInferenceKey("xai-bad")
+        store.fetch()
+        expectEqual(store.errorMessage, "Invalid xAI API key")
+    }
+
+    run("xAI clear deletes both keys") {
+        let creds = InMemoryCredentialStore()
+        let store = XAIUsageStore(credentials: creds, transport: StubXAITransport(.networkError), defaults: defaults)
+        store.saveInferenceKey("xai-i"); store.saveManagementKey("xai-mgmt-m")
+        store.clear()
+        expectEqual(store.hasInferenceKey, false)
+        expectEqual(store.hasManagementKey, false)
+    }
+
+    defaults.removePersistentDomain(forName: suiteName)
+}
+
 // MARK: - Summary
 
 print("")

@@ -75,7 +75,10 @@ let package = Package(
                 "DeepSeekUsageStore.swift",
                 // Zed: reads Zed's own Keychain item; same rationale.
                 "ZedUsageFetcher.swift",
-                "ZedUsageStore.swift"
+                "ZedUsageStore.swift",
+                // xAI Developer: two-key, two-host; same rationale.
+                "XAIUsageFetcher.swift",
+                "XAIUsageStore.swift"
                 // AnthropicUsageStore.swift depends on UsageManager
                 // (defined in ClaudeUsageBar.swift), so it stays in the
                 // app-bundle compile only, not in the SwiftPM library
