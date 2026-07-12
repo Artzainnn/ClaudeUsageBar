@@ -2152,6 +2152,49 @@ MainActor.assumeIsolated {
         }
     }
 
+    run("Perplexity plan tile omitted when only subscription_source is present (chk1 Bug #3)") {
+        // subscription_source is the BILLING PROVIDER, not a plan name.
+        // Rendering "Stripe (active)" as the Perplexity plan tile misleads
+        // the user about their account state. The fix omits the tile
+        // entirely when subscription_tier is absent.
+        let store = PerplexityUsageStore(credentials: InMemoryCredentialStore(), transport: StubPerplexityTransport(.networkError), defaults: defaults)
+        store.saveKey("cookie")
+        var snap = PerplexityUsageSnapshot()
+        snap.settings = PerplexityUserSettings(
+            subscriptionStatus: "active",
+            subscriptionSource: "stripe",
+            subscriptionTier: nil    // no tier reported
+        )
+        store.apply(.success(snap))
+        expect(!store.tiles.contains { $0.id == "perplexity-plan" })
+    }
+
+    run("Perplexity plan tile omitted when subscription_tier is 'none' or empty") {
+        // Additional coverage: "none" and "" should not slip through and
+        // render as unknown-tier plan labels either.
+        let store = PerplexityUsageStore(credentials: InMemoryCredentialStore(), transport: StubPerplexityTransport(.networkError), defaults: defaults)
+        store.saveKey("cookie")
+        for badTier in ["none", "  none  ", "", "   "] {
+            var snap = PerplexityUsageSnapshot()
+            snap.settings = PerplexityUserSettings(subscriptionTier: badTier)
+            store.apply(.success(snap))
+            expect(!store.tiles.contains { $0.id == "perplexity-plan" }, "expected no plan tile for '\(badTier)'")
+        }
+    }
+
+    run("Perplexity fetch() on a locked keychain surfaces an unlock message (chk1 Bug #2)") {
+        // UnavailableCredentialStore reports `.unavailable` for readResult,
+        // so hasKey is true (round-2 fix) but a bare read() returns nil.
+        // Before the chk1 Bug #2 fix, fetch() collapsed .unavailable into
+        // .missing and cleared lastError silently. Now it distinguishes.
+        let store = PerplexityUsageStore(credentials: UnavailableCredentialStore(), transport: StubPerplexityTransport(.networkError), defaults: defaults)
+        expectEqual(store.isConfigured, true)
+        store.fetch()
+        expect(store.errorMessage?.contains("Keychain") == true || store.errorMessage?.contains("Unlock") == true)
+        // Snapshot cleared, not stale-preserved.
+        expect(store.snapshot == nil)
+    }
+
     run("Perplexity credits tile carries USD cents + Max plan hint from large recurring grant") {
         let store = PerplexityUsageStore(credentials: InMemoryCredentialStore(), transport: StubPerplexityTransport(.networkError), defaults: defaults)
         store.saveKey("cookie")

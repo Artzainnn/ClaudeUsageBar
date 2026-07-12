@@ -116,9 +116,10 @@ public final class PerplexityUsageStore: @preconcurrency UsageProvider, PasteKey
 
         var out: [UsageTile] = []
 
-        // Plan tile from user/settings. Fall back to a plain "Perplexity" label
-        // when settings is absent (Cloudflare-challenged that endpoint).
-        if let settings = snap.settings, let tier = normalisedTier(settings.subscriptionTier, source: settings.subscriptionSource) {
+        // Plan tile from user/settings. Only rendered when we can name a
+        // plan tier — the tile is omitted when the settings endpoint was
+        // Cloudflare-challenged or only reported a billing source.
+        if let settings = snap.settings, let tier = normalisedTier(settings.subscriptionTier) {
             let statusLine = settings.subscriptionStatus.map { "\(tier) (\($0))" } ?? tier
             out.append(UsageTile(
                 id: "perplexity-plan",
@@ -202,23 +203,24 @@ public final class PerplexityUsageStore: @preconcurrency UsageProvider, PasteKey
         return out
     }
 
-    /// Normalise raw subscription strings into a human label. Preserves
+    /// Normalise a raw subscription-tier string into a human label. Preserves
     /// unknown values verbatim so a new tier introduced server-side is not
-    /// silently swallowed.
-    private func normalisedTier(_ rawTier: String?, source: String?) -> String? {
-        // Prefer subscription_tier when present; fall back to source name.
-        if let tier = rawTier?.trimmingCharacters(in: .whitespaces), !tier.isEmpty, tier.lowercased() != "none" {
-            switch tier.lowercased() {
-            case "free": return "Free"
-            case "pro": return "Pro"
-            case "max": return "Max"
-            default: return tier
-            }
+    /// silently swallowed. Returns nil when no tier is reported — the caller
+    /// omits the plan tile in that case rather than mislabelling it with a
+    /// billing-provider name (chk1 Bug #3: `subscription_source` values like
+    /// "stripe" / "revenuecat" are billing providers, NOT plans).
+    private func normalisedTier(_ rawTier: String?) -> String? {
+        guard let tier = rawTier?.trimmingCharacters(in: .whitespaces),
+              !tier.isEmpty,
+              tier.lowercased() != "none" else {
+            return nil
         }
-        if let src = source?.trimmingCharacters(in: .whitespaces), !src.isEmpty, src.lowercased() != "none" {
-            return src.capitalized
+        switch tier.lowercased() {
+        case "free": return "Free"
+        case "pro":  return "Pro"
+        case "max":  return "Max"
+        default:     return tier   // preserve an unknown tier verbatim
         }
-        return nil
     }
 
     // MARK: - Result application (testable seam)
@@ -261,13 +263,34 @@ public final class PerplexityUsageStore: @preconcurrency UsageProvider, PasteKey
 
     public func fetch() {
         guard isEnabled else { return }
-        guard let data = credentials.read(PerplexityUsageFetcher.cookieKeychainKey),
-              !data.isEmpty,
-              let raw = String(data: data, encoding: .utf8) else {
-            // No credential in the store (or locked keychain returning nil
-            // read here). Onboarding card renders via isConfigured=false.
+        // Use readResult() rather than read() so a locked keychain
+        // (.unavailable) is distinguished from a truly-missing item. Round-2
+        // review addressed the malformed-cookie case; this closes the same
+        // silent-no-op gap for the locked-keychain scenario — isConfigured
+        // still returns true when the item exists but is unreadable, so
+        // without an explicit branch here the UI would report the provider
+        // as configured while fetch quietly did nothing (chk1 Bug #2).
+        let data: Data
+        switch credentials.readResult(PerplexityUsageFetcher.cookieKeychainKey) {
+        case .found(let value) where !value.isEmpty:
+            data = value
+        case .found, .missing:
+            // No credential stored (or empty item — treat as missing).
+            // Onboarding card renders via isConfigured=false.
             snapshot = nil
             lastError = nil
+            return
+        case .unavailable:
+            // Keychain present but temporarily unreadable (locked screen,
+            // access denied). Surface an actionable message so the tile
+            // does not silently blank while the user's Mac is locked.
+            snapshot = nil
+            lastError = "Keychain locked or unavailable. Unlock your Mac to refresh Perplexity usage."
+            return
+        }
+        guard let raw = String(data: data, encoding: .utf8) else {
+            snapshot = nil
+            lastError = "Could not decode the stored Perplexity cookie. Re-paste it in Settings."
             return
         }
         guard let cookie = PerplexityCookie.extract(from: raw) else {
@@ -335,6 +358,32 @@ public struct URLSessionPerplexityTransport: PerplexityUsageTransport {
     /// it is the shape Perplexity's own web bundle sends.
     private let userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " +
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
+
+    /// Private URLSession, isolated from `URLSession.shared` (chk1 Risk #1
+    /// + #2). Two problems the shared session has for a cookie-authenticated
+    /// provider:
+    ///   1. The default `HTTPCookieStorage` is disk-backed under
+    ///      ~/Library/Cookies/. Perplexity sets several cookies on every
+    ///      response (`__cf_bm`, `cf_clearance`, session tokens); with the
+    ///      shared session those would silently persist across app launches
+    ///      in a store the user cannot see, and would leak onto every other
+    ///      request the app makes to perplexity.ai (including Anthropic's
+    ///      tracker if that ever traversed the domain).
+    ///   2. `URLSessionConfiguration.default.timeoutIntervalForResource` is
+    ///      604 800 seconds (7 days). A stalled Perplexity response would
+    ///      park its callback for a week.
+    /// Our explicit `Cookie:` header is the ONLY source of session state for
+    /// this transport; the response cookie jar is nulled so nothing sticks.
+    /// Timeouts are matched to the 60s poll cadence.
+    private let session: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.httpShouldSetCookies = false
+        config.httpCookieAcceptPolicy = .never
+        config.httpCookieStorage = nil
+        config.timeoutIntervalForRequest = 15
+        config.timeoutIntervalForResource = 30
+        return URLSession(configuration: config)
+    }()
 
     public init() {}
 
@@ -443,7 +492,10 @@ public struct URLSessionPerplexityTransport: PerplexityUsageTransport {
         request.setValue("https://www.perplexity.ai/account/usage", forHTTPHeaderField: "Referer")
         request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
 
-        URLSession.shared.dataTask(with: request) { data, response, error in
+        // Private session (see the `session` property comment) — critical
+        // that this is NOT URLSession.shared, so Perplexity's Set-Cookie
+        // responses cannot contaminate the process-wide cookie jar.
+        session.dataTask(with: request) { data, response, error in
             if error != nil { done(nil, nil); return }
             let status = (response as? HTTPURLResponse)?.statusCode
             Log.info("Perplexity API response", .count(status ?? -1))
