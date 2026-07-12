@@ -59,6 +59,9 @@ swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_arm64" \
     PerplexityUsageStore.swift \
     CopilotUsageFetcher.swift \
     CopilotUsageStore.swift \
+    FileWatcher.swift \
+    SQLiteReader.swift \
+    TCCState.swift \
     -framework SwiftUI \
     -framework AppKit \
     -framework WebKit \
@@ -85,6 +88,9 @@ swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_x86_64" \
     PerplexityUsageStore.swift \
     CopilotUsageFetcher.swift \
     CopilotUsageStore.swift \
+    FileWatcher.swift \
+    SQLiteReader.swift \
+    TCCState.swift \
     -framework SwiftUI \
     -framework AppKit \
     -framework WebKit \

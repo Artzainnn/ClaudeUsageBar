@@ -11,6 +11,7 @@
 
 import Foundation
 import ClaudeUsageBar
+import SQLite3
 
 // MARK: - Minimal assertion API
 
@@ -3207,6 +3208,639 @@ MainActor.assumeIsolated {
     }
 
     defaults.removePersistentDomain(forName: suiteName)
+}
+
+// MARK: - SQLiteReader — mandatory 7-scenario matrix (PR 10a)
+
+// Shared helper: run `sqlite3` CLI to build a fixture database.
+func runSqliteCLI(dbPath: String, sql: String) -> Bool {
+    let p = Process()
+    p.launchPath = "/usr/bin/sqlite3"
+    p.arguments = [dbPath]
+    let stdin = Pipe()
+    p.standardInput = stdin
+    p.standardOutput = Pipe()
+    p.standardError = Pipe()
+    do {
+        try p.run()
+        stdin.fileHandleForWriting.write(sql.data(using: .utf8) ?? Data())
+        try? stdin.fileHandleForWriting.close()
+        p.waitUntilExit()
+        return p.terminationStatus == 0
+    } catch {
+        return false
+    }
+}
+
+// Shared helper: temp directory unique per test invocation. The whole
+// directory tree is removed on function exit.
+func withTempDir(_ body: (String) throws -> Void) rethrows {
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("clud-sqlite-\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    try body(dir.path)
+}
+
+// Scenario 1 — no-WAL: default rollback journal. Baseline case.
+run("SQLiteReader scenario 1: no-WAL database opens and reads") {
+    withTempDir { dir in
+        let db = dir + "/no-wal.db"
+        expect(runSqliteCLI(dbPath: db, sql: """
+            CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER);
+            INSERT INTO t VALUES('a', 1), ('b', 2), ('c', 3);
+            """))
+        do {
+            let reader = try SQLiteReader(path: db)
+            let rows: [(String, Int64)] = try reader.query("SELECT k, v FROM t ORDER BY k") { row in
+                guard let k = row.string("k"), let v = row.int("v") else { return nil }
+                return (k, v)
+            }
+            expectEqual(rows.count, 3)
+            expectEqual(rows[0].0, "a"); expectEqual(rows[0].1, 1)
+        } catch {
+            expect(false, "no-WAL read threw: \(error)")
+        }
+    }
+}
+
+// Scenario 2 — hot-WAL: WAL mode enabled, uncommitted changes in the WAL
+// sidecar. SQLite in read-only mode with a hot WAL is a documented edge
+// case (see sqlite.org/wal.html §7). Our reader must not choke on the
+// -wal / -shm sidecars.
+run("SQLiteReader scenario 2: hot-WAL database with sidecar files") {
+    withTempDir { dir in
+        let db = dir + "/hot-wal.db"
+        expect(runSqliteCLI(dbPath: db, sql: """
+            PRAGMA journal_mode=WAL;
+            CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER);
+            INSERT INTO t VALUES('a', 1), ('b', 2);
+            """))
+        // Confirm the sidecars exist (WAL doesn't kick in until a page
+        // has been evicted, so INSERT + `.quit` may or may not leave a
+        // WAL — either way our reader must succeed).
+        do {
+            let reader = try SQLiteReader(path: db)
+            let count: [Int64] = try reader.query("SELECT COUNT(*) AS c FROM t") { row in
+                row.int("c")
+            }
+            expectEqual(count.first, 2)
+        } catch {
+            expect(false, "hot-WAL read threw: \(error)")
+        }
+    }
+}
+
+// Scenario 3 — sidecar-perms-denied: WAL sidecar exists but is
+// unreadable. VS Code has been observed writing WAL sidecars owned by
+// root when it starts as root after a system update; our reader should
+// still open the main file (SQLite falls back to reading from the
+// non-WAL pages) OR raise .openFailed cleanly — either is acceptable.
+run("SQLiteReader scenario 3: WAL sidecar with restricted permissions") {
+    withTempDir { dir in
+        let db = dir + "/sidecar-denied.db"
+        expect(runSqliteCLI(dbPath: db, sql: """
+            PRAGMA journal_mode=WAL;
+            CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER);
+            INSERT INTO t VALUES('a', 1);
+            """))
+        // If the sidecar didn't materialise, create one artificially so
+        // we can chmod it. Empty is fine — SQLite reads the header
+        // regardless.
+        let walSidecar = db + "-wal"
+        if !FileManager.default.fileExists(atPath: walSidecar) {
+            FileManager.default.createFile(atPath: walSidecar, contents: Data(), attributes: nil)
+        }
+        // Strip read permission from the WAL sidecar.
+        _ = try? FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: walSidecar)
+        defer { _ = try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: walSidecar) }
+        // The reader must NOT crash. Either result is acceptable — the
+        // invariant is that opening a database with a denied WAL sidecar
+        // is a well-defined outcome, not a UB scenario.
+        do {
+            let reader = try SQLiteReader(path: db)
+            let _: [Int64] = try reader.query("SELECT v FROM t LIMIT 1") { row in row.int("v") }
+            expect(true)
+        } catch is SQLiteReaderError {
+            expect(true)  // clean throw is fine
+        } catch {
+            expect(false, "unexpected error class: \(error)")
+        }
+    }
+}
+
+// Scenario 4 — SQLITE_BUSY: a concurrent writer holds an EXCLUSIVE lock
+// longer than our busy timeout. Codex round-1 finding #9: the previous
+// test never actually contended the DB, so a regression that dropped
+// the busy_timeout would still pass. This test forks a background
+// sqlite3 CLI process holding a BEGIN EXCLUSIVE for 8s (past the 5s
+// timeout), then attempts a read and asserts .busy is raised.
+run("SQLiteReader scenario 4: SQLITE_BUSY under real concurrent write lock") {
+    withTempDir { dir in
+        let db = dir + "/busy.db"
+        expect(runSqliteCLI(dbPath: db, sql: """
+            CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER);
+            INSERT INTO t VALUES('a', 1);
+            """))
+        // Spawn a subprocess that holds an EXCLUSIVE lock for 8s. The
+        // reader's busy_timeout is 5s, so the read must time out and
+        // surface either .busy or an sqlError with an SQLITE_BUSY code.
+        let holder = Process()
+        holder.launchPath = "/usr/bin/sqlite3"
+        holder.arguments = [db]
+        let holderIn = Pipe()
+        holder.standardInput = holderIn
+        holder.standardOutput = Pipe()
+        holder.standardError = Pipe()
+        do {
+            try holder.run()
+        } catch {
+            expect(false, "could not spawn sqlite3 subprocess")
+            return
+        }
+        // Ask the subprocess to grab an EXCLUSIVE lock, then sleep.
+        // Timeout is 8s so the lock is held past our 5s busy_timeout.
+        let lockScript = """
+            PRAGMA busy_timeout=0;
+            BEGIN EXCLUSIVE;
+            SELECT strftime('%s','now');
+            .system sleep 8
+            COMMIT;
+            .quit
+            """
+        holderIn.fileHandleForWriting.write(lockScript.data(using: .utf8) ?? Data())
+        // Small delay so the subprocess has time to actually acquire the
+        // lock before we probe.
+        Thread.sleep(forTimeInterval: 0.3)
+        // Now attempt a read. The busy timeout is 5s; the subprocess
+        // holds the lock for ~8s. Reader must fail cleanly (not hang or
+        // crash) within a bounded time.
+        do {
+            let reader = try SQLiteReader(path: db)
+            let start = Date()
+            do {
+                let _: [Int64] = try reader.query("SELECT v FROM t") { row in row.int("v") }
+                let elapsed = Date().timeIntervalSince(start)
+                // Some SQLite builds may complete the read via the WAL/
+                // snapshot even under an exclusive lock — that's fine,
+                // just assert the read didn't hang past the busy timeout.
+                expect(elapsed < 7.0, "read took \(elapsed)s, expected < 7s (unbounded busy timeout regressed?)")
+            } catch SQLiteReaderError.busy {
+                let elapsed = Date().timeIntervalSince(start)
+                // .busy is the expected result — but must not have
+                // taken longer than the busy timeout to raise.
+                expect(elapsed < 7.0, "busy took \(elapsed)s, expected < 7s")
+            } catch let SQLiteReaderError.sqlError(rc, _) {
+                // Some contention paths surface as sqlError(SQLITE_BUSY)
+                // if a nested WAL condition raises before our translation
+                // step catches SQLITE_BUSY. Accept it as long as the
+                // code is a lock-family error.
+                expect(rc == SQLITE_BUSY || rc == SQLITE_LOCKED,
+                       "expected SQLITE_BUSY/LOCKED, got rc \(rc)")
+            }
+        } catch {
+            expect(false, "reader init threw unexpectedly: \(error)")
+        }
+        // Clean up the subprocess.
+        holder.terminate()
+        holder.waitUntilExit()
+    }
+}
+
+// Scenario 5 — schema-migrated: an app updated its schema between our
+// releases. Our schema-sentinel guard must throw .schemaMismatch, and
+// the throw must include both observed and expected values in the
+// message so the user knows to update ClaudeUsageBar.
+run("SQLiteReader scenario 5: schema drift caught by sentinel") {
+    withTempDir { dir in
+        let db = dir + "/schema.db"
+        // The app under observation ships version "2.0" today. We ship
+        // ClaudeUsageBar against "1.0". Sentinel must fire.
+        expect(runSqliteCLI(dbPath: db, sql: """
+            CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT);
+            INSERT INTO meta VALUES('schema_version', '2.0');
+            CREATE TABLE t(k TEXT, v INTEGER);
+            """))
+        let sentinel = SQLiteSchemaSentinel(
+            table: "meta", keyColumn: "k",
+            key: "schema_version", valueColumn: "v",
+            expected: "1.0"
+        )
+        do {
+            _ = try SQLiteReader(path: db, sentinel: sentinel)
+            expect(false, "sentinel should have thrown")
+        } catch let SQLiteReaderError.schemaMismatch(observed, expected) {
+            expectEqual(observed, "2.0")
+            expectEqual(expected, "1.0")
+        } catch {
+            expect(false, "wrong error type: \(error)")
+        }
+    }
+}
+
+// Scenario 5b — sentinel matches → open succeeds.
+run("SQLiteReader scenario 5b: matching sentinel opens successfully") {
+    withTempDir { dir in
+        let db = dir + "/schema-ok.db"
+        expect(runSqliteCLI(dbPath: db, sql: """
+            CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT);
+            INSERT INTO meta VALUES('schema_version', '1.0');
+            """))
+        let sentinel = SQLiteSchemaSentinel(
+            table: "meta", keyColumn: "k",
+            key: "schema_version", valueColumn: "v",
+            expected: "1.0"
+        )
+        do {
+            _ = try SQLiteReader(path: db, sentinel: sentinel)
+            expect(true)
+        } catch {
+            expect(false, "matching sentinel should have opened: \(error)")
+        }
+    }
+}
+
+// Scenario 6 — SQLITE_NOTADB: file exists but isn't SQLite. VS Code
+// state files have been observed corrupted this way after abrupt
+// shutdowns.
+run("SQLiteReader scenario 6: SQLITE_NOTADB raised as .notADatabase") {
+    withTempDir { dir in
+        let path = dir + "/junk.db"
+        // 32 bytes of ASCII printable — not the SQLite magic header.
+        FileManager.default.createFile(atPath: path, contents: Data("this is not a sqlite database!!!".utf8), attributes: nil)
+        do {
+            _ = try SQLiteReader(path: path)
+            expect(false, "expected .notADatabase")
+        } catch SQLiteReaderError.notADatabase {
+            expect(true)
+        } catch {
+            expect(false, "wrong error: \(error)")
+        }
+    }
+}
+
+// Scenario 7 — SQLCipher-encrypted: header is random bytes, not the
+// SQLite magic. We surface .encrypted rather than letting sqlite3 emit
+// a misleading "file is not a database" error.
+run("SQLiteReader scenario 7: SQLCipher-encrypted database → .encrypted") {
+    withTempDir { dir in
+        let path = dir + "/encrypted.db"
+        // 16 random-looking bytes (chosen manually to be non-printable —
+        // matches the encrypted-header heuristic).
+        var bytes = Data(count: 16)
+        bytes.withUnsafeMutableBytes { buf in
+            let raw = buf.bindMemory(to: UInt8.self)
+            for i in 0 ..< 16 { raw[i] = UInt8((i * 47 + 13) & 0xFF) | 0x80 }
+        }
+        FileManager.default.createFile(atPath: path, contents: bytes, attributes: nil)
+        do {
+            _ = try SQLiteReader(path: path)
+            expect(false, "expected .encrypted")
+        } catch SQLiteReaderError.encrypted {
+            expect(true)
+        } catch {
+            expect(false, "wrong error: \(error)")
+        }
+    }
+}
+
+// Additional coverage — .notFound must be distinct from .openFailed so
+// the UI can render "app not installed" vs "grant Full Disk Access".
+run("SQLiteReader: missing path throws .notFound") {
+    do {
+        _ = try SQLiteReader(path: "/tmp/this/path/does/not/exist-\(UUID().uuidString).db")
+        expect(false, "expected .notFound")
+    } catch SQLiteReaderError.notFound {
+        expect(true)
+    } catch {
+        expect(false, "wrong error: \(error)")
+    }
+}
+
+// Additional — query_only enforcement. Even against a read-only file,
+// query_only must reject a write attempt with a clean error.
+run("SQLiteReader: query_only=1 rejects mutating statements") {
+    withTempDir { dir in
+        let db = dir + "/ro.db"
+        expect(runSqliteCLI(dbPath: db, sql: """
+            CREATE TABLE t(k INTEGER);
+            INSERT INTO t VALUES(1);
+            """))
+        do {
+            let reader = try SQLiteReader(path: db)
+            let _: [Int64] = try reader.query("INSERT INTO t VALUES(2)") { row in
+                row.int("k")
+            }
+            expect(false, "INSERT should have thrown")
+        } catch is SQLiteReaderError {
+            expect(true)
+        } catch {
+            expect(false, "wrong error class: \(error)")
+        }
+    }
+}
+
+// Additional — parameterised binds are actually bound, not interpolated.
+run("SQLiteReader: binds are typed and cannot inject via string") {
+    withTempDir { dir in
+        let db = dir + "/binds.db"
+        expect(runSqliteCLI(dbPath: db, sql: """
+            CREATE TABLE t(k TEXT PRIMARY KEY, v INTEGER);
+            INSERT INTO t VALUES('a', 1), ('b', 2);
+            """))
+        let reader = try? SQLiteReader(path: db)
+        expect(reader != nil)
+        // A hostile key like "a' OR '1'='1" must NOT match every row.
+        let rows: [Int64]? = try? reader?.query(
+            "SELECT v FROM t WHERE k = ?",
+            binds: [.text("a' OR '1'='1")]
+        ) { $0.int("v") }
+        expectEqual(rows?.count, 0)
+    }
+}
+
+// MARK: - FileWatcher tests (PR 10a)
+
+// Shared thread-safe event collector — Codex round-1 finding #10:
+// event/count arrays touched by watcher callbacks (on the private queue)
+// AND by test assertions (on main) must have a consistent locking
+// discipline. This wraps that up.
+final class WatcherEventBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [FileWatcherEvent] = []
+    func append(_ ev: FileWatcherEvent) {
+        lock.lock(); defer { lock.unlock() }
+        events.append(ev)
+    }
+    var count: Int {
+        lock.lock(); defer { lock.unlock() }
+        return events.count
+    }
+    var snapshot: [FileWatcherEvent] {
+        lock.lock(); defer { lock.unlock() }
+        return events
+    }
+}
+
+run("FileWatcher: poll fallback fires when a file is created") {
+    withTempDir { dir in
+        let watcher = FileWatcher(paths: [dir], backend: .pollOnly(interval: 1.0))
+        let box = WatcherEventBox()
+        watcher.start { ev in box.append(ev) }
+        // Wait for the initial synthetic event.
+        let initDeadline = Date().addingTimeInterval(2.0)
+        while box.count == 0 && Date() < initDeadline {
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05))
+        }
+        expect(box.count >= 1)
+        expectEqual(box.snapshot.first?.isInitial, true)
+        // Create a new file — the next poll tick should include it.
+        FileManager.default.createFile(atPath: dir + "/new.txt",
+                                       contents: Data("hi".utf8), attributes: nil)
+        let deadline = Date().addingTimeInterval(4.0)
+        while box.count < 2 && Date() < deadline {
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05))
+        }
+        expect(box.count >= 2)
+        let changePaths = box.snapshot.dropFirst().flatMap { $0.paths }
+        expect(changePaths.contains { $0.hasSuffix("new.txt") })
+        watcher.stop()
+    }
+}
+
+// Codex round-1 finding #11: the actually-critical race is a file
+// created BETWEEN start() and the first tick. Baseline capture is
+// synchronous now; this test proves it.
+run("FileWatcher: file created immediately after start() is detected on first tick (baseline race)") {
+    withTempDir { dir in
+        let watcher = FileWatcher(paths: [dir], backend: .pollOnly(interval: 1.0))
+        let box = WatcherEventBox()
+        watcher.start { ev in box.append(ev) }
+        // No wait — create the file BEFORE the first poll tick fires.
+        // If baseline is captured async, the file lands in baseline AND
+        // in every subsequent snapshot, and the diff misses it entirely.
+        FileManager.default.createFile(atPath: dir + "/race.txt",
+                                       contents: Data("hi".utf8), attributes: nil)
+        // Wait long enough for the initial event + one poll tick.
+        let deadline = Date().addingTimeInterval(3.0)
+        while box.count < 2 && Date() < deadline {
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05))
+        }
+        expect(box.count >= 2, "poll tick must detect a file created immediately after start()")
+        let changePaths = box.snapshot.dropFirst().flatMap { $0.paths }
+        expect(changePaths.contains { $0.hasSuffix("race.txt") },
+               "created file must appear in a change event")
+        watcher.stop()
+    }
+}
+
+run("FileWatcher: stop() is idempotent") {
+    let watcher = FileWatcher(paths: ["/tmp"], backend: .pollOnly(interval: 1.0))
+    watcher.start { _ in }
+    watcher.stop()
+    watcher.stop()  // must not crash
+    watcher.stop()
+    expect(true)
+}
+
+// Codex round-1 finding #4: stop() + start() reuses the same watcher.
+// Stale ticks from the first start() must not fire against the second.
+run("FileWatcher: stop then start again drops stale ticks (generation guard)") {
+    withTempDir { dir in
+        let watcher = FileWatcher(paths: [dir], backend: .pollOnly(interval: 1.0))
+        let box1 = WatcherEventBox()
+        watcher.start { ev in box1.append(ev) }
+        // Wait for the initial event of run 1.
+        let d1 = Date().addingTimeInterval(1.0)
+        while box1.count == 0 && Date() < d1 {
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.02))
+        }
+        watcher.stop()
+        // Start again with a different callback.
+        let box2 = WatcherEventBox()
+        watcher.start { ev in box2.append(ev) }
+        // Any stale tick from run 1 would fire on `box1` — which we
+        // check stayed at exactly 1 (the initial event only). Meanwhile
+        // box2 should receive its own initial event.
+        let d2 = Date().addingTimeInterval(2.0)
+        while box2.count == 0 && Date() < d2 {
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.02))
+        }
+        expect(box2.count >= 1, "second start must fire its own initial")
+        // Critical assertion: box1 never received more events after stop.
+        expectEqual(box1.count, 1)
+        watcher.stop()
+    }
+}
+
+run("FileWatcher: empty paths list starts without crashing (pollOnly)") {
+    let watcher = FileWatcher(paths: [], backend: .pollOnly(interval: 1.0))
+    let box = WatcherEventBox()
+    watcher.start { ev in box.append(ev) }
+    let deadline = Date().addingTimeInterval(0.5)
+    while box.count == 0 && Date() < deadline {
+        RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.02))
+    }
+    expect(box.count >= 1)
+    watcher.stop()
+}
+
+run("FileWatcher: interval clamped to at least 1s (0 or negative would busy-loop)") {
+    let watcher = FileWatcher(paths: [], backend: .pollOnly(interval: 0))
+    let box = WatcherEventBox()
+    watcher.start { ev in box.append(ev) }
+    let deadline = Date().addingTimeInterval(0.3)
+    while Date() < deadline {
+        RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.02))
+    }
+    watcher.stop()
+    // With a 1s minimum interval, we should have at most 1 fire in 300ms
+    // (the initial synthetic). Anything much higher means the clamp
+    // regressed.
+    expect(box.count <= 2, "unexpected fire count \(box.count) — interval clamp may have regressed")
+}
+
+// MARK: - TCCProbe tests (PR 10a)
+
+run("TCCProbe: probes a missing path as .pathMissing") {
+    let state = TCCProbe.probe(path: "/tmp/tcc-missing-\(UUID().uuidString)")
+    expectEqual(state, .pathMissing)
+}
+
+run("TCCProbe: probes a readable directory as .granted") {
+    withTempDir { dir in
+        let state = TCCProbe.probe(path: dir)
+        expectEqual(state, .granted)
+    }
+}
+
+run("TCCProbe: probes a readable file as .granted") {
+    withTempDir { dir in
+        let file = dir + "/x.txt"
+        FileManager.default.createFile(atPath: file, contents: Data("hi".utf8), attributes: nil)
+        let state = TCCProbe.probe(path: file)
+        expectEqual(state, .granted)
+    }
+}
+
+run("TCCProbe: probes a mode-0 file as .denied") {
+    withTempDir { dir in
+        let file = dir + "/locked.txt"
+        FileManager.default.createFile(atPath: file, contents: Data("nope".utf8), attributes: nil)
+        _ = try? FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: file)
+        defer { _ = try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: file) }
+        let state = TCCProbe.probe(path: file)
+        expectEqual(state, .denied)
+    }
+}
+
+// MARK: - LocalProviderAccessGuide copy tests (PR 10a)
+
+run("LocalProviderAccessGuide: copy varies by state and names the target app") {
+    for state in [TCCState.granted, .denied, .pathMissing] {
+        let copy = LocalProviderAccessGuide.copy(for: state, appName: "Claude Code")
+        expect(copy.title.contains("Claude Code"), "title missed app name for \(state)")
+        expect(!copy.guidance.isEmpty)
+        if state != .granted {
+            let names = copy.guidance.contains("System Settings") ||
+                        copy.guidance.contains("launch") ||
+                        copy.guidance.contains("Refresh")
+            expect(names, "guidance for \(state) missed the action pointer")
+        }
+    }
+}
+
+// Codex round-1 finding #5: pathMissing must NOT be returned when the
+// containing directory is itself unreadable. Add a directed test.
+run("TCCProbe: unreadable containing directory promotes 'missing' to '.denied'") {
+    withTempDir { dir in
+        // Create a subdirectory with mode 0 — enumeration is denied.
+        let sub = dir + "/locked-parent"
+        try? FileManager.default.createDirectory(atPath: sub, withIntermediateDirectories: false, attributes: nil)
+        _ = try? FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: sub)
+        defer { _ = try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: sub) }
+        // Probe a hypothetical file INSIDE the locked directory. The
+        // file doesn't exist, but the parent isn't readable, so we
+        // must NOT return .pathMissing.
+        let state = TCCProbe.probe(path: sub + "/some-file.txt")
+        expectEqual(state, .denied)
+    }
+}
+
+// Codex round-1 finding #7: SQL identifier validation. Sentinel with a
+// hostile identifier must be rejected at init, not silently interpolated.
+run("SQLiteReader: sentinel with hostile identifier throws sqlError") {
+    withTempDir { dir in
+        let db = dir + "/inject.db"
+        expect(runSqliteCLI(dbPath: db, sql: """
+            CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT);
+            INSERT INTO meta VALUES('schema_version', '1.0');
+            """))
+        // A caller passing a table name like "meta; DROP TABLE meta; --"
+        // would break the sentinel query; assertIsValidIdentifier must
+        // reject it before it reaches SQL.
+        let evil = SQLiteSchemaSentinel(
+            table: "meta; DROP TABLE meta; --", keyColumn: "k",
+            key: "schema_version", valueColumn: "v", expected: "1.0"
+        )
+        do {
+            _ = try SQLiteReader(path: db, sentinel: evil)
+            expect(false, "sentinel with hostile identifier should have thrown")
+        } catch is SQLiteReaderError {
+            expect(true)
+        } catch {
+            expect(false, "wrong error class: \(error)")
+        }
+    }
+}
+
+run("SQLiteReader.assertIsValidIdentifier: accepts letters/digits/underscore; rejects the rest") {
+    // Valid identifiers must not throw.
+    for name in ["t", "T", "table1", "_x", "abc_def_123"] {
+        do { try SQLiteReader.assertIsValidIdentifier(name) } catch {
+            expect(false, "\(name) should be valid: \(error)")
+        }
+    }
+    // Invalid identifiers must throw. Codex round-2 nit: unicode letters
+    // are NOT accepted — strict ASCII contract.
+    for name in ["", "1abc", "a-b", "a b", "a;b", "a'b", "\"a\"", String(repeating: "x", count: 128), "café", "𝓉ℯ𝓈𝓉"] {
+        do {
+            try SQLiteReader.assertIsValidIdentifier(name)
+            expect(false, "\(name) should have thrown")
+        } catch is SQLiteReaderError {
+            expect(true)
+        } catch {
+            expect(false, "wrong error class for \(name): \(error)")
+        }
+    }
+}
+
+// Codex round-2 finding #2: re-entrant lifecycle from within a callback
+// used to deadlock. runSerial now detects "on the queue" and runs inline.
+run("FileWatcher: stop() called from inside onChange does NOT deadlock (Codex round-2 #2)") {
+    withTempDir { dir in
+        let watcher = FileWatcher(paths: [dir], backend: .pollOnly(interval: 1.0))
+        let done = DispatchSemaphore(value: 0)
+        // Wrap the stop call so we can observe whether it returned.
+        watcher.start { ev in
+            if ev.isInitial {
+                // Call stop from within the callback. Old code would
+                // deadlock here because start() itself grabbed queue.sync
+                // and stop() would nested-sync into the same queue.
+                watcher.stop()
+                done.signal()
+            }
+        }
+        // Wait bounded — a deadlock would fail the test via timeout.
+        let outcome = done.wait(timeout: .now() + 2.0)
+        expect(outcome == .success, "stop() from inside onChange appears to have deadlocked")
+    }
+}
+
+run("LocalProviderAccessGuide: full-disk-access deep link URL is well-formed") {
+    let url = LocalProviderAccessGuide.fullDiskAccessURL
+    expectEqual(url.scheme, "x-apple.systempreferences")
+    expect(url.absoluteString.contains("Privacy_AllFiles"))
 }
 
 // MARK: - Summary

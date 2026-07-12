@@ -88,7 +88,12 @@ let package = Package(
                 // GitHub Copilot: fine-grained PAT in Keychain, /user +
                 // /users/{login}/settings/billing/ai_credit/usage.
                 "CopilotUsageFetcher.swift",
-                "CopilotUsageStore.swift"
+                "CopilotUsageStore.swift",
+                // PR 10a — shared local-provider infrastructure. Consumed
+                // by every local-file provider from PR 10b onward.
+                "FileWatcher.swift",
+                "SQLiteReader.swift",
+                "TCCState.swift"
                 // AnthropicUsageStore.swift depends on UsageManager
                 // (defined in ClaudeUsageBar.swift), so it stays in the
                 // app-bundle compile only, not in the SwiftPM library
