@@ -220,6 +220,32 @@ public final class ClineUsageStore: @preconcurrency UsageProvider {
             ))
         }
 
+        // 3cc round-1 finding #2: surface file-level parse failures.
+        // Without this, a corrupt / over-cap / permission-denied
+        // ui_messages.json is silently skipped and the tile shows the
+        // remaining totals as complete — the user has no way to know
+        // some sessions are missing. Both counts are diagnostics, not
+        // errors, so the tile is informational, not alarming.
+        let unreadable = snap.unreadableFileCount
+        let malformed = snap.malformedRecordCount
+        if unreadable > 0 || malformed > 0 {
+            var lines: [String] = []
+            if unreadable > 0 {
+                lines.append("\(unreadable) session file\(unreadable == 1 ? "" : "s") could not be read (corrupt, over 64 MB, or unreadable).")
+            }
+            if malformed > 0 {
+                lines.append("\(malformed) usage record\(malformed == 1 ? "" : "s") could not be parsed (a partial write may be in flight).")
+            }
+            out.append(UsageTile(
+                id: "cline-diagnostics",
+                title: "Some sessions skipped",
+                kind: .text(
+                    status: lines.first ?? "",
+                    subtitle: lines.dropFirst().joined(separator: "\n")
+                )
+            ))
+        }
+
         // Codex round-1 finding #1 partial-access tile is now emitted
         // as a priority tile above (round-2 finding #3), so it stays
         // visible during a slow parse too.
@@ -306,6 +332,9 @@ public final class ClineUsageStore: @preconcurrency UsageProvider {
         // hop can record which set produced the snapshot (Codex
         // round-2 finding #4).
         let grantedKeyCopy = grantedKey
+        // Capture dependencies for the re-probe below (3cc round-1
+        // finding #1).
+        let tccProbeCopy = self.tccProbe
         workQueue.async { [weak self] in
             let urls = discover(rootsCopy)
             let snap = parse(urls)
@@ -316,6 +345,31 @@ public final class ClineUsageStore: @preconcurrency UsageProvider {
                 // disables the provider cannot repopulate.
                 guard self.isEnabled else { return }
                 guard launchGeneration == self.fetchGeneration else { return }
+                // 3cc round-1 finding #1: TCC may have been revoked
+                // between fetch-start and now. discoverFiles(⋯) on a
+                // now-unreadable root returns [] silently, so we would
+                // otherwise write an empty snapshot as if the user had
+                // no usage. Re-probe every root that was granted at
+                // fetch-start; if any turned .denied, discard this
+                // parse result, surface .denied, and rely on the next
+                // fetch tick to reconcile.
+                var stillAllGranted = true
+                var newDeniedCount = 0
+                for root in rootsCopy {
+                    switch tccProbeCopy(root.tasksDirectoryPath) {
+                    case .granted:      break
+                    case .denied:       stillAllGranted = false; newDeniedCount += 1
+                    case .pathMissing:  break  // was granted; now missing — treat
+                                               // as "no data" not "access revoked"
+                    }
+                }
+                if !stillAllGranted {
+                    self.tccState = .denied
+                    self.deniedRootCount = self.deniedRootCount + newDeniedCount
+                    self.snapshot = nil
+                    self.lastAppliedGrantedRootsKey = nil
+                    return
+                }
                 self.snapshot = snap
                 self.lastAppliedGrantedRootsKey = grantedKeyCopy
                 // Codex round-5 finding #2: use the injected clock so

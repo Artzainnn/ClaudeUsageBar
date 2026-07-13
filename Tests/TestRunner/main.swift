@@ -6220,6 +6220,143 @@ MainActor.assumeIsolated {
         expectEqual(store.tccState, .denied)
     }
 
+    run("ClineUsageStore: TCC revoked mid-parse discards the empty parse result (3cc round-1 #1)") {
+        // 3cc round-1 finding #1: TCC probed .granted at fetch-start,
+        // then revoked between discoverFiles and apply-hop. The re-probe
+        // must catch it and discard the (now empty) parse result rather
+        // than overwriting real usage with $0.
+        let now = ClaudeCodeUsageFetcher.parseTimestamp("2026-07-13T04:00:00Z")!
+        let priorRec = ClineUsageRecord(
+            model: "claude-opus-4-7", timestamp: now,
+            sayKind: .apiReqStarted,
+            tokensIn: 1000, tokensOut: 500, cacheWrites: 0, cacheReads: 0,
+            costUSD: 1.23, sourceFile: "/tmp/fake/a.json"
+        )
+        let defaults = UserDefaults(suiteName: "cline-revoke-\(UUID().uuidString)")!
+        defaults.set(true, forKey: "features.cline.enabled")
+        final class ProbeToggle: @unchecked Sendable {
+            // Starts granted, flips to denied on the SECOND probe call.
+            var granted = true
+            var callCount = 0
+        }
+        let toggle = ProbeToggle()
+        final class Gate: @unchecked Sendable { let sem = DispatchSemaphore(value: 0) }
+        let gate = Gate()
+        let root = ClinePathResolver.ScanRoot(id: "test", tasksDirectoryPath: "/tmp/fake/tasks")
+        let store = ClineUsageStore(
+            defaults: defaults,
+            resolveScanRoots: { [root] },
+            tccProbe: { _ in
+                toggle.callCount += 1
+                // First call (fetch-start aggregation): granted.
+                // Second call (apply-hop re-probe): denied.
+                return toggle.granted && toggle.callCount == 1 ? .granted : .denied
+            },
+            discoverFiles: { _ in [] },  // TCC revoked → no files discoverable
+            parseFiles: { _ in
+                // Block briefly so the caller can flip toggle.granted
+                // between the fetch-start probe and this parse.
+                gate.sem.wait()
+                return ClineUsageSnapshot(records: [])
+            },
+            clock: { now }
+        )
+        // Seed a prior good snapshot manually — the "before" state.
+        // We can't set snapshot directly since it's private(set), so
+        // instead we run one clean fetch first with granted state
+        // and files, then flip the toggle for the second fetch.
+        toggle.granted = true
+        // For the seeding fetch, we need discoverFiles + parseFiles to
+        // return the prior good record. Use a separate store.
+        let seedDefaults = UserDefaults(suiteName: "cline-revoke-seed-\(UUID().uuidString)")!
+        seedDefaults.set(true, forKey: "features.cline.enabled")
+        let seedGate = Gate(); seedGate.sem.signal()  // pre-signalled → non-blocking
+        let seedStore = ClineUsageStore(
+            defaults: seedDefaults,
+            resolveScanRoots: { [root] },
+            tccProbe: { _ in .granted },
+            discoverFiles: { _ in [URL(fileURLWithPath: "/tmp/fake/tasks/a/ui_messages.json")] },
+            parseFiles: { _ in ClineUsageSnapshot(records: [priorRec]) },
+            clock: { now }
+        )
+        seedStore.fetch()
+        // seedStore is not the store-under-test; just proves the code
+        // path works. The MAIN assertion below is on `store`.
+
+        // Kick off the racy fetch on `store`. parseFiles will block.
+        store.fetch()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+        // Release the parse.
+        gate.sem.signal()
+        awaitClineFetch()
+
+        // Because the re-probe returned .denied on the second call,
+        // the empty parse result must NOT have applied.
+        expect(store.snapshot == nil, "empty parse from a revoked-mid-flight fetch must not overwrite state")
+        expectEqual(store.tccState, .denied)
+    }
+
+    run("ClineUsageStore: file-level parse failures surface a 'Some sessions skipped' diagnostic tile (3cc round-1 #2)") {
+        // 3cc round-1 finding #2: without a diagnostic, a corrupt or
+        // over-cap ui_messages.json is silently dropped and the tile
+        // shows the remaining totals as complete. Now the store
+        // surfaces unreadableFileCount + malformedRecordCount as an
+        // informational tile.
+        let now = ClaudeCodeUsageFetcher.parseTimestamp("2026-07-13T04:00:00Z")!
+        let rec = ClineUsageRecord(
+            model: "claude-opus-4-7", timestamp: now,
+            sayKind: .apiReqStarted,
+            tokensIn: 1000, tokensOut: 500, cacheWrites: 0, cacheReads: 0,
+            costUSD: 0.0175, sourceFile: "/tmp/fake/a.json"
+        )
+        let snap = ClineUsageSnapshot(
+            records: [rec],
+            recordsPerFile: ["/tmp/fake/a.json": 1],
+            malformedRecordCount: 2,
+            unreadableFileCount: 1
+        )
+        let store = makeClineStoreForTest(
+            flagEnabled: true, tccState: .granted,
+            files: [URL(fileURLWithPath: "/tmp/fake/a.json")],
+            snapshot: snap,
+            now: now
+        )
+        store.fetch()
+        awaitClineFetch()
+
+        let ids = Set(store.tiles.map { $0.id })
+        expect(ids.contains("cline-diagnostics"))
+        // Regular tiles still present alongside the diagnostic.
+        expect(ids.contains("cline-cost-today"))
+    }
+
+    run("ClineUsageStore: no diagnostic tile when unreadable + malformed counts are both zero") {
+        let now = ClaudeCodeUsageFetcher.parseTimestamp("2026-07-13T04:00:00Z")!
+        let rec = ClineUsageRecord(
+            model: "claude-opus-4-7", timestamp: now,
+            sayKind: .apiReqStarted,
+            tokensIn: 100, tokensOut: 50, cacheWrites: 0, cacheReads: 0,
+            costUSD: 0.005, sourceFile: "/tmp/fake/a.json"
+        )
+        let snap = ClineUsageSnapshot(
+            records: [rec],
+            recordsPerFile: ["/tmp/fake/a.json": 1],
+            malformedRecordCount: 0,
+            unreadableFileCount: 0
+        )
+        let store = makeClineStoreForTest(
+            flagEnabled: true, tccState: .granted,
+            files: [URL(fileURLWithPath: "/tmp/fake/a.json")],
+            snapshot: snap,
+            now: now
+        )
+        store.fetch()
+        awaitClineFetch()
+
+        let ids = Set(store.tiles.map { $0.id })
+        expect(!ids.contains("cline-diagnostics"))
+    }
+
     run("ClineUsageStore: TRULY in-flight fetch A releases AFTER fetch B's denial — A must not repopulate (round-1 finding #4)") {
         // Codex round-1 finding #4: the prior test does not create a
         // genuinely in-flight race. This test uses a semaphore inside
