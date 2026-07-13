@@ -120,7 +120,16 @@ let package = Package(
                 "WindsurfUsageFetcher.swift",
                 "WindsurfUsageStore.swift",
                 "CursorUsageFetcher.swift",
-                "CursorUsageStore.swift"
+                "CursorUsageStore.swift",
+                // PR 12-BE — JetBrains AI + Warp providers. Pure-local:
+                // JetBrains reads an XML quota file per IDE, Warp reads
+                // a schema-guarded sqlite. NEITHER contacts a JetBrains
+                // API (DMCA constraint) NOR uses a Warp API key (that
+                // path is deferred to a follow-up).
+                "JetBrainsUsageFetcher.swift",
+                "JetBrainsUsageStore.swift",
+                "WarpUsageFetcher.swift",
+                "WarpUsageStore.swift"
                 // AnthropicUsageStore.swift depends on UsageManager
                 // (defined in ClaudeUsageBar.swift), so it stays in the
                 // app-bundle compile only, not in the SwiftPM library

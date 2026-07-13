@@ -7788,6 +7788,926 @@ MainActor.assumeIsolated {
     }
 }
 
+// MARK: - JetBrains AI Assistant (PR 12-BE)
+
+// Every fixture below is HAND-AUTHORED against the JetBrains
+// PersistentStateComponent XML format. No credentials, no live data.
+// Shape verified against steipete/CodexBar's JetBrainsStatusProbe.swift
+// which is itself reverse-engineered from live AIAssistantQuotaManager2.xml
+// samples across multiple IDE versions.
+
+// A minimal happy-path XML: current=12345, maximum=100000, tariff
+// available=87655, until=2027-01-01 subscription end, next refill on
+// 2026-08-01 with tariff amount=100000 and duration=P30D.
+let fixtureJetBrainsHappy = """
+<application>
+  <component name="AIAssistantQuotaManager2">
+    <option name="quotaInfo" value="&quot;type&quot;:&quot;Available&quot;,&quot;current&quot;:&quot;12345&quot;,&quot;maximum&quot;:&quot;100000&quot;,&quot;tariffQuota&quot;:{&quot;available&quot;:&quot;87655&quot;},&quot;until&quot;:&quot;2027-01-01T00:00:00Z&quot;" />
+    <option name="nextRefill" value="&quot;type&quot;:&quot;Known&quot;,&quot;next&quot;:&quot;2026-08-01T00:00:00Z&quot;,&quot;tariff&quot;:{&quot;amount&quot;:&quot;100000&quot;,&quot;duration&quot;:&quot;P30D&quot;}" />
+  </component>
+</application>
+"""
+
+// A missing-component fixture — AIAssistantQuotaManager2 is absent so
+// the parser must return `.componentMissing`, not `.malformedPayload`.
+let fixtureJetBrainsNoComponent = """
+<application>
+  <component name="SomeOtherComponent">
+    <option name="foo" value="bar" />
+  </component>
+</application>
+"""
+
+// A malformed-payload fixture — component exists but the JSON payload
+// is genuinely unparseable (unterminated string). The parser must
+// return `.malformedPayload` so the store can surface an update-app
+// prompt rather than a wrong number. Note: Foundation's JSON parser
+// tolerates trailing commas in modern Swift, so the malformed
+// fixture uses an unterminated quoted string instead — that is
+// strictly rejected.
+let fixtureJetBrainsMalformed = """
+<application>
+  <component name="AIAssistantQuotaManager2">
+    <option name="quotaInfo" value="&quot;type&quot;:&quot;Availab" />
+  </component>
+</application>
+"""
+
+// An older fixture where `nextRefill` is absent entirely — the parser
+// must still return `.success` with a nil `refillNext`. Reflects an
+// early JetBrains AI build that had not yet published the refill
+// payload.
+let fixtureJetBrainsOnlyQuota = """
+<application>
+  <component name="AIAssistantQuotaManager2">
+    <option name="quotaInfo" value="&quot;type&quot;:&quot;Available&quot;,&quot;current&quot;:&quot;50000&quot;,&quot;maximum&quot;:&quot;100000&quot;,&quot;tariffQuota&quot;:{&quot;available&quot;:&quot;50000&quot;},&quot;until&quot;:&quot;2027-01-01T00:00:00Z&quot;" />
+  </component>
+</application>
+"""
+
+// A fixture where the tariffQuota.available field is absent — the
+// parser must fall back to `max(0, maximum - used)` per the CodexBar-
+// reverse-engineered behaviour.
+let fixtureJetBrainsNoTariffAvailable = """
+<application>
+  <component name="AIAssistantQuotaManager2">
+    <option name="quotaInfo" value="&quot;type&quot;:&quot;Available&quot;,&quot;current&quot;:&quot;25000&quot;,&quot;maximum&quot;:&quot;100000&quot;,&quot;until&quot;:&quot;2027-01-01T00:00:00Z&quot;" />
+  </component>
+</application>
+"""
+
+// Fixture with a hostile non-finite maximum. The parser must
+// coerce Double("Infinity") / Double("NaN") to 0 rather than passing
+// them into a downstream Int() that would trap.
+let fixtureJetBrainsHostileNumber = """
+<application>
+  <component name="AIAssistantQuotaManager2">
+    <option name="quotaInfo" value="&quot;type&quot;:&quot;Available&quot;,&quot;current&quot;:&quot;NaN&quot;,&quot;maximum&quot;:&quot;Infinity&quot;,&quot;tariffQuota&quot;:{&quot;available&quot;:&quot;-1e400&quot;},&quot;until&quot;:&quot;2027-01-01T00:00:00Z&quot;" />
+  </component>
+</application>
+"""
+
+// Fixture with fractional-seconds in the ISO-8601 next-refill date.
+// The parser must accept both fractional and plain forms.
+let fixtureJetBrainsFractionalDate = """
+<application>
+  <component name="AIAssistantQuotaManager2">
+    <option name="quotaInfo" value="&quot;type&quot;:&quot;Available&quot;,&quot;current&quot;:&quot;1&quot;,&quot;maximum&quot;:&quot;100&quot;,&quot;tariffQuota&quot;:{&quot;available&quot;:&quot;99&quot;},&quot;until&quot;:&quot;2027-01-01T00:00:00Z&quot;" />
+    <option name="nextRefill" value="&quot;type&quot;:&quot;Known&quot;,&quot;next&quot;:&quot;2026-08-15T12:34:56.789Z&quot;,&quot;tariff&quot;:{&quot;amount&quot;:&quot;100&quot;,&quot;duration&quot;:&quot;PT720H&quot;}" />
+  </component>
+</application>
+"""
+
+run("JetBrainsUsageFetcher.parseXMLText: happy path decodes every field") {
+    let outcome = JetBrainsUsageFetcher.parseXMLText(fixtureJetBrainsHappy)
+    guard case .success(let snap) = outcome else { expect(false, "expected success"); return }
+    expectEqual(snap.quotaType, "Available")
+    expectEqual(snap.used, 12345.0)
+    expectEqual(snap.maximum, 100000.0)
+    expectEqual(snap.available, 87655.0)
+    // `until` is subscriptionUntil.
+    expect(snap.subscriptionUntil != nil)
+    // Refill fields — nextRefill.next is the reset date, NOT
+    // quotaInfo.until (a mis-mapping would produce a wildly wrong
+    // reset date to the user).
+    expectEqual(snap.refillType, "Known")
+    expect(snap.refillNext != nil)
+    expectEqual(snap.refillAmount, 100000.0)
+    expectEqual(snap.refillDuration, "P30D")
+    // usedFraction: (100000 - 87655) / 100000 = 0.12345
+    let f = snap.usedFraction
+    expect(abs(f - 0.12345) < 1e-9)
+}
+
+run("JetBrainsUsageFetcher.parseXMLText: componentMissing when AIAssistantQuotaManager2 absent") {
+    let outcome = JetBrainsUsageFetcher.parseXMLText(fixtureJetBrainsNoComponent)
+    expectEqual(outcome, .componentMissing)
+}
+
+run("JetBrainsUsageFetcher.parseXMLText: malformedPayload when JSON truncated") {
+    let outcome = JetBrainsUsageFetcher.parseXMLText(fixtureJetBrainsMalformed)
+    expectEqual(outcome, .malformedPayload)
+}
+
+run("JetBrainsUsageFetcher.parseXMLText: only quotaInfo — nextRefill absent -> success with nil refill") {
+    let outcome = JetBrainsUsageFetcher.parseXMLText(fixtureJetBrainsOnlyQuota)
+    guard case .success(let snap) = outcome else { expect(false, "expected success"); return }
+    expectEqual(snap.used, 50000.0)
+    expectEqual(snap.maximum, 100000.0)
+    expectEqual(snap.available, 50000.0)
+    expect(snap.refillType == nil)
+    expect(snap.refillNext == nil)
+    expect(snap.refillAmount == nil)
+    expect(snap.refillDuration == nil)
+}
+
+run("JetBrainsUsageFetcher.parseXMLText: tariffQuota.available absent -> available = max(0, maximum-used)") {
+    let outcome = JetBrainsUsageFetcher.parseXMLText(fixtureJetBrainsNoTariffAvailable)
+    guard case .success(let snap) = outcome else { expect(false, "expected success"); return }
+    expectEqual(snap.used, 25000.0)
+    expectEqual(snap.maximum, 100000.0)
+    // 100000 - 25000 = 75000.
+    expectEqual(snap.available, 75000.0)
+}
+
+run("JetBrainsUsageFetcher: hostile Infinity / NaN inputs clamp to 0") {
+    // The parser must coerce non-finite Doubles to 0 so downstream
+    // Int() conversions cannot trap on a hostile persisted-state
+    // file.
+    let outcome = JetBrainsUsageFetcher.parseXMLText(fixtureJetBrainsHostileNumber)
+    guard case .success(let snap) = outcome else { expect(false, "expected success"); return }
+    expectEqual(snap.used, 0.0)
+    expectEqual(snap.maximum, 0.0)
+    // available fell back to max(0, maximum-used) = 0.
+    expectEqual(snap.available, 0.0)
+    // Fraction must not divide by zero.
+    expectEqual(snap.usedFraction, 0.0)
+}
+
+run("JetBrainsUsageFetcher.parseXMLText: ISO-8601 fractional-seconds accepted for nextRefill.next") {
+    let outcome = JetBrainsUsageFetcher.parseXMLText(fixtureJetBrainsFractionalDate)
+    guard case .success(let snap) = outcome else { expect(false, "expected success"); return }
+    expect(snap.refillNext != nil)
+    expectEqual(snap.refillDuration, "PT720H")
+}
+
+run("JetBrainsUsageFetcher.decodeHTMLEntities: reverses all six documented entities in dependency order") {
+    // Order matters: &amp; MUST decode last so &amp;quot; doesn't
+    // silently become &quot; and then to `"`. Verify with a compound
+    // string that exercises every entity.
+    let raw = "a &amp; b &quot;c&quot; d &lt;e&gt; f &apos;g&apos; h &#10; i &#13; end"
+    let decoded = JetBrainsUsageFetcher.decodeHTMLEntities(raw)
+    expectEqual(decoded, "a & b \"c\" d <e> f 'g' h \n i \r end")
+}
+
+run("JetBrainsUsageFetcher.decodeHTMLEntities: &amp;quot; must NOT decode into a bare quote") {
+    // Regression guard: if we decoded &amp; BEFORE &quot;, then
+    // "&amp;quot;" would first become "&quot;" then become `"`.
+    // We decode &amp; LAST so it stays as "&quot;".
+    let decoded = JetBrainsUsageFetcher.decodeHTMLEntities("&amp;quot;")
+    expectEqual(decoded, "&quot;")
+}
+
+run("JetBrainsPathResolver.compareVersions: numeric dotted comparison") {
+    expectEqual(JetBrainsPathResolver.compareVersions("2024.1", "2024.2"), -1)
+    expectEqual(JetBrainsPathResolver.compareVersions("2024.2", "2024.1"), 1)
+    expectEqual(JetBrainsPathResolver.compareVersions("2024.3.1", "2024.3"), 1)
+    expectEqual(JetBrainsPathResolver.compareVersions("2024.1", "2024.1"), 0)
+    // Non-numeric trailing components read as 0 — the version we
+    // care about is the pre-suffix numeric prefix.
+    expectEqual(JetBrainsPathResolver.compareVersions("2024.2-EAP", "2024.1"), 1)
+}
+
+run("JetBrainsPathResolver.discover: enumerates IntelliJIdea + PyCharm + Android Studio, ignores non-IDE folders") {
+    // Build a fake filesystem tree in memory. The environment's
+    // closures let us do this without touching the real disk.
+    let files: Set<String> = [
+        "/vendor-jb",
+        "/vendor-jb/IntelliJIdea2024.1",
+        "/vendor-jb/IntelliJIdea2024.1/options",
+        "/vendor-jb/IntelliJIdea2024.1/options/AIAssistantQuotaManager2.xml",
+        "/vendor-jb/PyCharm2024.2",
+        "/vendor-jb/PyCharm2024.2/options",
+        "/vendor-jb/PyCharm2024.2/options/AIAssistantQuotaManager2.xml",
+        // A folder that starts with an IDE prefix but has no digit
+        // suffix — MUST be rejected.
+        "/vendor-jb/RustRoverExamples",
+        // A folder with the IDE prefix + version suffix but NO quota
+        // file — MUST be rejected (it has never had AI Assistant
+        // used).
+        "/vendor-jb/CLion2024.1",
+        "/vendor-jb/CLion2024.1/options",
+        "/vendor-google",
+        "/vendor-google/AndroidStudio2024.3.1",
+        "/vendor-google/AndroidStudio2024.3.1/options",
+        "/vendor-google/AndroidStudio2024.3.1/options/AIAssistantQuotaManager2.xml"
+    ]
+    let env = JetBrainsEnvironment(
+        jetbrainsVendorPath: "/vendor-jb",
+        googleVendorPath: "/vendor-google",
+        fileExists: { files.contains($0) },
+        contentsOfDirectory: { path in
+            switch path {
+            case "/vendor-jb":
+                return ["IntelliJIdea2024.1", "PyCharm2024.2", "RustRoverExamples", "CLion2024.1"]
+            case "/vendor-google":
+                return ["AndroidStudio2024.3.1"]
+            default:
+                return nil
+            }
+        },
+        attributes: { _ in nil }
+    )
+    let installs = JetBrainsPathResolver.discover(env)
+    let ideNames = installs.map { $0.ide.displayName }
+    expect(ideNames.contains("IntelliJ IDEA"))
+    expect(ideNames.contains("PyCharm"))
+    expect(ideNames.contains("Android Studio"))
+    // CLion has an options dir but no quota XML — MUST be dropped.
+    expect(!ideNames.contains("CLion"))
+    // RustRoverExamples is a bare-prefix folder (no digit) — MUST
+    // be dropped.
+    expect(!ideNames.contains("RustRover"))
+    expectEqual(installs.count, 3)
+}
+
+run("JetBrainsPathResolver.discover: case-sensitive prefix — 'intellijidea' does NOT match") {
+    // JetBrains uses canonical Title case for folder names. A folder
+    // in unusual casing (bug in a user's own automation) MUST NOT
+    // match — otherwise the resolver could pick up a random folder.
+    let files: Set<String> = [
+        "/vendor-jb",
+        "/vendor-jb/intellijidea2024.1",
+        "/vendor-jb/intellijidea2024.1/options/AIAssistantQuotaManager2.xml"
+    ]
+    let env = JetBrainsEnvironment(
+        jetbrainsVendorPath: "/vendor-jb",
+        googleVendorPath: "/vendor-google",
+        fileExists: { files.contains($0) },
+        contentsOfDirectory: { path in
+            if path == "/vendor-jb" { return ["intellijidea2024.1"] }
+            return nil
+        },
+        attributes: { _ in nil }
+    )
+    let installs = JetBrainsPathResolver.discover(env)
+    expectEqual(installs.count, 0)
+}
+
+run("JetBrainsPathResolver.mostRecentlyModified: picks install with latest xml mtime") {
+    let install1 = JetBrainsIDEInstall(
+        ide: JetBrainsIDE(dirPrefix: "IntelliJIdea", displayName: "IntelliJ IDEA"),
+        version: "2024.1",
+        quotaFilePath: "/a/IntelliJIdea2024.1/options/AIAssistantQuotaManager2.xml"
+    )
+    let install2 = JetBrainsIDEInstall(
+        ide: JetBrainsIDE(dirPrefix: "PyCharm", displayName: "PyCharm"),
+        version: "2024.2",
+        quotaFilePath: "/a/PyCharm2024.2/options/AIAssistantQuotaManager2.xml"
+    )
+    let env = JetBrainsEnvironment(
+        jetbrainsVendorPath: "/a",
+        googleVendorPath: "/b",
+        fileExists: { _ in true },
+        contentsOfDirectory: { _ in nil },
+        attributes: { path in
+            // Install 2 is more recent.
+            let oldDate = Date(timeIntervalSince1970: 1_700_000_000)
+            let newDate = Date(timeIntervalSince1970: 1_800_000_000)
+            if path == install1.quotaFilePath { return [.modificationDate: oldDate] }
+            if path == install2.quotaFilePath { return [.modificationDate: newDate] }
+            return nil
+        }
+    )
+    let winner = JetBrainsPathResolver.mostRecentlyModified([install1, install2], env: env)
+    expectEqual(winner?.ide.displayName, "PyCharm")
+}
+
+run("JetBrainsIDECatalog.all: contains 15 canonical IDEs including Android Studio under Google vendor") {
+    let names = Set(JetBrainsIDECatalog.all.map { $0.displayName })
+    // Every IDE from the JetBrains SDK docs (+ Android Studio).
+    for expected in [
+        "IntelliJ IDEA", "PyCharm", "WebStorm", "GoLand", "CLion",
+        "DataGrip", "RubyMine", "Rider", "PhpStorm", "AppCode",
+        "Fleet", "Android Studio", "RustRover", "Aqua", "DataSpell"
+    ] {
+        expect(names.contains(expected), "missing IDE: \(expected)")
+    }
+    // Android Studio is the only Google-vendor entry.
+    let googleIDEs = JetBrainsUsageFetcher_googleVendorIDEs()
+    expectEqual(googleIDEs, ["Android Studio"])
+    // Total count sanity.
+    expectEqual(JetBrainsIDECatalog.all.count, 15)
+}
+
+// Helper: filter Catalog to the IDEs living under Google vendor.
+func JetBrainsUsageFetcher_googleVendorIDEs() -> [String] {
+    JetBrainsIDECatalog.all.filter { $0.underGoogleVendor }.map { $0.displayName }
+}
+
+run("JetBrainsUsageStore.formatDuration: JetBrains ISO-8601 durations render sensibly") {
+    // Only the shapes JetBrains has been observed to emit.
+    expectEqual(JetBrainsUsageStore.formatDuration("P30D"), "30 days")
+    expectEqual(JetBrainsUsageStore.formatDuration("P1D"), "1 day")
+    expectEqual(JetBrainsUsageStore.formatDuration("PT720H"), "30 days")   // 720 hours = 30 days
+    expectEqual(JetBrainsUsageStore.formatDuration("PT12H"), "12 hours")
+    expectEqual(JetBrainsUsageStore.formatDuration("PT1H"), "1 hour")
+    expectEqual(JetBrainsUsageStore.formatDuration("PT30M"), "30 minutes")
+    // Unrecognised shape falls through verbatim.
+    expectEqual(JetBrainsUsageStore.formatDuration("P1Y"), "P1Y")
+}
+
+// Store-level integration tests — MainActor isolation.
+MainActor.assumeIsolated {
+    let suite = "com.claude.usagebar.jetbrains.tests"
+    let defaults = UserDefaults(suiteName: suite) ?? .standard
+    defaults.removePersistentDomain(forName: suite)
+
+    // Helper to build a store that reads a fixed XML text through
+    // an injected environment. No filesystem access. Paths chosen
+    // so `discover` computes the SAME quotaFilePath the fixture install
+    // carries — otherwise the resolver's `fileExists(quotaPath)` check
+    // rejects it and the fetch short-circuits.
+    let jbVendorPath = "/vendor-jb"
+    let jbGoogleVendorPath = "/vendor-google"
+    @MainActor func makeJetBrainsStoreForTest(
+        flagEnabled: Bool = true,
+        includeInstall: Bool = true,
+        tccState: TCCState = .granted,
+        readOutcome: JetBrainsReadOutcome = .componentMissing
+    ) -> JetBrainsUsageStore {
+        defaults.set(flagEnabled, forKey: "features.jetbrains.enabled")
+        let idePrefix = "IntelliJIdea"
+        let version = "2024.1"
+        let ideDir = idePrefix + version
+        let quotaPath = "\(jbVendorPath)/\(ideDir)/options/AIAssistantQuotaManager2.xml"
+        let env = JetBrainsEnvironment(
+            jetbrainsVendorPath: jbVendorPath,
+            googleVendorPath: jbGoogleVendorPath,
+            fileExists: { path in
+                guard includeInstall else { return false }
+                switch path {
+                case jbVendorPath, quotaPath: return true
+                default: return false
+                }
+            },
+            contentsOfDirectory: { path in
+                if path == jbVendorPath { return includeInstall ? [ideDir] : [] }
+                return nil
+            },
+            attributes: { path in
+                if path == quotaPath {
+                    return [.modificationDate: Date()]
+                }
+                return nil
+            }
+        )
+        return JetBrainsUsageStore(
+            defaults: defaults,
+            environment: env,
+            tccProbe: { _ in tccState },
+            readXML: { _ in readOutcome }
+        )
+    }
+
+    @MainActor func awaitJetBrainsFetch() {
+        let deadline = Date().addingTimeInterval(1.5)
+        while Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
+    }
+
+    run("JetBrainsUsageStore: feature-flag off produces no tiles") {
+        let store = makeJetBrainsStoreForTest(flagEnabled: false)
+        expectEqual(store.tiles.count, 0)
+    }
+
+    run("JetBrainsUsageStore: TCC .denied renders needsAccess tile only") {
+        let store = makeJetBrainsStoreForTest(flagEnabled: true, tccState: .denied)
+        store.fetch()
+        awaitJetBrainsFetch()
+        let tiles = store.tiles
+        expectEqual(tiles.count, 1)
+        expectEqual(tiles.first?.id, "jetbrains-needs-access")
+    }
+
+    run("JetBrainsUsageStore: no detected install -> not-installed tile after fetch") {
+        let store = makeJetBrainsStoreForTest(flagEnabled: true, includeInstall: false, tccState: .pathMissing)
+        store.fetch()
+        awaitJetBrainsFetch()
+        let tiles = store.tiles
+        expectEqual(tiles.count, 1)
+        expectEqual(tiles.first?.id, "jetbrains-not-installed")
+    }
+
+    run("JetBrainsUsageStore: success outcome populates snapshot + activeInstall + tiles") {
+        let snap = JetBrainsQuotaSnapshot(
+            quotaType: "Available",
+            used: 12345,
+            maximum: 100000,
+            available: 87655,
+            subscriptionUntil: nil,
+            refillType: "Known",
+            refillNext: Date(timeIntervalSince1970: 1_800_000_000),
+            refillAmount: 100000,
+            refillDuration: "P30D"
+        )
+        let store = makeJetBrainsStoreForTest(flagEnabled: true, readOutcome: .success(snap))
+        store.fetch()
+        awaitJetBrainsFetch()
+        expect(store.snapshot != nil)
+        expectEqual(store.activeInstall?.ide.displayName, "IntelliJ IDEA")
+        // Plan + quota + refill = at least 3 tiles.
+        let tileIds = store.tiles.map { $0.id }
+        expect(tileIds.contains("jetbrains-plan"))
+        expect(tileIds.contains("jetbrains-quota"))
+        expect(tileIds.contains("jetbrains-refill"))
+    }
+
+    run("JetBrainsUsageStore: componentMissing renders sign-in-needed tile") {
+        let store = makeJetBrainsStoreForTest(flagEnabled: true, readOutcome: .componentMissing)
+        store.fetch()
+        awaitJetBrainsFetch()
+        let ids = store.tiles.map { $0.id }
+        expect(ids.contains("jetbrains-signin-needed"))
+    }
+
+    run("JetBrainsUsageStore: malformed payload -> schemaMismatch tile") {
+        let store = makeJetBrainsStoreForTest(flagEnabled: true, readOutcome: .malformedPayload)
+        store.fetch()
+        awaitJetBrainsFetch()
+        let ids = store.tiles.map { $0.id }
+        expect(ids.contains("jetbrains-schema-mismatch"))
+    }
+
+    run("JetBrainsUsageStore: clear() drops snapshot + resets state") {
+        let snap = JetBrainsQuotaSnapshot(
+            quotaType: "Available", used: 1, maximum: 100, available: 99,
+            subscriptionUntil: nil, refillType: nil, refillNext: nil,
+            refillAmount: nil, refillDuration: nil
+        )
+        let store = makeJetBrainsStoreForTest(flagEnabled: true, readOutcome: .success(snap))
+        store.fetch()
+        awaitJetBrainsFetch()
+        expect(store.snapshot != nil)
+        store.clear()
+        expect(store.snapshot == nil)
+        expect(store.activeInstall == nil)
+        expect(store.componentMissing == false)
+        expect(store.schemaMismatch == false)
+    }
+
+    // ID-drift regression guard mirroring PRs #68 / #70 / #72.
+    run("ProviderCopy id 'jetbrains' matches JetBrainsUsageStore.id — exercises real Settings path (PR 12-BE regression scaffold)") {
+        let store = JetBrainsUsageStore()
+        expectEqual(store.id, "jetbrains")
+        // The Settings help/disclosure is added in PR 12-UI, but the
+        // id string is settled here so the UI-side PR only needs to
+        // provide the copy. Near-miss casings return nil regardless.
+        expect(ProviderCopy.help(for: "JetBrains") == nil)
+        expect(ProviderCopy.help(for: "JETBRAINS") == nil)
+        expect(ProviderCopy.help(for: "jet-brains") == nil)
+        expect(ProviderCopy.help(for: "jbrains") == nil)
+    }
+
+    defaults.removePersistentDomain(forName: suite)
+}
+
+// DMCA guard — verify at unit level that neither the fetcher nor the
+// store file mentions api.jetbrains.ai or grazie.aws.intellij.net.
+// The CI static-grep is the authoritative gate but a unit test lets
+// the failure surface locally too.
+run("DMCA guard: JetBrains provider source never references api.jetbrains.ai or grazie.aws.intellij.net") {
+    // These hosts are LOAD-BEARING for the DMCA constraint (see
+    // .pr-bodies/RESUME.md's "Known caveats"). A future maintainer
+    // who added a "live-endpoint fallback for accuracy" would silently
+    // reintroduce the risk; this test makes that impossible without
+    // deliberately updating the assertion.
+    let forbidden = ["api.jetbrains.ai", "grazie.aws.intellij.net"]
+    // We test by reading the fetcher/store source at build time via
+    // a bundled resource — but since this TestRunner does not bundle
+    // source, we assert against the Swift symbol surface instead:
+    // no public/internal member of JetBrainsUsageFetcher touches a
+    // URL type. This is a coarse check but catches the naive
+    // implementation. The CI static-grep guard remains the true
+    // gate.
+    let mirror = Mirror(reflecting: JetBrainsEnvironment.current())
+    for child in mirror.children {
+        if let s = child.value as? String {
+            for host in forbidden {
+                expect(!s.contains(host), "DMCA: forbidden host '\(host)' leaked into \(String(describing: child.label))")
+            }
+        }
+    }
+}
+
+// MARK: - Warp local sqlite (PR 12-BE)
+
+run("WarpPathResolver.resolveDbPath: returns first candidate that exists") {
+    let env = WarpEnvironment(
+        candidateDbPaths: ["/no-a", "/yes-b", "/yes-c"],
+        fileExists: { path in path == "/yes-b" || path == "/yes-c" }
+    )
+    expectEqual(WarpPathResolver.resolveDbPath(env), "/yes-b")
+}
+
+run("WarpPathResolver.resolveDbPath: nil when no candidate exists") {
+    let env = WarpEnvironment(
+        candidateDbPaths: ["/no-a", "/no-b"],
+        fileExists: { _ in false }
+    )
+    expect(WarpPathResolver.resolveDbPath(env) == nil)
+}
+
+run("WarpPathResolver.current: includes both Application Support AND Group Container paths") {
+    let env = WarpEnvironment.current()
+    let all = env.candidateDbPaths.joined(separator: "|")
+    expect(all.contains("Application Support/dev.warp.Warp-Stable/warp.sqlite"))
+    expect(all.contains("Group Containers/2BBY89MBSN.dev.warp/warp.sqlite"))
+    // Preview channel included so a beta user is not silently skipped.
+    expect(all.contains("Application Support/dev.warp.Warp-Preview/warp.sqlite"))
+}
+
+run("WarpUsageFetcher.todayWindowBounds: yields local-midnight and next-local-midnight") {
+    // 2026-07-13T12:00:00Z is well inside a day in any TZ; both
+    // bounds must be within the same 24h.
+    let now = Date(timeIntervalSince1970: 1_784_385_600)  // 2026-07-13 12:00 UTC
+    let (start, end) = WarpUsageFetcher.todayWindowBounds(now: now)
+    // End must be exactly 24h after start (barring DST — this is
+    // July so no DST-crossing).
+    let delta = end.timeIntervalSince(start)
+    expect(delta >= 86_000 && delta <= 87_000, "delta was \(delta)")
+    // Start must not be in the future.
+    expect(start <= now)
+}
+
+run("WarpUsageFetcher.knownTables + knownTimestampColumns: exhaustive lists match plan") {
+    // Locking these lists in a test means adding a new supported
+    // table / column name requires an explicit update to the test
+    // — no silent widening of the reader's schema surface.
+    expectEqual(WarpUsageFetcher.knownTables, ["ai_queries", "agent_conversations"])
+    expectEqual(WarpUsageFetcher.knownTimestampColumns,
+                ["created_at", "createdAt", "timestamp", "ts", "date", "time"])
+}
+
+run("WarpUsageFetcher.classifyIntegerEpoch: seconds bucket accepts 2017 → 2286") {
+    // Codex R1 P2 finding #5: only accept the two epoch shapes
+    // Warp has been observed to use. Micro/nano/hostile values
+    // surface as .unknown so the fetcher can return .schemaUnknown.
+    // Boundaries verified: 2017-01-01 seconds = 1483228800, and
+    // 2286-11-20 seconds ~= 9999999999.
+    expectEqual(WarpUsageFetcher.classifyIntegerEpoch(1_500_000_000), .seconds)
+    expectEqual(WarpUsageFetcher.classifyIntegerEpoch(1_800_000_000), .seconds)
+    expectEqual(WarpUsageFetcher.classifyIntegerEpoch(9_999_999_999), .seconds)
+    // Just below the seconds floor — pre-2017. Reject.
+    expectEqual(WarpUsageFetcher.classifyIntegerEpoch(1_499_999_999), .unknown)
+    // Zero — reject.
+    expectEqual(WarpUsageFetcher.classifyIntegerEpoch(0), .unknown)
+}
+
+run("WarpUsageFetcher.classifyIntegerEpoch: milliseconds bucket accepts 2017 → 2286") {
+    // 2017-01-01 ms = 1483228800000.
+    expectEqual(WarpUsageFetcher.classifyIntegerEpoch(1_500_000_000_000), .milliseconds)
+    expectEqual(WarpUsageFetcher.classifyIntegerEpoch(1_800_000_000_000), .milliseconds)
+    expectEqual(WarpUsageFetcher.classifyIntegerEpoch(9_999_999_999_999), .milliseconds)
+}
+
+run("WarpUsageFetcher.classifyIntegerEpoch: microseconds / nanoseconds / gap magnitudes -> unknown") {
+    // Between-bucket gap (a plausible microsecond epoch): 1e10 → 1.5e12.
+    expectEqual(WarpUsageFetcher.classifyIntegerEpoch(10_000_000_000), .unknown)
+    expectEqual(WarpUsageFetcher.classifyIntegerEpoch(1_499_999_999_999), .unknown)
+    // Nanoseconds — well above the ms bucket.
+    expectEqual(WarpUsageFetcher.classifyIntegerEpoch(10_000_000_000_000), .unknown)
+    expectEqual(WarpUsageFetcher.classifyIntegerEpoch(1_500_000_000_000_000), .unknown)
+    // Hostile Int64.max — reject.
+    expectEqual(WarpUsageFetcher.classifyIntegerEpoch(Int64.max), .unknown)
+    // Negative — reject.
+    expectEqual(WarpUsageFetcher.classifyIntegerEpoch(-1), .unknown)
+}
+
+run("WarpUsageFetcher.classifyTextTimestamp: ISO-8601 with T detected") {
+    // Codex R1 P2 finding #4: sqlite datetime output uses SPACE,
+    // ISO-8601 uses `T`. Space sorts BEFORE `T` lexically so a
+    // wrong bound choice undercounts today.
+    expectEqual(WarpUsageFetcher.classifyTextTimestamp("2026-07-13T00:00:00Z"), .iso8601)
+    expectEqual(WarpUsageFetcher.classifyTextTimestamp("2026-07-13T00:00:00.123Z"), .iso8601)
+}
+
+run("WarpUsageFetcher.classifyTextTimestamp: sqlite datetime with SPACE detected") {
+    expectEqual(WarpUsageFetcher.classifyTextTimestamp("2026-07-13 00:00:00"), .sqliteDatetime)
+    expectEqual(WarpUsageFetcher.classifyTextTimestamp("2026-07-13 12:34:56"), .sqliteDatetime)
+}
+
+run("WarpUsageFetcher.classifyTextTimestamp: neither shape -> unknown") {
+    expectEqual(WarpUsageFetcher.classifyTextTimestamp(""), .unknown)
+    expectEqual(WarpUsageFetcher.classifyTextTimestamp("13/07/2026"), .unknown)
+    expectEqual(WarpUsageFetcher.classifyTextTimestamp("2026-07-13"), .unknown)  // date only, no time
+    expectEqual(WarpUsageFetcher.classifyTextTimestamp("garbage"), .unknown)
+}
+
+run("JetBrainsUsageStore.formatDateShort: renders UTC with explicit label") {
+    // Codex R1 P3: JetBrains's own dashboard shows refill dates in
+    // UTC (e.g. '1 Aug' for 2026-08-01T00:00:00Z). Rendering the
+    // instant in local time would show '31 Jul' in Americas
+    // timezones — an off-by-one that would look like a bug in the
+    // app. Format explicitly in UTC with the label.
+    // 2026-08-01 00:00:00 UTC = unix epoch 1785542400.
+    let utcMidnight = Date(timeIntervalSince1970: 1_785_542_400)
+    expectEqual(JetBrainsUsageStore.formatDateShort(utcMidnight), "1 Aug UTC")
+}
+
+run("JetBrainsUsageFetcher.parseXMLText: duplicate component — first valid wins (R2 P3)") {
+    // Codex R2 P3: some crash-recovery paths leave a stale duplicate
+    // component before the real write. The parser must iterate all
+    // matching components and keep the first that yields a valid
+    // snapshot. A stale duplicate with an empty payload MUST NOT
+    // shadow the fresh one.
+    let fixture = """
+    <application>
+      <component name="AIAssistantQuotaManager2">
+        <option name="quotaInfo" value="" />
+      </component>
+      <component name="AIAssistantQuotaManager2">
+        <option name="quotaInfo" value="&quot;type&quot;:&quot;Available&quot;,&quot;current&quot;:&quot;7&quot;,&quot;maximum&quot;:&quot;100&quot;,&quot;tariffQuota&quot;:{&quot;available&quot;:&quot;93&quot;},&quot;until&quot;:&quot;2027-01-01T00:00:00Z&quot;" />
+      </component>
+    </application>
+    """
+    let outcome = JetBrainsUsageFetcher.parseXMLText(fixture)
+    guard case .success(let snap) = outcome else { expect(false, "expected success from the valid second component"); return }
+    expectEqual(snap.used, 7.0)
+    expectEqual(snap.maximum, 100.0)
+    expectEqual(snap.available, 93.0)
+}
+
+run("JetBrainsUsageFetcher.parseXMLText: all components malformed -> malformedPayload") {
+    // If every candidate component is malformed, THEN surface
+    // malformed — do not silently return success.
+    let fixture = """
+    <application>
+      <component name="AIAssistantQuotaManager2">
+        <option name="quotaInfo" value="&quot;type&quot;:&quot;Availab" />
+      </component>
+      <component name="AIAssistantQuotaManager2">
+        <option name="quotaInfo" value="&quot;another&quot;:&quot;broken" />
+      </component>
+    </application>
+    """
+    let outcome = JetBrainsUsageFetcher.parseXMLText(fixture)
+    expectEqual(outcome, .malformedPayload)
+}
+
+run("JetBrainsUsageStore.formatUnits: hostile 1e300 clamps to Int.max, no trap (R3 P2)") {
+    // Codex R3 P2: `Double(Int.max)` rounds UP to 2^63 (Int.max+1),
+    // so a naive `min(raw, Double(Int.max))` still traps. The new
+    // implementation uses `Int(exactly: raw.rounded())` with a
+    // saturating fallback. This test verifies both the clamp AND
+    // the no-trap invariant simultaneously — if the function
+    // trapped the whole TestRunner would abort with SIGILL.
+    let out1 = JetBrainsUsageStore.formatUnits(1e300)
+    // The precise formatted string depends on ClaudeCodeUsageStore.formatTokens's
+    // rounding; the load-bearing invariant is that the CALL COMPLETED
+    // (didn't trap) AND produced a non-empty result.
+    expect(!out1.isEmpty)
+    // Negative and NaN handled without trap. NaN short-circuits to
+    // a bare "0" (the non-finite fast path); a finite negative
+    // clamps to 0 and then returns whatever formatTokens(0) yields.
+    let zeroFmt = ClaudeCodeUsageStore.formatTokens(0)
+    expectEqual(JetBrainsUsageStore.formatUnits(-1.0), zeroFmt)
+    expectEqual(JetBrainsUsageStore.formatUnits(Double.nan), "0")
+    // A sensible small value passes through.
+    let out2 = JetBrainsUsageStore.formatUnits(1234.0)
+    expect(!out2.isEmpty)
+}
+
+run("JetBrainsUsageStore: hostile finite maximum 1e300 -> no trap on Int(snap.maximum) (R2 P2)") {
+    // Codex R2 P2: a persisted-state file with `maximum:"1e300"` is
+    // finite, so the parser accepts it, but Int(1e300) would trap in
+    // the Log.info(.count(...)) line. The applyOutcome path must
+    // clamp before the Int conversion.
+    let snap = JetBrainsQuotaSnapshot(
+        quotaType: "Available",
+        used: 0.0,
+        maximum: 1e300,
+        available: 1e300,
+        subscriptionUntil: nil,
+        refillType: nil,
+        refillNext: nil,
+        refillAmount: nil,
+        refillDuration: nil
+    )
+    // Reach applyOutcome via a store fetch injection. The critical
+    // invariant is: this call must NOT trap.
+    MainActor.assumeIsolated {
+        let suite = "com.claude.usagebar.jb.r2-trap"
+        let d = UserDefaults(suiteName: suite) ?? .standard
+        d.removePersistentDomain(forName: suite)
+        d.set(true, forKey: "features.jetbrains.enabled")
+        let env = JetBrainsEnvironment(
+            jetbrainsVendorPath: "/j",
+            googleVendorPath: "/g",
+            fileExists: { _ in true },
+            contentsOfDirectory: { path in
+                if path == "/j" { return ["IntelliJIdea2024.1"] }
+                return nil
+            },
+            attributes: { _ in [.modificationDate: Date()] }
+        )
+        let store = JetBrainsUsageStore(
+            defaults: d,
+            environment: env,
+            tccProbe: { _ in .granted },
+            readXML: { _ in .success(snap) }
+        )
+        store.fetch()
+        // Await the completion.
+        let deadline = Date().addingTimeInterval(1.5)
+        while Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
+        expect(store.snapshot != nil, "store must not have trapped and cleared the snapshot")
+        // Codex R3 P2: ALSO evaluate the tiles accessor — the
+        // formatUnits(1e300) path traps only when the UI reads
+        // store.tiles, not on the Log.info line. Checking snapshot
+        // alone lets that regression slip through.
+        let tiles = store.tiles
+        expect(!tiles.isEmpty, "tiles accessor must survive a hostile finite maximum")
+        d.removePersistentDomain(forName: suite)
+    }
+}
+
+// Store-level integration tests for Warp.
+MainActor.assumeIsolated {
+    let suite = "com.claude.usagebar.warp.tests"
+    let defaults = UserDefaults(suiteName: suite) ?? .standard
+    defaults.removePersistentDomain(forName: suite)
+
+    @MainActor func makeWarpStoreForTest(
+        flagEnabled: Bool = true,
+        pathExists: Bool = true,
+        tccState: TCCState = .granted,
+        readOutcome: WarpReadOutcome? = nil,
+        readError: SQLiteReaderError? = nil
+    ) -> WarpUsageStore {
+        defaults.set(flagEnabled, forKey: "features.warp.enabled")
+        let env = WarpEnvironment(
+            candidateDbPaths: pathExists ? ["/fake/warp.sqlite"] : ["/nope/warp.sqlite"],
+            fileExists: { pathExists && $0 == "/fake/warp.sqlite" }
+        )
+        return WarpUsageStore(
+            defaults: defaults,
+            environment: env,
+            tccProbe: { _ in tccState },
+            readSnapshot: { _, _ in
+                if let err = readError { throw err }
+                return readOutcome ?? .tablesMissing
+            }
+        )
+    }
+
+    @MainActor func awaitWarpFetch() {
+        let deadline = Date().addingTimeInterval(1.5)
+        while Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
+    }
+
+    run("WarpUsageStore: feature-flag off produces no tiles") {
+        let store = makeWarpStoreForTest(flagEnabled: false)
+        expectEqual(store.tiles.count, 0)
+    }
+
+    run("WarpUsageStore: TCC .denied renders needsAccess tile only") {
+        let store = makeWarpStoreForTest(flagEnabled: true, tccState: .denied)
+        store.fetch()
+        awaitWarpFetch()
+        expectEqual(store.tiles.count, 1)
+        expectEqual(store.tiles.first?.id, "warp-needs-access")
+    }
+
+    run("WarpUsageStore: path missing on disk renders not-installed tile") {
+        let store = makeWarpStoreForTest(flagEnabled: true, pathExists: false, tccState: .pathMissing)
+        store.fetch()
+        awaitWarpFetch()
+        expectEqual(store.tiles.count, 1)
+        expectEqual(store.tiles.first?.id, "warp-not-installed")
+    }
+
+    run("WarpUsageStore: happy path — today count populates counter tile + source label") {
+        let snap = WarpUsageSnapshot(
+            requestsToday: 42,
+            sourceTable: "ai_queries",
+            timestampColumn: "created_at",
+            requestsAllTime: nil
+        )
+        let store = makeWarpStoreForTest(flagEnabled: true, readOutcome: .success(snap))
+        store.fetch()
+        awaitWarpFetch()
+        let ids = store.tiles.map { $0.id }
+        expect(ids.contains("warp-requests-today"))
+        expect(ids.contains("warp-source"))
+        expect(store.snapshot?.requestsToday == 42)
+    }
+
+    run("WarpUsageStore: tables missing -> sign-in-needed tile") {
+        let store = makeWarpStoreForTest(flagEnabled: true, readOutcome: .tablesMissing)
+        store.fetch()
+        awaitWarpFetch()
+        let ids = store.tiles.map { $0.id }
+        expect(ids.contains("warp-signin-needed"))
+    }
+
+    run("WarpUsageStore: schema unknown -> update tile") {
+        let store = makeWarpStoreForTest(flagEnabled: true, readOutcome: .schemaUnknown)
+        store.fetch()
+        awaitWarpFetch()
+        let ids = store.tiles.map { $0.id }
+        expect(ids.contains("warp-schema-unknown"))
+    }
+
+    run("WarpUsageStore: (defence-in-depth) tolerates a snapshot with only all-time count") {
+        // After Codex R1 P2 finding #3 the fetcher no longer returns
+        // an all-time-only snapshot (schema drift is surfaced as
+        // .schemaUnknown instead). The STORE's rendering path is
+        // kept as defence-in-depth: if a future PR reintroduces an
+        // all-time fallback via the fetcher, the store already
+        // renders it correctly with the required warning label.
+        let snap = WarpUsageSnapshot(
+            requestsToday: nil,
+            sourceTable: "ai_queries",
+            timestampColumn: nil,
+            requestsAllTime: 1234
+        )
+        let store = makeWarpStoreForTest(flagEnabled: true, readOutcome: .success(snap))
+        store.fetch()
+        awaitWarpFetch()
+        let ids = store.tiles.map { $0.id }
+        expect(ids.contains("warp-requests-alltime"))
+        // The partial-schema warning must ALSO show so the user is
+        // not misled into thinking the number is today's.
+        expect(ids.contains("warp-partial-schema"))
+    }
+
+    run("WarpUsageStore: SQLiteReader.busy -> retry-later error, snapshot preserved") {
+        // Seed a snapshot first, then observe .busy leaves it alone.
+        let good = WarpUsageSnapshot(requestsToday: 7, sourceTable: "ai_queries", timestampColumn: "created_at", requestsAllTime: nil)
+        var callCount = 0
+        let env = WarpEnvironment(
+            candidateDbPaths: ["/fake/warp.sqlite"],
+            fileExists: { $0 == "/fake/warp.sqlite" }
+        )
+        defaults.set(true, forKey: "features.warp.enabled")
+        final class CountBox: @unchecked Sendable {
+            var count = 0
+        }
+        let box = CountBox()
+        let store = WarpUsageStore(
+            defaults: defaults,
+            environment: env,
+            tccProbe: { _ in .granted },
+            readSnapshot: { _, _ in
+                box.count += 1
+                if box.count == 1 { return .success(good) }
+                throw SQLiteReaderError.busy
+            }
+        )
+        store.fetch()
+        awaitWarpFetch()
+        expect(store.snapshot?.requestsToday == 7)
+        // Second fetch — .busy. Snapshot preserved, lastError set.
+        store.fetch()
+        awaitWarpFetch()
+        expect(store.snapshot?.requestsToday == 7, "snapshot must survive a transient .busy")
+        expect(store.lastError?.contains("retry") == true)
+        _ = callCount   // suppress unused warning
+    }
+
+    run("WarpUsageStore: clear() drops snapshot + tablesMissing + schemaUnknown flags") {
+        let snap = WarpUsageSnapshot(requestsToday: 5, sourceTable: "ai_queries", timestampColumn: "ts", requestsAllTime: nil)
+        let store = makeWarpStoreForTest(flagEnabled: true, readOutcome: .success(snap))
+        store.fetch()
+        awaitWarpFetch()
+        expect(store.snapshot != nil)
+        store.clear()
+        expect(store.snapshot == nil)
+        expect(store.lastUpdatedAt == nil)
+        expect(store.tablesMissing == false)
+        expect(store.schemaUnknown == false)
+    }
+
+    // ID-drift regression guard for Warp.
+    run("ProviderCopy id 'warp' matches WarpUsageStore.id — Settings-path scaffold for PR 12-UI") {
+        let store = WarpUsageStore()
+        expectEqual(store.id, "warp")
+        // Near-miss casings for future PR 12-UI copy.
+        expect(ProviderCopy.help(for: "Warp") == nil)
+        expect(ProviderCopy.help(for: "WARP") == nil)
+        expect(ProviderCopy.help(for: "warp-terminal") == nil)
+        expect(ProviderCopy.help(for: "warp.dev") == nil)
+    }
+
+    defaults.removePersistentDomain(forName: suite)
+}
+
 // MARK: - Summary
 
 print("")

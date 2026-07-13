@@ -125,6 +125,93 @@ jobs:
             exit 1
           fi
 
+      - name: Reject JetBrains AI live-endpoint use (DMCA constraint)
+        run: |
+          # PR 12-BE — the JetBrains AI Assistant provider is
+          # deliberately LOCAL-ONLY. Calling `api.jetbrains.ai` or
+          # `grazie.aws.intellij.net` from this app would breach
+          # JetBrains's terms and expose the project to a DMCA request.
+          #
+          # Codex R1 P2 (finding #6) + Codex R2 P2 (comment-stripping
+          # bug): the guard now INVERTS its approach. Rather than
+          # strip comments and then scan for strings (which
+          # accidentally strips `//` inside URL literals like
+          # `"https://api.jetbrains.ai/v1"`), it uses Python's
+          # tokenize-like inspection via a small awk program to
+          # walk the file character-by-character, tracking whether
+          # the cursor is inside a Swift string literal (regular
+          # OR raw with `#"..."#` OR multi-line `"""..."""`) or
+          # inside a comment (`// ...` OR `/* ... */`), and emits
+          # only the string-literal bytes. Then we grep the
+          # extracted string content for the forbidden hosts.
+          FORBIDDEN='api\.jetbrains\.ai|grazie\.aws\.intellij\.net'
+          FAIL=0
+          while IFS= read -r file; do
+            # Extract every Swift string-literal body via awk. State
+            # machine tracks four modes: code, line-comment,
+            # block-comment, string-literal. Emits string-literal
+            # bytes only.
+            #
+            # Codex R3 P2: the earlier version compared a 2-char
+            # `d` to `"""` (3 chars), so the triple-quote branch was
+            # unreachable — a multiline `"""..."""` string was parsed
+            # as an empty single-line string followed by ordinary
+            # code, and a forbidden host inside the multi-line body
+            # never reached the string-mode emitter. This version
+            # takes a 3-char `t` (triple-lookahead) and always
+            # matches triple-quote BEFORE single-quote to avoid the
+            # ambiguity.
+            strings=$(awk '
+              BEGIN { mode="code"; }
+              {
+                i = 1;
+                while (i <= length($0)) {
+                  c = substr($0, i, 1);
+                  d = substr($0, i, 2);
+                  t = substr($0, i, 3);
+                  if (mode == "code") {
+                    if (d == "//") { mode="line_comment"; i += 2; continue; }
+                    if (d == "/*") { mode="block_comment"; i += 2; continue; }
+                    # Triple-quote MUST be tested before single-quote —
+                    # otherwise `"""` reads as `""` + `"`.
+                    if (t == "\"\"\"") { mode="ms"; i += 3; continue; }
+                    if (d == "#\"") { mode="raw"; i += 2; continue; }
+                    if (c == "\"") { mode="s"; i += 1; continue; }
+                    i += 1; continue;
+                  }
+                  if (mode == "line_comment") { i = length($0)+1; continue; }
+                  if (mode == "block_comment") {
+                    if (d == "*/") { mode="code"; i += 2; continue; }
+                    i += 1; continue;
+                  }
+                  if (mode == "s") {
+                    if (c == "\\") { printf "%s", substr($0, i, 2); i += 2; continue; }
+                    if (c == "\"") { mode="code"; printf "\n"; i += 1; continue; }
+                    printf "%s", c; i += 1; continue;
+                  }
+                  if (mode == "ms") {
+                    if (t == "\"\"\"") { mode="code"; printf "\n"; i += 3; continue; }
+                    printf "%s", c; i += 1; continue;
+                  }
+                  if (mode == "raw") {
+                    if (d == "\"#") { mode="code"; printf "\n"; i += 2; continue; }
+                    printf "%s", c; i += 1; continue;
+                  }
+                }
+                # End of line — line comments end at line boundary.
+                if (mode == "line_comment") { mode="code"; }
+              }
+            ' "$file")
+            if echo "$strings" | grep -qE "$FORBIDDEN"; then
+              echo "::error file=$file::DMCA live-endpoint reference to a forbidden JetBrains host in a Swift string literal." >&2
+              FAIL=1
+            fi
+          done < <(find app -name '*.swift' -type f)
+          if [ $FAIL -eq 1 ]; then
+            echo "::error::JetBrains live-endpoint use detected. DMCA constraint — this app must NOT contact api.jetbrains.ai or grazie.aws.intellij.net. See .pr-bodies/RESUME.md 'Known caveats'." >&2
+            exit 1
+          fi
+
   build-and-test:
     name: Build and test (macOS)
     runs-on: macos-15
