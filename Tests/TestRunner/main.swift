@@ -1048,6 +1048,249 @@ run("ProviderCopy: Cursor disclosure warns about private API + refresh flow + si
     )
 }
 
+run("ProviderCopy id 'jetbrains' matches JetBrainsUsageStore.id — exercises the real Settings path (PR 12-UI regression guard)") {
+    // Same regression guard as PRs 10b-UI/10c-UI/windsurf/cursor: read
+    // the store's OWN id, then also the ProviderBox-wrapped id — the
+    // exact path ProviderToggleRow walks in Settings. A silent rename
+    // of either side would drop the tile to nil copy.
+    MainActor.assumeIsolated {
+        let store = JetBrainsUsageStore()
+        expect(ProviderCopy.help(for: store.id) != nil)
+        // JetBrains has BOTH help + disclosure — disclosure covers the
+        // load-bearing DMCA / schema-drift / UTC facts.
+        expect(ProviderCopy.disclosure(for: store.id) != nil)
+        let box = ProviderBox(store)
+        expect(ProviderCopy.help(for: box.id) != nil)
+        expect(ProviderCopy.disclosure(for: box.id) != nil)
+    }
+    // Pin the literal too so a store-id rename does not silently pass
+    // when both sides move together but drift away from the shipped
+    // spec.
+    expect(ProviderCopy.help(for: "jetbrains") != nil)
+    expect(ProviderCopy.disclosure(for: "jetbrains") != nil)
+    // Near-miss casings return nil so a silent rename disaster is
+    // caught. `JetBrains` is the human-readable rendering; the id is
+    // lowercase. Codex R1 P3#6: both `help` and `disclosure` must
+    // reject every near-miss — a mismatch between the two lists
+    // would allow one path to silently accept `jetbrains-ai` while
+    // the other rejects it.
+    expect(ProviderCopy.help(for: "JetBrains") == nil)
+    expect(ProviderCopy.help(for: "JETBRAINS") == nil)
+    expect(ProviderCopy.help(for: "jet-brains") == nil)
+    expect(ProviderCopy.help(for: "jetbrains-ai") == nil)
+    expect(ProviderCopy.disclosure(for: "JetBrains") == nil)
+    expect(ProviderCopy.disclosure(for: "JETBRAINS") == nil)
+    expect(ProviderCopy.disclosure(for: "jet-brains") == nil)
+    expect(ProviderCopy.disclosure(for: "jetbrains-ai") == nil)
+}
+
+run("ProviderCopy id 'warp' matches WarpUsageStore.id — exercises the real Settings path (PR 12-UI regression guard)") {
+    // Same regression guard as JetBrains and prior UI PRs: read the
+    // store's OWN id AND ProviderBox-wrapped id. Near-miss casings
+    // must return nil.
+    MainActor.assumeIsolated {
+        let store = WarpUsageStore()
+        expect(ProviderCopy.help(for: store.id) != nil)
+        // Warp has BOTH help + disclosure — disclosure covers the
+        // schema-drift and wk-key-deferred facts.
+        expect(ProviderCopy.disclosure(for: store.id) != nil)
+        let box = ProviderBox(store)
+        expect(ProviderCopy.help(for: box.id) != nil)
+        expect(ProviderCopy.disclosure(for: box.id) != nil)
+    }
+    expect(ProviderCopy.help(for: "warp") != nil)
+    expect(ProviderCopy.disclosure(for: "warp") != nil)
+    // Near-miss casings. `Warp` is the display name; the id is
+    // lowercase. `warp-terminal` and `warp.dev` are plausible aliases
+    // a future rename might slip in — reject them.
+    expect(ProviderCopy.help(for: "Warp") == nil)
+    expect(ProviderCopy.help(for: "WARP") == nil)
+    expect(ProviderCopy.help(for: "warp-terminal") == nil)
+    expect(ProviderCopy.help(for: "warp.dev") == nil)
+    // Codex R1 P3#6: symmetry between help and disclosure near-miss
+    // asserts. `warp.dev` in the disclosure path is a plausible
+    // near-miss (Warp's marketing domain) that a maintainer might
+    // accidentally add.
+    expect(ProviderCopy.disclosure(for: "Warp") == nil)
+    expect(ProviderCopy.disclosure(for: "WARP") == nil)
+    expect(ProviderCopy.disclosure(for: "warp-terminal") == nil)
+    expect(ProviderCopy.disclosure(for: "warp.dev") == nil)
+}
+
+run("ProviderCopy: JetBrains help names both vendor roots, the XML filename, pure-local posture (PR 12-UI)") {
+    // The JetBrains help must (1) name BOTH vendor roots so a user
+    // with Android Studio understands why AS is included even though
+    // it lives under `Google/`, (2) name the exact XML filename so a
+    // curious user can `stat` it, (3) assert "Nothing leaves your Mac"
+    // so pure-local posture is explicit, (4) tell the user no key /
+    // pasted credential / sign-in on our side is needed, and (5) note
+    // that AI Assistant must be enabled inside a JetBrains IDE at
+    // least once for the file to exist (otherwise the tile shows
+    // "not installed" and the user may not know why).
+    let help = ProviderCopy.help(for: "jetbrains")
+    expect(help != nil)
+    // Both vendor roots named — the JetBrains one AND the Google one
+    // (Android Studio). If either is missing, an Android Studio user
+    // will not realise their install is covered.
+    expect(help?.contains("Application Support/JetBrains") == true)
+    expect(help?.contains("Application Support/Google") == true)
+    // The XML filename appears verbatim so a user can find it.
+    expect(help?.contains("AIAssistantQuotaManager2.xml") == true)
+    // Pure-local promise.
+    expect(help?.contains("Nothing leaves your Mac") == true)
+    // No-key / no-pasted-credential posture at OUR end. Codex R1
+    // P3#5: pin "in this app" so a rewrite dropping that scope
+    // (which would over-claim "no vendor sign-in either") fails.
+    // "no sign-in" alone is FORBIDDEN — JetBrains IDE sign-in is
+    // required for the XML file to exist.
+    expect(help?.contains("no key") == true || help?.contains("no pasted credential") == true)
+    expect(help?.contains("in this app") == true)
+    expect(help?.contains("no sign-in") == false)
+    expect(help?.contains("no sign in") == false)
+    // The "AI Assistant must be enabled inside the IDE" prerequisite
+    // is named — otherwise the not-installed tile is unexplained.
+    expect(help?.contains("AI Assistant") == true)
+}
+
+run("ProviderCopy: JetBrains disclosure covers DMCA constraint + schema drift + UTC dates (PR 12-UI)") {
+    // The JetBrains disclosure must cover THREE load-bearing facts,
+    // each pinned INDEPENDENTLY so a rewrite that drops one is
+    // caught: (a) the DMCA constraint — this app deliberately does
+    // NOT contact JetBrains's live quota API (and a CI guard
+    // enforces it); (b) the IntelliJ PersistentStateComponent XML
+    // format may change between IDE versions, and if it does a
+    // "format changed" tile appears until the app is updated; (c)
+    // refill dates render in UTC and a UTC value may resolve to a
+    // different day in the user's local timezone (off-by-one
+    // hazard).
+    let disc = ProviderCopy.disclosure(for: "jetbrains")
+    expect(disc != nil)
+    // (a) DMCA constraint — both forbidden hostnames must be named.
+    // A user auditing the app's network behaviour needs to see both.
+    expect(disc?.contains("api.jetbrains.ai") == true)
+    expect(disc?.contains("grazie.aws.intellij.net") == true)
+    // Pin the "does NOT contact" framing so a future rewrite that
+    // said "avoids contacting" (weaker) would fail. Capital NOT is a
+    // deliberate emphasis; accept either.
+    expect(disc?.contains("does NOT contact") == true || disc?.contains("does not contact") == true)
+    // Codex R1 P2#2: the RESUME spec REQUIRES the DMCA constraint to
+    // be named EXPLICITLY. Prior text said "CI static-grep guard"
+    // but never the word "DMCA" — a security-conscious reader sees
+    // a policy promise without the reason. Pin the DMCA word so a
+    // future rewrite that dropped it fails.
+    expect(disc?.contains("DMCA") == true)
+    // The CI enforcement is surfaced so a security-minded reader
+    // knows the constraint is guarded, not just documented.
+    expect(disc?.contains("CI") == true || disc?.contains("static-grep") == true || disc?.contains("guard") == true)
+    // (b) Schema drift + user-visible tile.
+    expect(disc?.contains("format") == true)
+    expect(disc?.contains("quota format changed") == true || disc?.contains("JetBrains quota format changed") == true)
+    // (c) UTC rendering and the off-by-one hazard.
+    expect(disc?.contains("UTC") == true)
+    // The off-by-one is pinned by an example date fragment or the
+    // explicit local-timezone framing.
+    expect(disc?.contains("local timezone") == true || disc?.contains("local time zone") == true || disc?.contains("31 Jul") == true || disc?.contains("2 Aug") == true)
+}
+
+run("ProviderCopy: Warp help names both sqlite paths + Group Container fallback + pure-local posture (PR 12-UI)") {
+    // The Warp help must (1) name the primary sqlite path so a
+    // curious user can `stat` it, (2) name the Group Container
+    // fallback so an App-Store install is covered, (3) name the
+    // Preview channel fallback, (4) assert "Nothing leaves your Mac"
+    // so pure-local posture is explicit, (5) tell the user no key /
+    // pasted credential is needed at our end, and (6) name the
+    // today-window scope (only today's AI-request count) so the
+    // user is not misled into thinking this is a full-usage tile.
+    let help = ProviderCopy.help(for: "warp")
+    expect(help != nil)
+    // Primary path.
+    expect(help?.contains("Application Support/dev.warp.Warp-Stable/warp.sqlite") == true)
+    // Group Container fallback — App-Store installs live here.
+    expect(help?.contains("Group Containers/2BBY89MBSN.dev.warp/warp.sqlite") == true)
+    // Preview channel fallback.
+    expect(help?.contains("Warp-Preview") == true)
+    // Pure-local promise.
+    expect(help?.contains("Nothing leaves your Mac") == true)
+    // No-key / no-pasted-credential posture at OUR end. Codex R1
+    // P3#5: pin "in this app" so scope drift is caught, and
+    // FORBID "no sign-in" — Warp itself needs a sign-in for AI
+    // queries to be logged.
+    expect(help?.contains("no key") == true || help?.contains("no pasted credential") == true)
+    expect(help?.contains("in this app") == true)
+    expect(help?.contains("no sign-in") == false)
+    expect(help?.contains("no sign in") == false)
+    // Today-window scope — the user should not think this is a full
+    // usage / balance tile. Warp's balance and rate limits live
+    // server-side; those are the deferred wk-key path.
+    expect(help?.contains("today") == true)
+    // Codex R2 P3#2: pin the balance + rate-limit exclusion facts
+    // INDEPENDENTLY so a rewrite that dropped one is caught. The
+    // prior single `||` chain permitted "history is not read here"
+    // to satisfy the asserion while dropping "credit balance" and
+    // "rate limits".
+    expect(help?.contains("credit balance") == true || help?.contains("balance") == true)
+    expect(help?.contains("rate limits") == true)
+    expect(help?.contains("NOT read") == true || help?.contains("not read") == true)
+}
+
+run("ProviderCopy: Warp disclosure covers schema drift + wk-key path deferred (PR 12-UI)") {
+    // The Warp disclosure must cover TWO load-bearing facts, each
+    // pinned INDEPENDENTLY so a rewrite that drops one is caught:
+    // (a) the sqlite schema is not documented — this app reads two
+    // known table names with a small set of accepted timestamp
+    // columns/formats, and a schema drift surfaces a user-visible
+    // tile until the app is updated; (b) Warp's own server-side
+    // credit balance and rate limits are NOT read here — the
+    // `wk-`-prefixed API-key GraphQL path is deferred to a future
+    // PR (so a user looking for that in Settings does not think it
+    // is broken).
+    let disc = ProviderCopy.disclosure(for: "warp")
+    expect(disc != nil)
+    // (a) Schema not documented + drift tile.
+    expect(disc?.contains("not documented") == true || disc?.contains("undocumented") == true)
+    // Both known table names appear verbatim so an auditor can
+    // verify which shapes are accepted.
+    expect(disc?.contains("ai_queries") == true)
+    expect(disc?.contains("agent_conversations") == true)
+    // Codex R1 P2#3: RESUME spec requires SIX accepted timestamp
+    // column names. Pin each INDEPENDENTLY so a future rewrite that
+    // drops one is caught. `created_at` and `createdAt` are the
+    // most common on-disk names; the four short aliases catch older
+    // Warp releases.
+    expect(disc?.contains("created_at") == true)
+    expect(disc?.contains("createdAt") == true)
+    expect(disc?.contains("timestamp") == true)
+    // `ts`, `date`, `time` — pin them as whole tokens (backtick-
+    // wrapped, matching the disclosure prose) so a rewrite that
+    // dropped one but kept prose sentences using those words
+    // ambiently does not silently pass.
+    expect(disc?.contains("`ts`") == true)
+    expect(disc?.contains("`date`") == true)
+    expect(disc?.contains("`time`") == true)
+    // The drift tile is named so a reader knows the failure mode.
+    expect(disc?.contains("Warp database format changed") == true || disc?.contains("database format changed") == true)
+    // (b) Server-side credits + wk-key path deferred. Codex R1 P2#4:
+    // load-bearing FACTS are pinned INDEPENDENTLY — an `||` chain
+    // that allowed "server-side" alone would drop the "credit
+    // balance" and "rate limits" specifics, and a chain that
+    // allowed "wk-" alone would drop the "server-side" contrast.
+    expect(disc?.contains("server-side") == true)
+    // Credit balance is one of the two things NOT read locally —
+    // pin the specific word so a vague rewrite fails.
+    expect(disc?.contains("credit balance") == true || disc?.contains("balance") == true)
+    // Rate limits are the OTHER thing NOT read locally — same
+    // reasoning.
+    expect(disc?.contains("rate limits") == true)
+    // The "NOT read" (or lowercase "not read") verb pin — a
+    // rewrite that said "are shown elsewhere" would drop the
+    // security-relevant "this app does not touch them" fact.
+    expect(disc?.contains("NOT read") == true || disc?.contains("not read") == true)
+    // The wk-key GraphQL path is explicitly named as deferred so a
+    // user asking "when will I get balances?" has a pointer.
+    expect(disc?.contains("wk-") == true)
+    expect(disc?.contains("deferred") == true || disc?.contains("follow-up") == true)
+}
+
 run("ProviderCopy: Claude Code disclosure states 'estimate not receipt' + unpriced-model behaviour (PR 10b-UI)") {
     // Costs are estimates. If we don't say so, a user could see $47 in
     // the tile and be surprised when their Anthropic bill says $52. The

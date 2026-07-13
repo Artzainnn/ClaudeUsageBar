@@ -10,9 +10,11 @@
 // Verified by the CI static-grep guard (see Non-breaking guarantee in
 // the PR body).
 //
-// Feature posture: `features.jetbrains.enabled` defaults false. Nothing
-// registers a JetBrainsUsageStore into `AppDelegate.providers` yet —
-// that lands in PR 12-UI along with `ProviderCopy.help(for: "jetbrains")`.
+// Feature posture: `features.jetbrains.enabled` defaults false. PR 12-UI
+// registers a JetBrainsUsageStore into `AppDelegate.providers` alongside
+// the Windsurf / Cursor / Warp providers, and adds
+// `ProviderCopy.help(for: "jetbrains")` + `ProviderCopy.disclosure(for: "jetbrains")`.
+// The store remains inert until the feature flag is flipped on.
 
 import Foundation
 import SwiftUI

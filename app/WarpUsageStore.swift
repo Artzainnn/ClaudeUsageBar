@@ -5,9 +5,11 @@
 // surfaces a diagnostic tile per EXPANSION_PLAN.md § Phase 8f's
 // "version-guard the reader" directive.
 //
-// Feature posture: `features.warp.enabled` defaults false. Nothing
-// registers a WarpUsageStore into `AppDelegate.providers` yet — that
-// lands in PR 12-UI along with `ProviderCopy.help(for: "warp")`.
+// Feature posture: `features.warp.enabled` defaults false. PR 12-UI
+// registers a WarpUsageStore into `AppDelegate.providers` alongside
+// the Windsurf / Cursor / JetBrains providers, and adds
+// `ProviderCopy.help(for: "warp")` + `ProviderCopy.disclosure(for: "warp")`.
+// The store remains inert until the feature flag is flipped on.
 //
 // Live-endpoint deferred: Warp officially documents `wk-`-prefixed
 // API keys against `app.warp.dev`'s GraphQL endpoint; that path is a

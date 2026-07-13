@@ -111,6 +111,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // on double-401 surfaces a "sign in again in Cursor" tile.
         // Backend from PR #71.
         providers.append(ProviderBox(CursorUsageStore()))
+        // PR 12-UI: register JetBrains AI. Opt-in
+        // (features.jetbrains.enabled defaults false); pure-local —
+        // parses `AIAssistantQuotaManager2.xml` under both
+        // `~/Library/Application Support/JetBrains` and
+        // `~/Library/Application Support/Google` (Android Studio's
+        // vendor namespace). Nothing leaves the machine; no key or
+        // paste required. DMCA constraint: this store deliberately
+        // does NOT contact JetBrains's live quota API — the two
+        // forbidden hostnames are enumerated in
+        // `ProviderCopy.disclosure(for: "jetbrains")`, and enforced
+        // by the CI static-grep guard added in PR #73 and hardened
+        // in PR 12-UI. Backend from PR #73.
+        providers.append(ProviderBox(JetBrainsUsageStore()))
+        // PR 12-UI: register Warp. Opt-in
+        // (features.warp.enabled defaults false); pure-local — reads
+        // Warp's own state sqlite (`~/Library/Application Support/`
+        // `dev.warp.Warp-Stable/warp.sqlite`, with fallbacks to the
+        // Group Container and Preview channel) for a today-window
+        // AI-request count. Schema-guarded: surfaces a "database
+        // format changed" tile rather than fabricating a number
+        // against an unknown shape. Nothing leaves the machine; no
+        // key or paste required. Warp's own credit balance and rate
+        // limits live server-side and are NOT read here (the wk-key
+        // GraphQL path is deferred to a future PR). Backend from
+        // PR #73.
+        providers.append(ProviderBox(WarpUsageStore()))
         // Model SwiftUI observes for the generic (non-Anthropic) provider
         // tiles. Anthropic continues to render through usageManager directly.
         providersModel = ProvidersModel(providers: providers)

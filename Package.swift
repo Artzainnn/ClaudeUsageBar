@@ -63,6 +63,11 @@ let package = Package(
                 "Log.swift",
                 "AnthropicUsageFetcher.swift",
                 "UsageProvider.swift",
+                // PR 12-UI — ProviderCopy extracted into its own file so
+                // the CI DMCA static-grep guard can allowlist ONLY the
+                // copy-catalog file (not UsageProvider.swift, which
+                // also contains DefaultsStore executable code).
+                "ProviderCopy.swift",
                 "CodexUsageFetcher.swift",
                 // CodexUsageStore has no dependency on UsageManager (unlike
                 // AnthropicUsageStore), so it lives in the library where the

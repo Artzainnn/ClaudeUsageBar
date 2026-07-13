@@ -44,6 +44,7 @@ swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_arm64" \
     Log.swift \
     AnthropicUsageFetcher.swift \
     UsageProvider.swift \
+    ProviderCopy.swift \
     AnthropicUsageStore.swift \
     CodexUsageFetcher.swift \
     CodexUsageStore.swift \
@@ -86,6 +87,7 @@ swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_x86_64" \
     Log.swift \
     AnthropicUsageFetcher.swift \
     UsageProvider.swift \
+    ProviderCopy.swift \
     AnthropicUsageStore.swift \
     CodexUsageFetcher.swift \
     CodexUsageStore.swift \

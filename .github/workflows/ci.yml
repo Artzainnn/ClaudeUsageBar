@@ -125,6 +125,591 @@ jobs:
             exit 1
           fi
 
+      - name: Enforce copy-only shape of the DMCA-allowlisted file
+        run: |
+          # Codex R4 P2#1: `app/ProviderCopy.swift` is whole-file
+          # allowlisted by the DMCA guard below. That allowlist is
+          # only safe if the file NEVER gains executable code that
+          # could form a live-endpoint request. This step mechanises
+          # the "copy-only" promise: it rejects any of the following
+          # tokens appearing in the allowlisted file:
+          #   - URL / URLSession / URLComponents / URLRequest
+          #   - NWConnection / URLProtocol / dataTask / httpMethod
+          #   - Data(contentsOf:) / String(contentsOf:)
+          #   - any import beyond Foundation
+          #   - Keychain / SecItem symbols (credential handling)
+          #   - Log / NSLog / print / os_log (logging sinks are the
+          #     other credential-leak surface — they are also
+          #     forbidden in a pure-copy file)
+          #
+          # If a legitimate need arises to add executable code, the
+          # allowlist must be re-scoped (per-line or per-string) in
+          # the same PR that adds the code.
+          set -euo pipefail
+          ALLOWLISTED_FILE='app/ProviderCopy.swift'
+          if [ ! -f "$ALLOWLISTED_FILE" ]; then
+            echo "::error::Copy-only shape guard: allowlisted file '$ALLOWLISTED_FILE' does not exist. If the copy was moved, update this step + the DMCA guard's ALLOWLISTED_FILE together." >&2
+            exit 1
+          fi
+          # Tokens that must NOT appear anywhere in the file. A code
+          # comment mentioning e.g. "URLSession" is fine — the
+          # awk-based extractor below strips comments before
+          # matching, mirroring the DMCA guard's extractor so a
+          # comment about the constraint does not trip the guard.
+          #
+          # Codex R5 P2#2: broadened from `URL(string:` to also catch
+          # `\bURL\b` (bare type), `URL\.init` (explicit init form),
+          # `NSURL`, and `Foundation\.URL` (qualified reference). Also
+          # matches `String.init(contentsOf:)` and `Data.init(contentsOf:)`.
+          # An extra token `\\\\\(` (Swift string interpolation) will
+          # be checked separately below because interpolation permits
+          # arbitrary code inside a string literal — the extractor
+          # can't see inside interpolation without a full Swift
+          # tokenizer, so we just ban the pattern outright in this
+          # copy-only file.
+          # Codex R6 P2#1: added process-spawn / subprocess-execution
+          # escape hatches. A Process/NSTask/launchPath/executableURL
+          # + arguments + run/launch call can shell out to `curl` and
+          # form a live-endpoint request WITHOUT ever mentioning
+          # URL/URLSession in Swift code — the forbidden hostname
+          # lives in a string literal which the shape extractor
+          # deliberately ignores. Plus `print` for defence-in-depth.
+          # Plus `FileHandle` and `Pipe` since a subprocess launched
+          # through them is functionally equivalent.
+          #
+          # Codex R7 P2#1: added ObjC-runtime dynamic-dispatch tokens.
+          # A hostile edit can call NSURLSession via
+          # `NSClassFromString("NSURLSession").perform(...)` with the
+          # dangerous class name AND the forbidden host both hidden
+          # inside inert string literals. The shape extractor strips
+          # string bodies, so URL and URLSession tokens never appear
+          # in emitted code. The fix bans the ObjC-runtime surface
+          # (NSClassFromString, NSSelectorFromString, Selector,
+          # perform, NSObject/NSObjectProtocol, @objc, dynamic) plus
+          # low-level runtime symbol lookup (unsafeBitCast, dlopen,
+          # dlsym, dlclose).
+          #
+          # Codex R8 P2#1: added Foundation stream/socket primitives.
+          # `Stream.getStreamsToHost(withName: "api.jetbrains.ai", …)`
+          # forms a TCP connection to the forbidden host without any
+          # URL/URLSession/Process token. Ban Stream, InputStream,
+          # OutputStream, getStreamsToHost, CFStreamCreatePairWithSocketToHost,
+          # CFHost, NetService.
+          #
+          # This denylist is fundamentally arms-race-y. The
+          # STRUCTURAL SHAPE CHECK below is the actual defence:
+          # any function/class/struct/extension in this file
+          # beyond the two documented `help` and `disclosure`
+          # functions fails CI. That is what makes the copy-only
+          # promise mechanical rather than aspirational.
+          FORBIDDEN_TOKENS='URLSession|URLComponents|URLRequest|URLProtocol|NWConnection|dataTask|httpMethod|URL\(string:|URL\.init|NSURL|Foundation\.URL|\bURL\b|Data\(contentsOf:|Data\.init\(contentsOf:|String\(contentsOf:|String\.init\(contentsOf:|SecItemAdd|SecItemUpdate|SecItemCopyMatching|SecItemDelete|NSLog|Logger\(|os_log|Log\.debug|Log\.info|\bprint\b|\bProcess\b|\bNSTask\b|launchPath|executableURL|\barguments\b|\.run\(|\.launch\(|\bPipe\b|\bFileHandle\b|NSClassFromString|NSSelectorFromString|\bSelector\b|\.perform\(|\bNSObject\b|NSObjectProtocol|@objc|\bdynamic\b|unsafeBitCast|\bdlopen\b|\bdlsym\b|\bdlclose\b|\bStream\b|\bInputStream\b|\bOutputStream\b|getStreamsToHost|CFStreamCreatePairWithSocketToHost|\bCFHost\b|\bNetService\b'
+          # Imports beyond Foundation: the copy file MUST NOT import
+          # any networking, cryptography, or SwiftUI/AppKit surface.
+          # Foundation alone is sufficient for `String` literals.
+          # Extract imports from OUTSIDE comments to avoid tripping
+          # on documentation lines. Simple grep on non-comment lines
+          # (lines that do not start with `//` or `*`, ignoring
+          # leading whitespace).
+          #
+          # Codex R5 P3#4: Swift permits attributed imports
+          # (`@_exported import Security`, `@_implementationOnly
+          # import Network`, `internal import Foo`, `public import
+          # Bar`, etc.). The stricter rule is: any non-comment line
+          # whose LAST `import <Module>` token is not `import
+          # Foundation` (bare) is rejected. Regex matches an import
+          # line with any leading attributes/modifiers, and demands
+          # exactly `import Foundation` at the end.
+          non_comment=$(grep -vE '^\s*(//|\*)' "$ALLOWLISTED_FILE" || true)
+          # Match any line containing `\bimport\b` word.
+          all_imports=$(printf '%s\n' "$non_comment" | grep -E '(^|[^a-zA-Z0-9_])import\b' || true)
+          # Reject any that are NOT the exact allowed shape
+          # (`\s*import\s+Foundation\s*(//.*)?\s*$`) — this
+          # permits an inline `// comment` after the import but no
+          # attributed forms.
+          unexpected_imports=$(printf '%s\n' "$all_imports" | grep -vE '^\s*import\s+Foundation\s*(//.*)?\s*$' || true)
+          if [ -n "$unexpected_imports" ]; then
+            echo "::error file=$ALLOWLISTED_FILE::Copy-only shape guard: found an unexpected import (bare, attributed, or qualified). The allowlisted copy file may import ONLY 'Foundation' — no attributes (@_exported etc.), no qualified imports (Foundation.NSString), no other modules." >&2
+            echo "$unexpected_imports" >&2
+            exit 1
+          fi
+          # Now scan the file for forbidden tokens, but ignore
+          # comments and string LITERAL bodies (a comment CAN mention
+          # e.g. "URLSession" as documentation; a string literal like
+          # `let s = "URLSession fake"` is inert data). Use the same
+          # awk extractor as the DMCA guard, then EMIT everything
+          # OUTSIDE string literals AND comments — i.e. actual Swift
+          # code. The DMCA extractor emits string bodies; here we
+          # invert to emit code bodies.
+          #
+          # Codex R5 P2#1: string interpolation `"...\(expr)..."`
+          # would let arbitrary Swift code hide inside a string body.
+          # The awk extractor treats the entire string body as inert.
+          # To defeat this bypass, the check below ALSO rejects the
+          # literal `\(` in the RAW file content (outside comments)
+          # for this copy-only file. Any legitimate copy string is
+          # literal text without runtime interpolation; if a maintainer
+          # needs a placeholder, they must template it before compile
+          # or extract a helper into a non-allowlisted file.
+          code_only=$(awk '
+            BEGIN { mode="code"; }
+            {
+              i = 1;
+              while (i <= length($0)) {
+                c = substr($0, i, 1);
+                d = substr($0, i, 2);
+                t = substr($0, i, 3);
+                if (mode == "code") {
+                  if (d == "//") { mode="line_comment"; i += 2; continue; }
+                  if (d == "/*") { mode="block_comment"; i += 2; continue; }
+                  if (t == "\"\"\"") { mode="ms"; i += 3; continue; }
+                  if (d == "#\"") { mode="raw"; i += 2; continue; }
+                  if (c == "\"") { mode="s"; i += 1; continue; }
+                  printf "%s", c; i += 1; continue;
+                }
+                if (mode == "line_comment") { i = length($0)+1; continue; }
+                if (mode == "block_comment") {
+                  if (d == "*/") { mode="code"; i += 2; continue; }
+                  i += 1; continue;
+                }
+                if (mode == "s") {
+                  if (c == "\\") { i += 2; continue; }
+                  if (c == "\"") { mode="code"; i += 1; continue; }
+                  i += 1; continue;
+                }
+                if (mode == "ms") {
+                  if (t == "\"\"\"") { mode="code"; i += 3; continue; }
+                  i += 1; continue;
+                }
+                if (mode == "raw") {
+                  if (d == "\"#") { mode="code"; i += 2; continue; }
+                  i += 1; continue;
+                }
+              }
+              printf "\n";
+              if (mode == "line_comment") { mode="code"; }
+            }
+          ' "$ALLOWLISTED_FILE")
+          match_rc=0
+          grep -qE "$FORBIDDEN_TOKENS" <<< "$code_only" || match_rc=$?
+          if [ $match_rc -eq 0 ]; then
+            echo "::error file=$ALLOWLISTED_FILE::Copy-only shape guard: forbidden token found in executable code. This file is DMCA-allowlisted and must remain copy-only." >&2
+            grep -nE "$FORBIDDEN_TOKENS" <<< "$code_only" >&2 || true
+            exit 1
+          elif [ $match_rc -ne 1 ]; then
+            echo "::error::Copy-only shape guard: grep failed with rc=$match_rc — escalating." >&2
+            exit 1
+          fi
+          # Codex R5 P2#1: reject string interpolation entirely.
+          # Extract everything OUTSIDE comments (both code AND string
+          # bodies) via a different awk pass, then reject `\(`
+          # anywhere in the output. This catches interpolation whether
+          # it appears in a string literal (executable expression) or
+          # in bare code (which shouldn't have `\(` outside a string
+          # anyway).
+          non_comment_all=$(awk '
+            BEGIN { mode="code"; }
+            {
+              i = 1;
+              while (i <= length($0)) {
+                c = substr($0, i, 1);
+                d = substr($0, i, 2);
+                if (mode == "code") {
+                  if (d == "//") { mode="line_comment"; i += 2; continue; }
+                  if (d == "/*") { mode="block_comment"; i += 2; continue; }
+                  printf "%s", c; i += 1; continue;
+                }
+                if (mode == "line_comment") { i = length($0)+1; continue; }
+                if (mode == "block_comment") {
+                  if (d == "*/") { mode="code"; i += 2; continue; }
+                  i += 1; continue;
+                }
+              }
+              printf "\n";
+              if (mode == "line_comment") { mode="code"; }
+            }
+          ' "$ALLOWLISTED_FILE")
+          if grep -qE '\\\(' <<< "$non_comment_all"; then
+            echo "::error file=$ALLOWLISTED_FILE::Copy-only shape guard: string interpolation ('\\(...)') found. Interpolation permits arbitrary Swift code inside a string literal and defeats the copy-only shape guarantee. Refactor to plain literals or move the interpolation into a non-allowlisted file." >&2
+            grep -nE '\\\(' -- "$ALLOWLISTED_FILE" >&2 || true
+            exit 1
+          fi
+          # Codex R8 defence: STRUCTURAL POSITIVE-SHAPE CHECK. The
+          # denylist above is arms-race prone (Stream, dlsym, NSTask,
+          # etc. keep appearing). The structural check is the
+          # mechanical enforcement that this file remains copy-only:
+          # count the top-level declarations and reject any that are
+          # not the two expected functions inside the ProviderCopy
+          # enum. Anything else (extension, class, struct, protocol,
+          # global var, static let, extra function, typealias)
+          # fails.
+          #
+          # We count occurrences of Swift declaration keywords in
+          # the code-only extracted output. Expected: exactly one
+          # `enum ProviderCopy` and exactly two `public static func`
+          # (help + disclosure). Zero of everything else.
+          count_of() {
+            local pattern="$1"
+            grep -oE "$pattern" <<< "$code_only" | wc -l | tr -d ' '
+          }
+          enum_count=$(count_of '\benum[[:space:]]+ProviderCopy\b')
+          func_count=$(count_of '\bfunc[[:space:]]')
+          class_count=$(count_of '\bclass[[:space:]]')
+          struct_count=$(count_of '\bstruct[[:space:]]')
+          protocol_count=$(count_of '\bprotocol[[:space:]]')
+          extension_count=$(count_of '\bextension[[:space:]]')
+          typealias_count=$(count_of '\btypealias[[:space:]]')
+          var_count=$(count_of '\bvar[[:space:]]')
+          global_let_count=$(grep -cE '^[[:space:]]*(public[[:space:]]+|private[[:space:]]+|internal[[:space:]]+)?let[[:space:]]' <<< "$code_only" || true)
+          if [ "$enum_count" != "1" ]; then
+            echo "::error file=$ALLOWLISTED_FILE::Copy-only shape guard: expected exactly 1 'enum ProviderCopy' declaration, found $enum_count. This file must contain only the ProviderCopy enum." >&2
+            exit 1
+          fi
+          if [ "$func_count" != "2" ]; then
+            echo "::error file=$ALLOWLISTED_FILE::Copy-only shape guard: expected exactly 2 'func' declarations (help + disclosure), found $func_count. Adding another function to this file requires re-scoping the DMCA allowlist." >&2
+            exit 1
+          fi
+          for kind in class struct protocol extension typealias var; do
+            eval "cnt=\$${kind}_count"
+            if [ "$cnt" != "0" ]; then
+              echo "::error file=$ALLOWLISTED_FILE::Copy-only shape guard: expected 0 '$kind' declarations, found $cnt. This file must contain only the ProviderCopy enum with two static string-returning functions." >&2
+              exit 1
+            fi
+          done
+          if [ "$global_let_count" != "0" ]; then
+            echo "::error file=$ALLOWLISTED_FILE::Copy-only shape guard: expected 0 global 'let' declarations, found $global_let_count. A global 'let' evaluated at load time could form a side effect via a closure declared elsewhere in Foundation." >&2
+            exit 1
+          fi
+
+          # Codex R9 P2#1: statement-level shape check. The
+          # declaration count above stops a hostile edit from
+          # adding an EXTRA function or class, but does not stop
+          # code hidden INSIDE the two allowed functions from
+          # calling POSIX `socket(AF_INET, SOCK_STREAM, 0)`,
+          # `getaddrinfo(...)`, `connect(...)` etc. — none of
+          # those tokens are on the denylist and the hostname
+          # can live in a string literal.
+          #
+          # A pure-copy function body only needs `switch id { case "…": return "…"; …; default: return nil }`.
+          # No CallExpr (function call `\w+\(`), no `if`, no `for`,
+          # no `while`, no `guard`, no `defer`, no assignment, no
+          # local `let`. Any of those means executable statements.
+          #
+          # Count function-call-like patterns in extracted code,
+          # EXCLUDING function DEFINITIONS (`func \w+\(`), which are
+          # the two allowed help/disclosure signatures.
+          # (Excludes calls inside string literals — those got
+          # stripped by the awk extractor.)  Legitimate body
+          # patterns: `switch id {`, `case "…":`, `return "…"`,
+          # `return nil`, `{`, `}`.
+          #
+          # Strategy: strip `func \w+\(` first (function defs),
+          # then count remaining `\w+\(` — those are calls.
+          code_no_defs=$(sed -E 's/func[[:space:]]+[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]*\(/func_DEF/g' <<< "$code_only")
+          # Codex R10 P2#1: allow optional whitespace between the
+          # identifier and `(` so a hostile edit cannot bypass with
+          # `gethostbyname ("api.jetbrains.ai")` (Swift permits
+          # whitespace before the argument list).
+          call_expr_count=$(grep -oE '[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]*\(' <<< "$code_no_defs" | wc -l | tr -d ' ')
+          # Expected: 0 function calls, since every legitimate
+          # function body has NO function calls — just switch,
+          # case, return.
+          if [ "$call_expr_count" != "0" ]; then
+            echo "::error file=$ALLOWLISTED_FILE::Copy-only shape guard: found $call_expr_count function-call-like tokens (\w+\() in emitted code (excluding func definitions). A pure-copy function body must contain NO function calls — only 'switch id { case ...: return ... default: return nil }'. Hostile edit could hide a socket()/getaddrinfo()/connect() call here." >&2
+            grep -nE '[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]*\(' <<< "$code_no_defs" >&2 || true
+            exit 1
+          fi
+          # Also count `if`, `for`, `while`, `guard`, `defer` —
+          # any control-flow beyond `switch` is not needed for
+          # copy-only functions. EXCLUDE the `for` in argument
+          # labels (`func help(for id: String)`) — that is a
+          # parameter label, not a control-flow keyword. Control-
+          # flow `for` matches `for\s+\w+\s+in\s+`; the argument
+          # label pattern is `\(for\s+\w+\s*:`. Simplest fix:
+          # strip argument-label `for` first.
+          code_no_labels=$(sed -E 's/\(for[[:space:]]+[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]*:/\(_LABEL:/g' <<< "$code_only")
+          extra_control_count=$(grep -oE '\b(if|for|while|guard|defer|repeat|do)\b' <<< "$code_no_labels" | wc -l | tr -d ' ')
+          if [ "$extra_control_count" != "0" ]; then
+            echo "::error file=$ALLOWLISTED_FILE::Copy-only shape guard: found $extra_control_count 'if'/'for'/'while'/'guard'/'defer'/'repeat'/'do' tokens in emitted code (excluding 'for' argument labels). A pure-copy function must use only 'switch'." >&2
+            grep -nE '\b(if|for|while|guard|defer|repeat|do)\b' <<< "$code_no_labels" >&2 || true
+            exit 1
+          fi
+          # Count local `let` inside functions. A pure-copy body
+          # has no locals — everything is inline.
+          # Match any `let\s+identifier` NOT already caught as a
+          # global-let above. Since global_let_count is 0, ALL
+          # `let` here are local. Zero expected.
+          local_let_count=$(grep -oE '\blet[[:space:]]+[a-zA-Z_]' <<< "$code_only" | wc -l | tr -d ' ')
+          if [ "$local_let_count" != "0" ]; then
+            echo "::error file=$ALLOWLISTED_FILE::Copy-only shape guard: found $local_let_count local 'let' declarations. A pure-copy function needs no locals." >&2
+            grep -nE '\blet[[:space:]]+[a-zA-Z_]' <<< "$code_only" >&2 || true
+            exit 1
+          fi
+          # Count assignments (=). A pure-copy body has no
+          # assignment. `==` for equality is not used because
+          # the switch handles matching.
+          assignment_count=$(grep -oE '[^!=<>][=][^=]' <<< "$code_only" | wc -l | tr -d ' ')
+          if [ "$assignment_count" != "0" ]; then
+            echo "::error file=$ALLOWLISTED_FILE::Copy-only shape guard: found $assignment_count assignment expressions ('='). A pure-copy body has no assignments." >&2
+            grep -nE '[^!=<>][=][^=]' <<< "$code_only" >&2 || true
+            exit 1
+          fi
+          # Codex R11 P2#1: Swift escaped identifiers (backticks)
+          # let a hostile edit call reserved-word identifiers like
+          # `system` or `class` at runtime. A `` `system`("curl …") ``
+          # call would bypass the `\w+\s*\(` regex because the
+          # backticks break the identifier boundary. Ban backticks
+          # anywhere in emitted code — a copy-only file never needs
+          # them.
+          if grep -q '`' <<< "$code_only"; then
+            echo "::error file=$ALLOWLISTED_FILE::Copy-only shape guard: backticked Swift identifier found in emitted code. A copy-only file must not use escaped identifiers. A hostile edit could use `\`system\`(\"curl …\")` to bypass the no-call regex." >&2
+            grep -n '`' -- "$ALLOWLISTED_FILE" >&2 || true
+            exit 1
+          fi
+          # Codex R12 P1: Swift extended raw strings (`##"..."##`,
+          # `###"..."###`, …) with extended interpolation
+          # (`\##(...)`) let a hostile edit smuggle arbitrary code
+          # inside a string that the awk extractor mis-parses. The
+          # extractor only understands level-1 raw strings (`#"…"#`);
+          # extended forms confuse it enough that the interpolation
+          # and forbidden tokens end up hidden inside what looks
+          # like inert data.
+          #
+          # Ban ALL `#` characters in emitted code. String literals
+          # in this file never need `#` since normal strings can
+          # express the same content (single backslashes are only
+          # needed for escape sequences, none of which the copy uses).
+          if grep -q '#' <<< "$code_only"; then
+            echo "::error file=$ALLOWLISTED_FILE::Copy-only shape guard: '#' character found in emitted code. A copy-only file must not use extended raw strings or extended interpolation. A hostile edit could use \`##\"\\##(URLSession...)\"##\` to smuggle code past the string-body extractor." >&2
+            grep -n '#' -- "$ALLOWLISTED_FILE" >&2 || true
+            exit 1
+          fi
+          echo "Copy-only shape guard: PASSED — $ALLOWLISTED_FILE contains exactly 1 ProviderCopy enum, 2 functions, 0 other declarations, 0 function calls (incl. backticked identifiers), 0 control flow beyond switch, 0 local let, 0 assignments, no networking / logging / import / interpolation surface."
+
+      - name: Self-test the copy-only shape guard against a table of hostile fixtures
+        run: |
+          # Codex R4 P2#1 + R5 P3#3: table-drive the self-test so
+          # DROPPING any single token from FORBIDDEN_TOKENS is
+          # detected. Prior aggregate-grep design would still pass
+          # as long as one token remained in the fixture. This
+          # version asserts EACH forbidden token independently
+          # against its own hostile snippet.
+          set -euo pipefail
+
+          FORBIDDEN_TOKENS='URLSession|URLComponents|URLRequest|URLProtocol|NWConnection|dataTask|httpMethod|URL\(string:|URL\.init|NSURL|Foundation\.URL|\bURL\b|Data\(contentsOf:|Data\.init\(contentsOf:|String\(contentsOf:|String\.init\(contentsOf:|SecItemAdd|SecItemUpdate|SecItemCopyMatching|SecItemDelete|NSLog|Logger\(|os_log|Log\.debug|Log\.info|\bprint\b|\bProcess\b|\bNSTask\b|launchPath|executableURL|\barguments\b|\.run\(|\.launch\(|\bPipe\b|\bFileHandle\b|NSClassFromString|NSSelectorFromString|\bSelector\b|\.perform\(|\bNSObject\b|NSObjectProtocol|@objc|\bdynamic\b|unsafeBitCast|\bdlopen\b|\bdlsym\b|\bdlclose\b|\bStream\b|\bInputStream\b|\bOutputStream\b|getStreamsToHost|CFStreamCreatePairWithSocketToHost|\bCFHost\b|\bNetService\b'
+
+          # Each entry: <literal-token-name> <hostile-swift-snippet>.
+          # Every token in FORBIDDEN_TOKENS must have exactly ONE
+          # entry here so a drop from the token list is caught.
+          #
+          # Table format: an assoc-array. Snippets are single Swift
+          # statements that would trip the token IF the extractor
+          # emitted them as code. We assert both (a) the actual
+          # token appears in the snippet (as a sanity check that the
+          # snippet is well-formed) and (b) the SAME token appears
+          # in FORBIDDEN_TOKENS (proof the token list still covers
+          # it). If any token vanishes from FORBIDDEN_TOKENS, the
+          # loop below reports it individually.
+          declare -A HOSTILE_TOKENS=(
+            ["URLSession"]='let s = URLSession.shared'
+            ["URLComponents"]='var c = URLComponents()'
+            ["URLRequest"]='let r = URLRequest(url: u)'
+            ["URLProtocol"]='class F: URLProtocol {}'
+            ["NWConnection"]='let c = NWConnection(to: h, using: .tcp)'
+            ["dataTask"]='let t = s.dataTask(with: r)'
+            ["httpMethod"]='r.httpMethod = "GET"'
+            ['URL\(string:']='let u = URL(string: "https://x")!'
+            ['URL\.init']='let u = URL.init(string: "https://x")!'
+            ["NSURL"]='let u = NSURL(string: "https://x")'
+            ['Foundation\.URL']='let u = Foundation.URL(string: "https://x")!'
+            ['\bURL\b']='let u: URL = someURL'
+            ['Data\(contentsOf:']='let d = try Data(contentsOf: u)'
+            ['Data\.init\(contentsOf:']='let d = try Data.init(contentsOf: u)'
+            ['String\(contentsOf:']='let s = try String(contentsOf: u)'
+            ['String\.init\(contentsOf:']='let s = try String.init(contentsOf: u)'
+            ["SecItemAdd"]='let s = SecItemAdd(q, nil)'
+            ["SecItemUpdate"]='let s = SecItemUpdate(q, u)'
+            ["SecItemCopyMatching"]='let s = SecItemCopyMatching(q, &r)'
+            ["SecItemDelete"]='let s = SecItemDelete(q)'
+            ["NSLog"]='NSLog("x")'
+            ['Logger\(']='let l = Logger(subsystem: "x", category: "y")'
+            ["os_log"]='os_log("x")'
+            ['Log\.debug']='Log.debug("x")'
+            ['Log\.info']='Log.info("x")'
+            # Codex R6 P2#1: process-spawn escape hatches.
+            ['\bprint\b']='print("x")'
+            ['\bProcess\b']='let p = Process()'
+            ['\bNSTask\b']='let t = NSTask()'
+            ["launchPath"]='p.launchPath = "/bin/sh"'
+            ["executableURL"]='p.executableURL = u'
+            ['\barguments\b']='p.arguments = ["-c", "true"]'
+            ['\.run\(']='try? p.run()'
+            ['\.launch\(']='p.launch()'
+            ['\bPipe\b']='let pipe = Pipe()'
+            ['\bFileHandle\b']='let h = FileHandle.standardOutput'
+            # Codex R7 P2#1: ObjC dynamic-dispatch escape hatches.
+            ["NSClassFromString"]='let c = NSClassFromString("NSURLSession")'
+            ["NSSelectorFromString"]='let s = NSSelectorFromString("resume")'
+            ['\bSelector\b']='let s = Selector("resume")'
+            ['\.perform\(']='_ = o.perform(s)'
+            ['\bNSObject\b']='let o: NSObject = anon'
+            ["NSObjectProtocol"]='let p: NSObjectProtocol = anon'
+            ["@objc"]='@objc func foo() {}'
+            ['\bdynamic\b']='dynamic func bar() {}'
+            ["unsafeBitCast"]='let b = unsafeBitCast(x, to: Y.self)'
+            ['\bdlopen\b']='let h = dlopen("libSystem", 0)'
+            ['\bdlsym\b']='let f = dlsym(h, "printf")'
+            ['\bdlclose\b']='_ = dlclose(h)'
+            # Codex R8 P2#1: Foundation stream/socket primitives.
+            ['\bStream\b']='Stream.getStreamsToHost(withName: "h", port: 1, inputStream: &i, outputStream: &o)'
+            ['\bInputStream\b']='var i: InputStream?'
+            ['\bOutputStream\b']='var o: OutputStream?'
+            ["getStreamsToHost"]='Stream.getStreamsToHost(withName: "h", port: 1, inputStream: &i, outputStream: &o)'
+            ["CFStreamCreatePairWithSocketToHost"]='CFStreamCreatePairWithSocketToHost(nil, "h" as CFString, 1, &r, &w)'
+            ['\bCFHost\b']='let h: CFHost = CFHostCreateWithName(nil, "h" as CFString).takeRetainedValue()'
+            ['\bNetService\b']='let n = NetService(domain: "", type: "", name: "")'
+          )
+          FAIL=0
+          for token_pattern in "${!HOSTILE_TOKENS[@]}"; do
+            snippet="${HOSTILE_TOKENS[$token_pattern]}"
+            if ! grep -qE "$token_pattern" <<< "$snippet"; then
+              echo "::error::Self-test malformed: snippet for token '$token_pattern' does not match its own pattern. Snippet was: $snippet" >&2
+              FAIL=1
+              continue
+            fi
+            if ! grep -qE "$token_pattern" <<< "$FORBIDDEN_TOKENS"; then
+              echo "::error::Copy-only shape guard self-test FAILED: token '$token_pattern' is in the hostile fixture table but MISSING from FORBIDDEN_TOKENS — a real DMCA/security-relevant token was dropped from the production list." >&2
+              FAIL=1
+            fi
+          done
+          if [ $FAIL -eq 1 ]; then
+            exit 1
+          fi
+          echo "Table-driven forbidden-token self-test: PASSED — every table entry appears in FORBIDDEN_TOKENS."
+
+          # Now also verify the extractor correctly ignores string
+          # LITERAL bodies: `let s = "URLSession fake"` must NOT
+          # trip the guard. If the extractor drifted to emit string
+          # bodies as code, this fixture would false-positive.
+          NTMP="${RUNNER_TEMP:-/tmp}/copy-only-shape-selftest-inertstr.swift"
+          cat > "$NTMP" << 'INERT_STRING'
+          import Foundation
+          let doc = "This string mentions URLSession and URL(string:) as documentation only."
+          INERT_STRING
+          inert_code=$(awk '
+            BEGIN { mode="code"; }
+            {
+              i = 1;
+              while (i <= length($0)) {
+                c = substr($0, i, 1);
+                d = substr($0, i, 2);
+                t = substr($0, i, 3);
+                if (mode == "code") {
+                  if (d == "//") { mode="line_comment"; i += 2; continue; }
+                  if (d == "/*") { mode="block_comment"; i += 2; continue; }
+                  if (t == "\"\"\"") { mode="ms"; i += 3; continue; }
+                  if (d == "#\"") { mode="raw"; i += 2; continue; }
+                  if (c == "\"") { mode="s"; i += 1; continue; }
+                  printf "%s", c; i += 1; continue;
+                }
+                if (mode == "line_comment") { i = length($0)+1; continue; }
+                if (mode == "block_comment") {
+                  if (d == "*/") { mode="code"; i += 2; continue; }
+                  i += 1; continue;
+                }
+                if (mode == "s") {
+                  if (c == "\\") { i += 2; continue; }
+                  if (c == "\"") { mode="code"; i += 1; continue; }
+                  i += 1; continue;
+                }
+                if (mode == "ms") {
+                  if (t == "\"\"\"") { mode="code"; i += 3; continue; }
+                  i += 1; continue;
+                }
+                if (mode == "raw") {
+                  if (d == "\"#") { mode="code"; i += 2; continue; }
+                  i += 1; continue;
+                }
+              }
+              printf "\n";
+              if (mode == "line_comment") { mode="code"; }
+            }
+          ' "$NTMP")
+          if grep -qE "$FORBIDDEN_TOKENS" <<< "$inert_code"; then
+            echo "::error::Copy-only shape guard self-test FAILED: extractor emitted an inert string body ('URLSession fake') as code — the extractor has drifted and would false-positive on legitimate documentation strings." >&2
+            echo "Extracted code was:" >&2
+            echo "$inert_code" >&2
+            exit 1
+          fi
+          rm -f "$NTMP"
+          echo "Inert-string self-test: PASSED — extractor correctly ignores string literal bodies."
+
+          # Interpolation self-test — `let s = "hi \(x)"` MUST trip
+          # the interpolation ban.
+          ITMP="${RUNNER_TEMP:-/tmp}/copy-only-shape-selftest-interpolation.swift"
+          cat > "$ITMP" << 'INTERPOLATION'
+          import Foundation
+          let x = "world"
+          let greeting = "hello \(x)"
+          INTERPOLATION
+          # The interpolation check greps for \( in non-comment
+          # source. Verify it fires on the fixture.
+          non_comment_all=$(awk '
+            BEGIN { mode="code"; }
+            {
+              i = 1;
+              while (i <= length($0)) {
+                c = substr($0, i, 1);
+                d = substr($0, i, 2);
+                if (mode == "code") {
+                  if (d == "//") { mode="line_comment"; i += 2; continue; }
+                  if (d == "/*") { mode="block_comment"; i += 2; continue; }
+                  printf "%s", c; i += 1; continue;
+                }
+                if (mode == "line_comment") { i = length($0)+1; continue; }
+                if (mode == "block_comment") {
+                  if (d == "*/") { mode="code"; i += 2; continue; }
+                  i += 1; continue;
+                }
+              }
+              printf "\n";
+              if (mode == "line_comment") { mode="code"; }
+            }
+          ' "$ITMP")
+          if ! grep -qE '\\\(' <<< "$non_comment_all"; then
+            echo "::error::Copy-only shape guard self-test FAILED: interpolation ban did not fire on a fixture containing '\\(x)'. The interpolation check has drifted." >&2
+            exit 1
+          fi
+          rm -f "$ITMP"
+          echo "Interpolation-ban self-test: PASSED — '\\(x)' is detected in non-comment source."
+
+          # Attributed-import self-test (Codex R5 P3#4).
+          ATMP="${RUNNER_TEMP:-/tmp}/copy-only-shape-selftest-attrimport.swift"
+          cat > "$ATMP" << 'ATTR_IMPORT'
+          @_exported import Security
+          @_implementationOnly import Network
+          public import Bar
+          import Foundation
+          ATTR_IMPORT
+          non_comment=$(grep -vE '^\s*(//|\*)' "$ATMP" || true)
+          all_imports=$(printf '%s\n' "$non_comment" | grep -E '(^|[^a-zA-Z0-9_])import\b' || true)
+          unexpected_imports=$(printf '%s\n' "$all_imports" | grep -vE '^\s*import\s+Foundation\s*(//.*)?\s*$' || true)
+          # The fixture has three attributed / non-Foundation
+          # imports; unexpected_imports must be non-empty.
+          if [ -z "$unexpected_imports" ]; then
+            echo "::error::Copy-only shape guard self-test FAILED: attributed-import check did NOT catch '@_exported import Security', '@_implementationOnly import Network', or 'public import Bar' — the import allowlist has drifted." >&2
+            exit 1
+          fi
+          # Additionally verify the bare `import Foundation` on the
+          # last line was NOT flagged (it is legitimate).
+          count=$(printf '%s\n' "$unexpected_imports" | wc -l | tr -d ' ')
+          if [ "$count" -lt 3 ]; then
+            echo "::error::Copy-only shape guard self-test FAILED: attributed-import check caught only $count of the 3 expected attributed imports." >&2
+            printf 'unexpected_imports:\n%s\n' "$unexpected_imports" >&2
+            exit 1
+          fi
+          rm -f "$ATMP"
+          echo "Attributed-import self-test: PASSED — all three attributed/non-Foundation imports caught, bare 'import Foundation' allowed."
+
       - name: Reject JetBrains AI live-endpoint use (DMCA constraint)
         run: |
           # chk1 audit Bug #12: fail fast on any error inside this
@@ -163,9 +748,56 @@ jobs:
           #     not the interpolated value. Any static-grep guard
           #     shares this blind spot. A code review must catch
           #     this shape.
+          # PR 12-UI refinement (Codex R2 P1#1): the URL-context-only
+          # pattern (`(://|//)host`) had a split-file bypass:
+          #   fileA.swift: let host = "api.jetbrains.ai"     // bare
+          #   fileB.swift: c.host = fileA.host; URLSession…  // no host literal
+          # Neither file individually tripped the URL-context guard
+          # nor a per-file co-occurrence guard. The correct model is a
+          # STRICT bare-hostname ban across the ENTIRE `app/` tree,
+          # with an EXPLICIT file-level allowlist for the copy-catalog
+          # file where the two hostnames legitimately appear in
+          # user-facing prose (ProviderCopy.disclosure). Every other
+          # file — regardless of whether it forms URLs, uses
+          # NWConnection, or splits the URL construction across files
+          # — must not contain the bare hostname in any string
+          # literal.
+          #
+          # Interpolation blind-spot (already noted above) is unchanged:
+          # `let h = "api.jetbrains.ai"; URL(string: "https://\(h)/")`
+          # still slips through a static-grep guard by design (the
+          # literal `"api.jetbrains.ai"` is now caught by this strict
+          # rule EVEN in files that never form a URL, because the ONLY
+          # legitimate holder of that literal is the allowlisted copy
+          # catalog).
           FORBIDDEN='api\.jetbrains\.ai|grazie\.aws\.intellij\.net'
+          # Files where the bare hostnames may legitimately appear in
+          # a Swift string literal. Additions to this list MUST be
+          # justified in a code comment near the string literal and
+          # in the PR body.
+          #
+          # `app/ProviderCopy.swift` — Codex R3 P1#1 rework: the
+          # `ProviderCopy` enum lives in its own dedicated file
+          # containing ONLY user-facing help + disclosure prose. No
+          # imports beyond `Foundation`, no networking, no URL
+          # construction, no credential handling. The
+          # `ProviderCopy.disclosure(for: "jetbrains")` case names
+          # both forbidden hosts to explain to the user that this
+          # app deliberately does NOT contact them. RESUME.md line
+          # 205 (PR 12-UI brief) REQUIRES this naming.
+          #
+          # Any executable code added to this file would fail code
+          # review because the file's stated purpose is copy-only.
+          ALLOWLISTED_FILE='app/ProviderCopy.swift'
           FAIL=0
           while IFS= read -r file; do
+            # Skip the allowlisted file. The allowlist is intentionally
+            # a whole-file skip rather than a per-line pragma: if this
+            # file gained a URL-forming code path, the code review
+            # would notice the file's role changing.
+            if [ "$file" = "$ALLOWLISTED_FILE" ]; then
+              continue
+            fi
             # Extract every Swift string-literal body via awk. State
             # machine tracks four modes: code, line-comment,
             # block-comment, string-literal. Emits string-literal
@@ -240,7 +872,13 @@ jobs:
               echo "::error file=$file::grep failed with rc=$match_rc while scanning for DMCA hosts." >&2
               exit 1
             fi
-          done < <(find app -name '*.swift' -type f)
+            # Codex R3 P2#2: `-type f` excludes symlinks. Include
+            # symlinks so a maliciously-added `app/Generated/Foo.swift`
+            # symbolic link into or out of the tree is still scanned.
+            # If the symlink target is unreadable, the awk extractor
+            # returns empty and the grep produces rc=1 (no match) —
+            # not the same as a real error (grep rc >= 2 escalates).
+          done < <(find app \( -type f -o -type l \) -name '*.swift')
           if [ $FAIL -eq 1 ]; then
             echo "::error::JetBrains live-endpoint use detected. DMCA constraint — this app must NOT contact api.jetbrains.ai or grazie.aws.intellij.net. See .pr-bodies/RESUME.md 'Known caveats'." >&2
             exit 1
@@ -321,8 +959,189 @@ jobs:
             echo "::error::DMCA guard self-test FAILED: multi-line string form (\"\"\"...\"\"\") not extracted." >&2
             exit 1
           fi
+          # PR 12-UI (Codex R2 P1#1 reworked): FORBIDDEN is now a
+          # strict bare-hostname pattern, with a whole-file allowlist
+          # for the copy catalog. The self-test verifies BOTH halves:
+          # (1) FORBIDDEN itself must fire on the extracted bare-host
+          # strings, (2) the allowlist branch must skip a file even
+          # if it contains bare hostnames.
+          FORBIDDEN_SELFTEST='api\.jetbrains\.ai|grazie\.aws\.intellij\.net'
+          if ! grep -qE "$FORBIDDEN_SELFTEST" <<< "$strings"; then
+            echo "::error::DMCA guard self-test FAILED: FORBIDDEN pattern did not match extracted bare-host strings — the pattern has drifted." >&2
+            exit 1
+          fi
           rm -f "$TMP"
-          echo "DMCA guard self-test PASSED: all three string forms extracted."
+          echo "DMCA guard self-test PASSED: all three string forms extracted and FORBIDDEN fired."
+
+          # Codex R3 P3#3: behavioural allowlist self-test. Prior
+          # revision only greped this workflow's source for the
+          # `ALLOWLISTED_FILE=` string, which a dead-code / no-op
+          # rewrite could satisfy while the actual scan drifted.
+          # This version executes the SAME extraction + FORBIDDEN
+          # match logic (inlined for isolation from the outer scan
+          # state) against two synthetic fixtures placed at (a) the
+          # actual allowlisted repo-relative path and (b) a non-
+          # allowlisted repo-relative path. It then reruns the
+          # allowlist skip logic and asserts (a) is bypassed and
+          # (b) is caught.
+          #
+          # ACKNOWLEDGED LIMITATION (Codex R4 P3#2): this self-test
+          # duplicates the production awk/grep logic rather than
+          # invoking it. A drift in the production loop that
+          # matched a similar drift in this duplicate would slip
+          # past. Two mitigations reduce this risk in practice:
+          #  1. The copy-only shape guard (previous step) prevents
+          #     `app/ProviderCopy.swift` from ever gaining
+          #     executable code, so even if the DMCA allowlist
+          #     branch drifted incorrectly, the file it protects
+          #     cannot form a URL request.
+          #  2. GitHub Actions steps run in separate shells, so
+          #     factoring the scan into a shared script would
+          #     require checking in `.github/scripts/dmca-scan.sh`
+          #     — a materially larger change. Deferred to a
+          #     dedicated hardening PR.
+          ALLOWLISTED_SELFTEST='app/ProviderCopy.swift'
+          NON_ALLOWLISTED_SELFTEST='app/JetBrainsUsageStore.swift'
+          run_scan_selftest() {
+            local target="$1"
+            local expect_hit="$2"  # "hit" or "miss"
+            local content="$3"
+            local tmpdir
+            tmpdir="$(mktemp -d "${RUNNER_TEMP:-/tmp}/dmca-behav-XXXXXX")"
+            mkdir -p "$tmpdir/$(dirname "$target")"
+            printf '%s\n' "$content" > "$tmpdir/$target"
+            # Inline the same scan the production guard uses, but
+            # with a scoped ALLOWLISTED_FILE so we can vary it.
+            local ALLOWLISTED_FILE="$ALLOWLISTED_SELFTEST"
+            local FORBIDDEN='api\.jetbrains\.ai|grazie\.aws\.intellij\.net'
+            local file="$target"
+            local hit="miss"
+            if [ "$file" = "$ALLOWLISTED_FILE" ]; then
+              hit="miss"  # allowlist skip
+            else
+              local strings
+              strings=$(awk '
+                BEGIN { mode="code"; }
+                {
+                  i = 1;
+                  while (i <= length($0)) {
+                    c = substr($0, i, 1);
+                    d = substr($0, i, 2);
+                    t = substr($0, i, 3);
+                    if (mode == "code") {
+                      if (d == "//") { mode="line_comment"; i += 2; continue; }
+                      if (d == "/*") { mode="block_comment"; i += 2; continue; }
+                      if (t == "\"\"\"") { mode="ms"; i += 3; continue; }
+                      if (d == "#\"") { mode="raw"; i += 2; continue; }
+                      if (c == "\"") { mode="s"; i += 1; continue; }
+                      i += 1; continue;
+                    }
+                    if (mode == "line_comment") { i = length($0)+1; continue; }
+                    if (mode == "block_comment") {
+                      if (d == "*/") { mode="code"; i += 2; continue; }
+                      i += 1; continue;
+                    }
+                    if (mode == "s") {
+                      if (c == "\\") { printf "%s", substr($0, i, 2); i += 2; continue; }
+                      if (c == "\"") { mode="code"; printf "\n"; i += 1; continue; }
+                      printf "%s", c; i += 1; continue;
+                    }
+                    if (mode == "ms") {
+                      if (t == "\"\"\"") { mode="code"; printf "\n"; i += 3; continue; }
+                      printf "%s", c; i += 1; continue;
+                    }
+                    if (mode == "raw") {
+                      if (d == "\"#") { mode="code"; printf "\n"; i += 2; continue; }
+                      printf "%s", c; i += 1; continue;
+                    }
+                  }
+                  if (mode == "line_comment") { mode="code"; }
+                }
+              ' "$tmpdir/$target")
+              if grep -qE "$FORBIDDEN" <<< "$strings"; then
+                hit="hit"
+              fi
+            fi
+            rm -rf "$tmpdir"
+            if [ "$hit" != "$expect_hit" ]; then
+              echo "::error::DMCA guard behavioural self-test FAILED: target='$file' expected='$expect_hit' actual='$hit'." >&2
+              return 1
+            fi
+          }
+          # Both fixtures contain the SAME bare-hostname string
+          # literal. Only the file path differs. Correct behaviour:
+          # allowlisted path → miss (skipped); non-allowlisted path
+          # → hit (caught).
+          FIXTURE_CONTENT='import Foundation'$'\n''let doc = "does not contact api.jetbrains.ai or grazie.aws.intellij.net"'
+          run_scan_selftest "$ALLOWLISTED_SELFTEST" "miss" "$FIXTURE_CONTENT"
+          run_scan_selftest "$NON_ALLOWLISTED_SELFTEST" "hit" "$FIXTURE_CONTENT"
+          echo "DMCA guard behavioural self-test PASSED: allowlist skips allowlisted path AND catches non-allowlisted path."
+
+          # PR 12-UI: an ADDITIONAL negative fixture — a file OUTSIDE
+          # the allowlist containing bare hostnames in string literals
+          # MUST match FORBIDDEN (proving the guard would fire). The
+          # allowlist itself is what protects the copy catalog; the
+          # regex must remain strict.
+          PTMP="${RUNNER_TEMP:-/tmp}/dmca-guard-selftest-prose.swift"
+          cat > "$PTMP" << 'PROSE_ONLY'
+          import Foundation
+          let disclosure = "This app does NOT contact api.jetbrains.ai or grazie.aws.intellij.net."
+          PROSE_ONLY
+          prose_strings=$(awk '
+            BEGIN { mode="code"; }
+            {
+              i = 1;
+              while (i <= length($0)) {
+                c = substr($0, i, 1);
+                d = substr($0, i, 2);
+                t = substr($0, i, 3);
+                if (mode == "code") {
+                  if (d == "//") { mode="line_comment"; i += 2; continue; }
+                  if (d == "/*") { mode="block_comment"; i += 2; continue; }
+                  if (t == "\"\"\"") { mode="ms"; i += 3; continue; }
+                  if (d == "#\"") { mode="raw"; i += 2; continue; }
+                  if (c == "\"") { mode="s"; i += 1; continue; }
+                  i += 1; continue;
+                }
+                if (mode == "line_comment") { i = length($0)+1; continue; }
+                if (mode == "block_comment") {
+                  if (d == "*/") { mode="code"; i += 2; continue; }
+                  i += 1; continue;
+                }
+                if (mode == "s") {
+                  if (c == "\\") { printf "%s", substr($0, i, 2); i += 2; continue; }
+                  if (c == "\"") { mode="code"; printf "\n"; i += 1; continue; }
+                  printf "%s", c; i += 1; continue;
+                }
+                if (mode == "ms") {
+                  if (t == "\"\"\"") { mode="code"; printf "\n"; i += 3; continue; }
+                  printf "%s", c; i += 1; continue;
+                }
+                if (mode == "raw") {
+                  if (d == "\"#") { mode="code"; printf "\n"; i += 2; continue; }
+                  printf "%s", c; i += 1; continue;
+                }
+              }
+              if (mode == "line_comment") { mode="code"; }
+            }
+          ' "$PTMP")
+          # Positive check: FORBIDDEN DOES fire on extracted prose
+          # bare-hostname literals. This proves the strict rule
+          # would fire in any non-allowlisted file that added the
+          # hostnames as prose — protection against the split-file
+          # bypass Codex R2 raised.
+          if ! grep -qE 'api\.jetbrains\.ai' <<< "$prose_strings"; then
+            echo "::error::DMCA guard self-test FAILED: bare hostname extraction broken." >&2
+            exit 1
+          fi
+          if ! grep -qE "$FORBIDDEN_SELFTEST" <<< "$prose_strings"; then
+            echo "::error::DMCA guard self-test FAILED: strict FORBIDDEN did NOT fire on bare-host prose — a non-allowlisted file could hold live-endpoint hosts undetected." >&2
+            echo "Extracted output was:" >&2
+            echo "$prose_strings" >&2
+            exit 1
+          fi
+          rm -f "$PTMP"
+          echo "DMCA guard self-test PASSED: strict FORBIDDEN fires on non-allowlisted bare-host prose."
 
           # Codex R1 P3 on the earlier version of this self-test: the
           # positive assertions above only prove the extractor FINDS
