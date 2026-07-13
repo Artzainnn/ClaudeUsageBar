@@ -119,21 +119,33 @@ public final class ClineUsageStore: @preconcurrency UsageProvider {
         switch tccState {
         case .denied:
             let copy = LocalProviderAccessGuide.copy(for: .denied, appName: displayName)
+            // Codex round-2 + round-3 + round-4 findings: name every
+            // supported location — editor family AND CLI — in the
+            // WRAPPING guidance line, not the monospace `path` line
+            // (which UsageTileView renders `.lineLimit(1)` with
+            // middle-truncation and hides most of the string in a
+            // 360px popover).
+            let clineGuidance = copy.guidance
+                + " Cline data lives under: `<host>/User/globalStorage/saoudrizwan.claude-dev/tasks/` for VS Code, VS Code Insiders, VSCodium, Cursor, or Windsurf; or `$CLINE_DATA_DIR/tasks/`, `$CLINE_DIR/data/tasks/`, or `~/.cline/data/tasks/` for the Cline CLI."
             return [UsageTile(
                 id: "cline-needs-access",
                 title: copy.title,
                 kind: .needsAccess(
-                    path: "Code / Cursor / Windsurf globalStorage",
-                    guidance: copy.guidance
+                    path: "~/Library/Application Support/…/saoudrizwan.claude-dev/tasks",
+                    guidance: clineGuidance
                 )
             )]
         case .pathMissing:
+            // Codex round-3 finding: "not installed" was misleading
+            // for an editor user who has Cline installed but has not
+            // yet started a task, so `tasks/` is missing. Reframe as
+            // "no sessions" with two remediation paths.
             return [UsageTile(
                 id: "cline-not-installed",
                 title: displayName,
                 kind: .text(
-                    status: "No Cline install found",
-                    subtitle: "Install the Cline extension in VS Code / Cursor / Windsurf, or run the Cline CLI at least once."
+                    status: "No Cline sessions found",
+                    subtitle: "If Cline is installed in VS Code, VS Code Insiders, VSCodium, Cursor, or Windsurf, start a Cline task and click Refresh. If you use the Cline CLI, run it at least once."
                 )
             )]
         case .granted:
@@ -218,12 +230,18 @@ public final class ClineUsageStore: @preconcurrency UsageProvider {
     // MARK: - UsageProvider: actions
 
     public func fetch() {
-        guard isEnabled else { return }
-
-        // Bump generation BEFORE any early-return path so an in-flight
-        // fetch cannot revive stale state after e.g. TCC denial. Copies
-        // the Claude Code round-2 finding #6 fix.
+        // Codex round-5 finding #1: bump generation even when disabled
+        // so a rapid disable → fetch()-while-disabled → re-enable →
+        // fetch() sequence cannot let a pre-disable in-flight fetch's
+        // completion apply. The isEnabled guard on the completion
+        // still exists, but generation-bump gives defence-in-depth
+        // against a future refactor that removes it.
         fetchGeneration &+= 1
+        guard isEnabled else {
+            snapshot = nil
+            lastAppliedGrantedRootsKey = nil
+            return
+        }
         let launchGeneration = fetchGeneration
 
         let scanRoots = resolveScanRoots()
@@ -298,7 +316,9 @@ public final class ClineUsageStore: @preconcurrency UsageProvider {
                 guard launchGeneration == self.fetchGeneration else { return }
                 self.snapshot = snap
                 self.lastAppliedGrantedRootsKey = grantedKeyCopy
-                self.lastUpdatedAt = Date()
+                // Codex round-5 finding #2: use the injected clock so
+                // deterministic tests get deterministic lastUpdatedAt.
+                self.lastUpdatedAt = self.clock()
                 self.lastError = nil
                 Log.info("Cline ui_messages parsed", .count(snap.records.count))
             }

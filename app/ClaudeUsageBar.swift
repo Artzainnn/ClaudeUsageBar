@@ -89,6 +89,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // (.granted) or an onboarding card (.denied → Full Disk Access
         // prompt; .pathMissing → "not installed"). Backend from PR #67.
         providers.append(ProviderBox(ClaudeCodeUsageStore()))
+        // PR 10c-UI: register Cline local ui_messages.json reader.
+        // Opt-in (features.cline.enabled defaults false); reads
+        // `saoudrizwan.claude-dev/tasks/{taskId}/ui_messages.json`
+        // under every VS Code family host (VS Code / Insiders /
+        // VSCodium / Cursor / Windsurf) AND the Cline CLI's
+        // $CLINE_DATA_DIR / $CLINE_DIR / ~/.cline/data. Nothing leaves
+        // the machine. Backend from PR #69.
+        providers.append(ProviderBox(ClineUsageStore()))
         // Model SwiftUI observes for the generic (non-Anthropic) provider
         // tiles. Anthropic continues to render through usageManager directly.
         providersModel = ProvidersModel(providers: providers)

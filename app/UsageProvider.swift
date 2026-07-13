@@ -310,6 +310,8 @@ public enum ProviderCopy {
             return "Shows your GitHub Copilot chargeable AI-Credit overage (net) month-to-date, plus the top SKU line items. Note: usage covered by your plan's included allowance shows as $0 — only overage is charged. Create a fine-grained PAT on github.com (Settings → Developer settings → Personal access tokens → Fine-grained tokens), set the resource owner to your own account, then under Account permissions grant 'Plan: Read-only'. Paste the github_pat_… token below; it is stored in your Keychain."
         case "claudeCode":
             return "Reads your local Claude Code session logs (`~/.claude/projects/**/*.jsonl`) to show tokens used today, cost today, and cost month-to-date, broken down by model. Nothing leaves your Mac; no key or sign-in is needed. Costs are calculated locally from a bundled snapshot of Anthropic's published rates."
+        case "cline":
+            return "Reads your local Cline session logs. In VS Code, VS Code Insiders, VSCodium, Cursor, or Windsurf: `<host>/User/globalStorage/saoudrizwan.claude-dev/tasks/{taskId}/ui_messages.json`. For the Cline CLI: `$CLINE_DATA_DIR/tasks/…`, `$CLINE_DIR/data/tasks/…`, or `~/.cline/data/tasks/…`. Shows tokens used today, cost today, and cost month-to-date, broken down by model. Nothing leaves your Mac; no key or sign-in is needed. Costs come from Cline's own precomputed per-turn total — the same number you see inside the extension or CLI."
         default:
             return nil
         }
@@ -329,6 +331,8 @@ public enum ProviderCopy {
             return "Use a fine-grained PAT (github_pat_…), NOT a classic token. Grant only 'Plan: Read' under Account permissions — nothing else. Set an expiry so an accidentally-leaked token becomes worthless. Classic PATs with broader scopes can spend money on your GitHub account; do not paste one here. Treat a PAT like a password — anyone with it can act as you without triggering your 2FA prompt. Clearing this key deletes it from your Mac's Keychain but does NOT revoke it on GitHub — to revoke, visit github.com Settings → Developer settings → Personal access tokens and delete it there."
         case "claudeCode":
             return "Costs are estimates based on Anthropic's published per-token rates at the time this build was released. They are not a receipt from Anthropic and may differ from your actual bill. When new Claude models ship, unpriced records show tokens but $0 cost until the next app update; a 'Pricing update available' tile appears when this happens."
+        case "cline":
+            return "Costs come from Cline itself — this app reads Cline's precomputed per-turn total and sums them. If Cline's rate table is out of date, or the API-request record was not fully written (a crash mid-turn), the numbers will not match your provider's bill exactly. If a Cline install exists on this Mac but its data cannot be read, a 'Partial access' tile appears; grant Full Disk Access in System Settings to include it."
         default:
             return nil
         }

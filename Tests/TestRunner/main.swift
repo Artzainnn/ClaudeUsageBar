@@ -803,6 +803,81 @@ run("ProviderCopy: Claude Code help names the JSONL path and 'nothing leaves you
     expect(help?.contains("bundled snapshot") == true || help?.contains("Anthropic") == true)
 }
 
+run("ProviderCopy: Cline help names every supported host + CLI env-vars + file + privacy (PR 10c-UI)") {
+    // Codex round-1 finding #2: assert EVERY supported host by name,
+    // not just three. If a copy edit drops Insiders or VSCodium the
+    // Settings text would no longer match the resolver's coverage.
+    let help = ProviderCopy.help(for: "cline")
+    expect(help != nil)
+    // The exact file — a Cline user Googling this cannot be steered
+    // to the wrong file.
+    expect(help?.contains("ui_messages.json") == true)
+    // The extension identifier the file lives under — pinning this
+    // guards against a Cline rename or a fork with a different id.
+    expect(help?.contains("saoudrizwan.claude-dev") == true)
+    // Every VS Code family host the resolver enumerates.
+    // Codex round-2 finding: `contains("VS Code")` matches "VS Code
+    // Insiders" too, so a copy edit that dropped VS Code stable but
+    // kept Insiders would still pass. Strip "VS Code Insiders" first,
+    // THEN check for a remaining "VS Code" occurrence — that proves
+    // the stable host is named separately.
+    let helpMinusInsiders = help?.replacingOccurrences(of: "VS Code Insiders", with: "")
+    expect(helpMinusInsiders?.contains("VS Code") == true, "must name VS Code stable specifically, not just via 'VS Code Insiders'")
+    expect(help?.contains("VS Code Insiders") == true)
+    expect(help?.contains("VSCodium") == true)
+    expect(help?.contains("Cursor") == true)
+    expect(help?.contains("Windsurf") == true)
+    // Codex round-1 finding #1: CLI env-vars named explicitly so a
+    // CLI user is not sent to the wrong path.
+    expect(help?.contains("$CLINE_DATA_DIR") == true)
+    expect(help?.contains("$CLINE_DIR") == true)
+    expect(help?.contains("~/.cline/data") == true)
+    // Privacy guarantee.
+    expect(help?.contains("Nothing leaves your Mac") == true || help?.contains("nothing leaves your Mac") == true)
+    // No key needed.
+    expect(help?.contains("no key") == true || help?.contains("No key") == true || help?.contains("no sign-in") == true || help?.contains("No sign-in") == true)
+    // Where the cost figure comes from — Cline computes it, we
+    // don't.
+    expect(help?.contains("Cline's own precomputed") == true || help?.contains("precomputed") == true)
+}
+
+run("ProviderCopy: Cline disclosure warns costs come from Cline + partial-access advice (PR 10c-UI)") {
+    let disc = ProviderCopy.disclosure(for: "cline")
+    expect(disc != nil)
+    // Where the numbers come from — Cline. Users should be able to
+    // reason about drift between the tile and their real bill.
+    expect(disc?.contains("Cline") == true)
+    // The "not a receipt" framing is the correct expectations-management
+    // language and matches the Claude Code disclosure.
+    expect(disc?.contains("will not match") == true || disc?.contains("may differ") == true || disc?.contains("not a receipt") == true)
+    // Partial-access advice — direct pointer to Full Disk Access.
+    expect(disc?.contains("Full Disk Access") == true)
+    // Partial access tile is called out by name so the user connects
+    // the disclosure to the tile they see.
+    expect(disc?.contains("Partial access") == true)
+}
+
+run("ProviderCopy id 'cline' matches ClineUsageStore.id — exercises the real Settings path (PR 10c-UI regression guard)") {
+    // Same regression guard as PR 10b-UI: read the store's OWN id so a
+    // drift on either side is caught. ProviderToggleRow calls
+    // `ProviderCopy.help(for: box.id)` — this walks that exact path.
+    MainActor.assumeIsolated {
+        let store = ClineUsageStore()
+        expect(ProviderCopy.help(for: store.id) != nil)
+        expect(ProviderCopy.disclosure(for: store.id) != nil)
+        let box = ProviderBox(store)
+        expect(ProviderCopy.help(for: box.id) != nil)
+        expect(ProviderCopy.disclosure(for: box.id) != nil)
+    }
+    // Pin the literal too.
+    expect(ProviderCopy.help(for: "cline") != nil)
+    expect(ProviderCopy.disclosure(for: "cline") != nil)
+    // Near-miss casings return nil so a silent rename disaster is caught.
+    expect(ProviderCopy.help(for: "Cline") == nil)
+    expect(ProviderCopy.help(for: "CLINE") == nil)
+    expect(ProviderCopy.help(for: "cline-code") == nil)
+}
+
 run("ProviderCopy: Claude Code disclosure states 'estimate not receipt' + unpriced-model behaviour (PR 10b-UI)") {
     // Costs are estimates. If we don't say so, a user could see $47 in
     // the tile and be surprised when their Anthropic bill says $52. The
