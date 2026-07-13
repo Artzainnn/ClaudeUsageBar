@@ -93,7 +93,14 @@ let package = Package(
                 // by every local-file provider from PR 10b onward.
                 "FileWatcher.swift",
                 "SQLiteReader.swift",
-                "TCCState.swift"
+                "TCCState.swift",
+                // PR 10b-BE — Claude Code local JSONL reader. Fetcher +
+                // embedded pricing snapshot in the library so the
+                // TestRunner can exercise dedupe and cost math directly.
+                // Store lands in a follow-up file (same PR).
+                "ClaudeCodePricing.swift",
+                "ClaudeCodeUsageFetcher.swift",
+                "ClaudeCodeUsageStore.swift"
                 // AnthropicUsageStore.swift depends on UsageManager
                 // (defined in ClaudeUsageBar.swift), so it stays in the
                 // app-bundle compile only, not in the SwiftPM library
