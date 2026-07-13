@@ -216,64 +216,116 @@ public final class JetBrainsUsageStore: @preconcurrency UsageProvider {
     public func fetch() {
         fetchGeneration &+= 1
         guard isEnabled else {
-            snapshot = nil
-            activeInstall = nil
-            detectedInstalls = []
-            componentMissing = false
-            schemaMismatch = false
+            // chk1 audit Bug #1: the disable branch must clear EVERY
+            // stale published field — otherwise `lastError`,
+            // `lastUpdatedAt`, or `tccState` from the last enabled
+            // session persist and the popover shows a red banner or
+            // a "Last updated: 3 hours ago" caption against an
+            // empty tile set. Reset to the disabled baseline.
+            resetToDisabledBaseline()
             return
         }
         let launchGeneration = fetchGeneration
 
-        // Discovery runs on the caller thread — it's cheap (a couple
-        // of directory reads) and its output is captured immediately
-        // for the background parse. The chosen install's path is
-        // separately TCC-probed so we distinguish "no IDE installed"
-        // from "IDE installed but Full Disk Access denied".
-        let installs = JetBrainsPathResolver.discover(env)
-        self.detectedInstalls = installs
-        guard let chosen = JetBrainsPathResolver.mostRecentlyModified(installs, env: env) else {
-            // No detected IDE. Codex R1 P1: probe BOTH vendor
-            // directories — Android Studio lives under Google. If
-            // EITHER root is TCC-denied we surface .denied so the
-            // user sees the Full Disk Access prompt; only when BOTH
-            // roots are truly absent do we surface .pathMissing.
-            let jbState = tccProbe(env.jetbrainsVendorPath)
-            let googState = tccProbe(env.googleVendorPath)
-            if jbState == .denied || googState == .denied {
-                self.tccState = .denied
-            } else {
-                // Both readable-or-missing: pathMissing wins so
-                // the user sees "not installed" rather than
-                // "grant Full Disk Access" for a machine that
-                // truly has no JetBrains folder.
-                self.tccState = .pathMissing
-            }
-            self.snapshot = nil
-            self.activeInstall = nil
-            self.componentMissing = false
-            self.schemaMismatch = false
-            self.lastError = nil
-            return
-        }
-        let probed = tccProbe(chosen.quotaFilePath)
-        self.tccState = probed
-        if probed != .granted {
-            self.snapshot = nil
-            self.activeInstall = nil
-            self.componentMissing = false
-            self.schemaMismatch = false
-            self.lastError = nil
-            return
-        }
-
+        // Discovery runs on the background parse queue. chk1 audit
+        // Risk #4: previously discovery ran on the main actor, doing
+        // up to 30 fileExists() + 2 contentsOfDirectory() syscalls on
+        // every fetch tick. Moving it into workQueue keeps the popover
+        // responsive on a slow/spun-down disk.
+        let env = self.env
+        let tccProbeFn = self.tccProbe
+        let jetbrainsVendorPath = env.jetbrainsVendorPath
+        let googleVendorPath = env.googleVendorPath
         let read = self.readXML
-        let path = chosen.quotaFilePath
+        workQueue.async { [weak self] in
+            let installs = JetBrainsPathResolver.discover(env)
+            let chosen = JetBrainsPathResolver.mostRecentlyModified(installs, env: env)
+            // No-install fallback needs both TCC probes so we can
+            // tell "denied" from "truly not installed".
+            let noInstallTccState: TCCState = {
+                guard chosen == nil else { return .granted }
+                let jb = tccProbeFn(jetbrainsVendorPath)
+                let goog = tccProbeFn(googleVendorPath)
+                if jb == .denied || goog == .denied { return .denied }
+                return .pathMissing
+            }()
+            let probedForChosen: TCCState? = chosen.map { tccProbeFn($0.quotaFilePath) }
+            // Apply the discovery + TCC probe result on the main
+            // actor. If TCC is granted, proceed with the parse; if
+            // not, return early with a fully-clean state (chk1
+            // audit Bug #2 + #3).
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                guard self.isEnabled else { return }
+                guard launchGeneration == self.fetchGeneration else { return }
+                self.detectedInstalls = installs
+                guard let chosen = chosen else {
+                    // No detected IDE.
+                    self.tccState = noInstallTccState
+                    self.applyNonGrantedReset()
+                    return
+                }
+                let probed = probedForChosen ?? .granted
+                self.tccState = probed
+                if probed != .granted {
+                    self.applyNonGrantedReset()
+                    return
+                }
+                // Kick off the actual XML read on workQueue.
+                self.enqueueRead(path: chosen.quotaFilePath, install: chosen, launchGeneration: launchGeneration, read: read)
+            }
+        }
+    }
+
+    /// Reset every published field to the "disabled" baseline —
+    /// used by both the disable branch of `fetch()` and by
+    /// `clear()`. chk1 audit Bug #1/#2/#3: keep the two sites in
+    /// lockstep so state hygiene can't drift between them.
+    private func resetToDisabledBaseline() {
+        snapshot = nil
+        activeInstall = nil
+        detectedInstalls = []
+        lastUpdatedAt = nil
+        lastError = nil
+        tccState = .granted
+        componentMissing = false
+        schemaMismatch = false
+    }
+
+    /// Reset published state after a TCC deny / pathMissing outcome
+    /// while KEEPING the just-set `tccState` intact. chk1 audit
+    /// Bugs #2, #3: previously `detectedInstalls` and `lastUpdatedAt`
+    /// were retained on these branches, leaving stale UI captions
+    /// alongside the needs-access tile.
+    private func applyNonGrantedReset() {
+        snapshot = nil
+        activeInstall = nil
+        detectedInstalls = []
+        lastUpdatedAt = nil
+        lastError = nil
+        componentMissing = false
+        schemaMismatch = false
+    }
+
+    /// Second phase of `fetch()`: run the XML parse on `workQueue`
+    /// and hop the result back to the main actor for state apply.
+    /// Extracted so the discovery-off-main-actor refactor keeps
+    /// the completion path readable.
+    private func enqueueRead(
+        path: String,
+        install: JetBrainsIDEInstall,
+        launchGeneration: UInt64,
+        read: @escaping @Sendable (String) throws -> JetBrainsReadOutcome
+    ) {
         workQueue.async { [weak self] in
             let outcome: WorkOutcome
             do {
-                let read = try read(path)
-                switch read {
+                // chk1 audit Bug #4: rename the read-result local
+                // so it does NOT shadow the `read` closure parameter
+                // — the old `let read = try read(path)` was legal
+                // but the reused name was a code smell.
+                let readOutcome = try read(path)
+                switch readOutcome {
                 case .success(let snap):
                     outcome = .success(snap)
                 case .componentMissing:
@@ -288,19 +340,13 @@ public final class JetBrainsUsageStore: @preconcurrency UsageProvider {
                 guard let self = self else { return }
                 guard self.isEnabled else { return }
                 guard launchGeneration == self.fetchGeneration else { return }
-                self.applyOutcome(outcome, install: chosen)
+                self.applyOutcome(outcome, install: install)
             }
         }
     }
 
     public func clear() {
-        snapshot = nil
-        activeInstall = nil
-        detectedInstalls = []
-        lastUpdatedAt = nil
-        lastError = nil
-        componentMissing = false
-        schemaMismatch = false
+        resetToDisabledBaseline()
         fetchGeneration &+= 1
     }
 
@@ -375,8 +421,13 @@ public final class JetBrainsUsageStore: @preconcurrency UsageProvider {
     }
 
     /// Turn an ISO-8601 duration like "PT720H" or "P30D" into a short
-    /// human string ("30 days", "12 hours"). Anything unrecognised
-    /// falls through as-is.
+    /// human string ("30 days", "12 hours", "1 day, 12 hours").
+    /// Anything unrecognised falls through as-is.
+    ///
+    /// chk1 audit Bug #6: previously mixed forms like `P1DT12H`
+    /// rendered as `"1 day"` — the trailing 12 hours were silently
+    /// dropped. This version concatenates every nonzero component
+    /// so mixed durations retain their precision.
     public nonisolated static func formatDuration(_ raw: String) -> String {
         // Strip the leading "P" (period) marker.
         var s = raw
@@ -406,13 +457,22 @@ public final class JetBrainsUsageStore: @preconcurrency UsageProvider {
             default: break
             }
         }
-        // Prefer the largest meaningful unit.
-        let totalHours = days * 24 + hours
-        if days > 0 { return "\(days) day\(days == 1 ? "" : "s")" }
-        if totalHours >= 24 && totalHours % 24 == 0 { return "\(totalHours/24) day\(totalHours/24 == 1 ? "" : "s")" }
-        if hours > 0 { return "\(hours) hour\(hours == 1 ? "" : "s")" }
-        if minutes > 0 { return "\(minutes) minute\(minutes == 1 ? "" : "s")" }
-        return raw
+        // Special case: `PT<24n>H` with no D component — render as
+        // a whole-day count if the hours divide evenly. Matches
+        // JetBrains's dashboard which shows "30 days" for PT720H.
+        if days == 0 && hours >= 24 && hours % 24 == 0 && minutes == 0 {
+            let d = hours / 24
+            return "\(d) day\(d == 1 ? "" : "s")"
+        }
+        // General mixed form — join every nonzero component with
+        // commas. If ALL three are zero the input is unrecognised
+        // and we fall through to `raw`.
+        var pieces: [String] = []
+        if days > 0 { pieces.append("\(days) day\(days == 1 ? "" : "s")") }
+        if hours > 0 { pieces.append("\(hours) hour\(hours == 1 ? "" : "s")") }
+        if minutes > 0 { pieces.append("\(minutes) minute\(minutes == 1 ? "" : "s")") }
+        if pieces.isEmpty { return raw }
+        return pieces.joined(separator: ", ")
     }
 
     /// Short absolute date label ("d MMM UTC"). Codex R1 P3 finding:

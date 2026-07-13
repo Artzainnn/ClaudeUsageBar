@@ -8117,6 +8117,23 @@ run("JetBrainsUsageStore.formatDuration: JetBrains ISO-8601 durations render sen
     expectEqual(JetBrainsUsageStore.formatDuration("P1Y"), "P1Y")
 }
 
+run("JetBrainsUsageStore.formatDuration: mixed forms retain every nonzero component (chk1 Bug #6)") {
+    // chk1 audit Bug #6: previously `P1DT12H` rendered as "1 day"
+    // and silently dropped the trailing 12 hours. The chk1 fix
+    // joins every nonzero component with commas so mixed forms
+    // are rendered in full.
+    expectEqual(JetBrainsUsageStore.formatDuration("P1DT12H"), "1 day, 12 hours")
+    expectEqual(JetBrainsUsageStore.formatDuration("P2DT4H30M"), "2 days, 4 hours, 30 minutes")
+    expectEqual(JetBrainsUsageStore.formatDuration("PT1H30M"), "1 hour, 30 minutes")
+    // Singular vs plural is preserved.
+    expectEqual(JetBrainsUsageStore.formatDuration("P1DT1H1M"), "1 day, 1 hour, 1 minute")
+    // Days-only whole-day shortcut is preserved.
+    expectEqual(JetBrainsUsageStore.formatDuration("PT48H"), "2 days")
+    // Empty parse falls through to raw (a value neither picker
+    // recognises should NOT render as an empty string).
+    expectEqual(JetBrainsUsageStore.formatDuration("PT"), "PT")
+}
+
 // Store-level integration tests — MainActor isolation.
 MainActor.assumeIsolated {
     let suite = "com.claude.usagebar.jetbrains.tests"
@@ -8270,6 +8287,104 @@ MainActor.assumeIsolated {
         expect(ProviderCopy.help(for: "jbrains") == nil)
     }
 
+    // chk1 audit Bug #1 regression guard: the disable branch must
+    // clear every stale published field. Previously lastError,
+    // lastUpdatedAt, and tccState from the last enabled session
+    // persisted into the disabled state.
+    run("JetBrainsUsageStore: disable clears lastError + lastUpdatedAt + tccState (chk1 Bug #1)") {
+        // Seed a store with populated fields via a successful fetch,
+        // then flip the feature flag OFF and fetch — assert every
+        // published field is back at baseline.
+        let snap = JetBrainsQuotaSnapshot(
+            quotaType: "Available", used: 1, maximum: 100, available: 99,
+            subscriptionUntil: nil, refillType: nil, refillNext: nil,
+            refillAmount: nil, refillDuration: nil
+        )
+        let store = makeJetBrainsStoreForTest(flagEnabled: true, readOutcome: .success(snap))
+        store.fetch()
+        awaitJetBrainsFetch()
+        expect(store.snapshot != nil, "precondition: fetch populated snapshot")
+        expect(store.lastUpdatedAt != nil, "precondition: fetch stamped lastUpdatedAt")
+        // Now disable and re-fetch — everything should be clear.
+        defaults.set(false, forKey: "features.jetbrains.enabled")
+        store.fetch()
+        awaitJetBrainsFetch()
+        expect(store.snapshot == nil, "Bug #1: snapshot must clear on disable")
+        expect(store.activeInstall == nil, "Bug #1: activeInstall must clear on disable")
+        expect(store.detectedInstalls.isEmpty, "Bug #1: detectedInstalls must clear on disable")
+        expect(store.lastUpdatedAt == nil, "Bug #1: lastUpdatedAt must clear on disable — a stale timestamp beside empty tiles is misleading")
+        expect(store.lastError == nil, "Bug #1: lastError must clear on disable")
+        expectEqual(store.tccState, .granted)   // Bug #1: tccState must reset on disable
+        expect(store.componentMissing == false, "Bug #1: componentMissing must clear on disable")
+        expect(store.schemaMismatch == false, "Bug #1: schemaMismatch must clear on disable")
+    }
+
+    // chk1 audit Bug #2 + #3 regression guard: TCC-denied branch
+    // must also clear detectedInstalls and lastUpdatedAt.
+    //
+    // Codex R1 P3 on the earlier version of this test: seed state
+    // on store A, then create fresh store B with denied TCC —
+    // asserting B's default-empty fields "passes" trivially and
+    // does NOT catch a regression to the SAME store's state
+    // clearing. Fix: use ONE store with a mutable tccProbe box,
+    // fetch success, mutate to .denied, fetch again, assert the
+    // same instance cleaned.
+    run("JetBrainsUsageStore: same-store TCC transition to .denied clears detectedInstalls + lastUpdatedAt (chk1 Bug #2, #3)") {
+        final class TCCBox: @unchecked Sendable {
+            var state: TCCState = .granted
+        }
+        let box = TCCBox()
+        let snap = JetBrainsQuotaSnapshot(
+            quotaType: "Available", used: 1, maximum: 100, available: 99,
+            subscriptionUntil: nil, refillType: nil, refillNext: nil,
+            refillAmount: nil, refillDuration: nil
+        )
+        defaults.set(true, forKey: "features.jetbrains.enabled")
+        let vendorPath = "/vendor-jb"
+        let ideDir = "IntelliJIdea2024.1"
+        let quotaPath = "\(vendorPath)/\(ideDir)/options/AIAssistantQuotaManager2.xml"
+        let env = JetBrainsEnvironment(
+            jetbrainsVendorPath: vendorPath,
+            googleVendorPath: "/vendor-google",
+            fileExists: { path in
+                switch path {
+                case vendorPath, quotaPath: return true
+                default: return false
+                }
+            },
+            contentsOfDirectory: { path in
+                if path == vendorPath { return [ideDir] }
+                return nil
+            },
+            attributes: { path in
+                if path == quotaPath { return [.modificationDate: Date()] }
+                return nil
+            }
+        )
+        let store = JetBrainsUsageStore(
+            defaults: defaults,
+            environment: env,
+            tccProbe: { _ in box.state },
+            readXML: { _ in .success(snap) }
+        )
+        // First fetch — TCC granted, snapshot populated.
+        store.fetch()
+        awaitJetBrainsFetch()
+        expect(store.snapshot != nil, "precondition: fetch populated snapshot")
+        expect(!store.detectedInstalls.isEmpty, "precondition: detectedInstalls populated")
+        expect(store.lastUpdatedAt != nil, "precondition: fetch stamped lastUpdatedAt")
+        // Mutate to .denied and re-fetch on the SAME store.
+        box.state = .denied
+        store.fetch()
+        awaitJetBrainsFetch()
+        expectEqual(store.tccState, .denied)
+        expect(store.snapshot == nil, "Bug #2/#3: same store — snapshot must clear on TCC transition to deny")
+        expect(store.activeInstall == nil, "Bug #2/#3: same store — activeInstall must clear")
+        expect(store.detectedInstalls.isEmpty, "Bug #2/#3: same store — detectedInstalls must clear (Codex R1 P3 regression)")
+        expect(store.lastUpdatedAt == nil, "Bug #2/#3: same store — lastUpdatedAt must clear (Codex R1 P3 regression)")
+        expect(store.lastError == nil, "Bug #2/#3: same store — lastError must clear")
+    }
+
     defaults.removePersistentDomain(forName: suite)
 }
 
@@ -8416,7 +8531,7 @@ run("JetBrainsUsageStore.formatDateShort: renders UTC with explicit label") {
     expectEqual(JetBrainsUsageStore.formatDateShort(utcMidnight), "1 Aug UTC")
 }
 
-run("JetBrainsUsageFetcher.parseXMLText: duplicate component — first valid wins (R2 P3)") {
+run("JetBrainsUsageFetcher.parseXMLText: empty-first-duplicate — valid second component wins (R2 P3)") {
     // Codex R2 P3: some crash-recovery paths leave a stale duplicate
     // component before the real write. The parser must iterate all
     // matching components and keep the first that yields a valid
@@ -8437,6 +8552,92 @@ run("JetBrainsUsageFetcher.parseXMLText: duplicate component — first valid win
     expectEqual(snap.used, 7.0)
     expectEqual(snap.maximum, 100.0)
     expectEqual(snap.available, 93.0)
+}
+
+run("JetBrainsUsageFetcher.parseXMLText: two-valid-components — freshest 'until' wins (chk1 Bug #5)") {
+    // chk1 audit Bug #5: previously the parser accepted the FIRST
+    // valid component. If IntelliJ's crash-recovery leaves a stale
+    // VALID duplicate before a fresh one, the stale would win and
+    // the user would see out-of-date numbers. The chk1 fix picks
+    // the component whose `until` (subscription end) is LATEST —
+    // that is semantically the freshest snapshot regardless of
+    // file order.
+    let fixture = """
+    <application>
+      <component name="AIAssistantQuotaManager2">
+        <option name="quotaInfo" value="&quot;type&quot;:&quot;Available&quot;,&quot;current&quot;:&quot;10&quot;,&quot;maximum&quot;:&quot;100&quot;,&quot;tariffQuota&quot;:{&quot;available&quot;:&quot;90&quot;},&quot;until&quot;:&quot;2026-01-01T00:00:00Z&quot;" />
+      </component>
+      <component name="AIAssistantQuotaManager2">
+        <option name="quotaInfo" value="&quot;type&quot;:&quot;Available&quot;,&quot;current&quot;:&quot;77&quot;,&quot;maximum&quot;:&quot;100&quot;,&quot;tariffQuota&quot;:{&quot;available&quot;:&quot;23&quot;},&quot;until&quot;:&quot;2027-06-01T00:00:00Z&quot;" />
+      </component>
+    </application>
+    """
+    let outcome = JetBrainsUsageFetcher.parseXMLText(fixture)
+    guard case .success(let snap) = outcome else { expect(false, "expected success from the fresher second component"); return }
+    // Fresh component has current=77, until=2027-06-01.
+    expectEqual(snap.used, 77.0)   // Bug #5: the fresher 'until' snapshot must win (used=77 not stale 10)
+    expectEqual(snap.available, 23.0)
+}
+
+run("JetBrainsUsageFetcher.parseXMLText: freshest-until wins even when stale is LAST in file (chk1 Bug #5 boundary)") {
+    // Same as above but FIRST-in-file is fresher. The picker must
+    // NOT default to "last valid" when it has a fresher first
+    // valid — that would flip Bug #5's fix into the OPPOSITE bug.
+    let fixture = """
+    <application>
+      <component name="AIAssistantQuotaManager2">
+        <option name="quotaInfo" value="&quot;type&quot;:&quot;Available&quot;,&quot;current&quot;:&quot;42&quot;,&quot;maximum&quot;:&quot;100&quot;,&quot;tariffQuota&quot;:{&quot;available&quot;:&quot;58&quot;},&quot;until&quot;:&quot;2027-12-01T00:00:00Z&quot;" />
+      </component>
+      <component name="AIAssistantQuotaManager2">
+        <option name="quotaInfo" value="&quot;type&quot;:&quot;Available&quot;,&quot;current&quot;:&quot;3&quot;,&quot;maximum&quot;:&quot;100&quot;,&quot;tariffQuota&quot;:{&quot;available&quot;:&quot;97&quot;},&quot;until&quot;:&quot;2025-01-01T00:00:00Z&quot;" />
+      </component>
+    </application>
+    """
+    let outcome = JetBrainsUsageFetcher.parseXMLText(fixture)
+    guard case .success(let snap) = outcome else { expect(false, "expected success"); return }
+    expectEqual(snap.used, 42.0)   // Bug #5 boundary: first component was freshest by 'until', must win
+}
+
+run("JetBrainsUsageFetcher.parseXMLText: two valid with IDENTICAL 'until' — LAST-in-file wins (Codex R1 on chk1 Bug #5)") {
+    // Codex R1 P2 on chk1 audit Bug #5: `max(by:)` keeps the FIRST
+    // element when the comparator reports equal. Without the
+    // (subscriptionUntil, index) composite comparator, an identical
+    // `until` pair would silently return the STALE first candidate.
+    // Pin the later-in-file preference on ties.
+    let fixture = """
+    <application>
+      <component name="AIAssistantQuotaManager2">
+        <option name="quotaInfo" value="&quot;type&quot;:&quot;Available&quot;,&quot;current&quot;:&quot;5&quot;,&quot;maximum&quot;:&quot;100&quot;,&quot;tariffQuota&quot;:{&quot;available&quot;:&quot;95&quot;},&quot;until&quot;:&quot;2027-06-01T00:00:00Z&quot;" />
+      </component>
+      <component name="AIAssistantQuotaManager2">
+        <option name="quotaInfo" value="&quot;type&quot;:&quot;Available&quot;,&quot;current&quot;:&quot;88&quot;,&quot;maximum&quot;:&quot;100&quot;,&quot;tariffQuota&quot;:{&quot;available&quot;:&quot;12&quot;},&quot;until&quot;:&quot;2027-06-01T00:00:00Z&quot;" />
+      </component>
+    </application>
+    """
+    let outcome = JetBrainsUsageFetcher.parseXMLText(fixture)
+    guard case .success(let snap) = outcome else { expect(false, "expected success"); return }
+    expectEqual(snap.used, 88.0)   // R1 P2: equal-until tie must break to LAST-in-file, not first
+}
+
+run("JetBrainsUsageFetcher.parseXMLText: two valid, one with no 'until' — falls back to LAST-in-file (chk1 Bug #5)") {
+    // When any candidate lacks `until`, the picker cannot compare
+    // on that axis. Fall back to LAST-in-file (append-then-truncate
+    // rationale). If Bug #5's fix were pure "always last", the
+    // freshest-by-until path above would fail. If Bug #5's fix
+    // were pure "always first valid", this test would fail.
+    let fixture = """
+    <application>
+      <component name="AIAssistantQuotaManager2">
+        <option name="quotaInfo" value="&quot;type&quot;:&quot;Available&quot;,&quot;current&quot;:&quot;11&quot;,&quot;maximum&quot;:&quot;100&quot;,&quot;tariffQuota&quot;:{&quot;available&quot;:&quot;89&quot;}" />
+      </component>
+      <component name="AIAssistantQuotaManager2">
+        <option name="quotaInfo" value="&quot;type&quot;:&quot;Available&quot;,&quot;current&quot;:&quot;99&quot;,&quot;maximum&quot;:&quot;100&quot;,&quot;tariffQuota&quot;:{&quot;available&quot;:&quot;1&quot;}" />
+      </component>
+    </application>
+    """
+    let outcome = JetBrainsUsageFetcher.parseXMLText(fixture)
+    guard case .success(let snap) = outcome else { expect(false, "expected success"); return }
+    expectEqual(snap.used, 99.0)   // Bug #5 tie-break: last-in-file wins when 'until' is missing on either candidate
 }
 
 run("JetBrainsUsageFetcher.parseXMLText: all components malformed -> malformedPayload") {
@@ -8649,8 +8850,11 @@ MainActor.assumeIsolated {
 
     run("WarpUsageStore: SQLiteReader.busy -> retry-later error, snapshot preserved") {
         // Seed a snapshot first, then observe .busy leaves it alone.
+        // chk1 audit Bug #13: the dead `var callCount = 0` + trailing
+        // `_ = callCount` suppression have been removed — the real
+        // counter is CountBox below, and the outer `var callCount`
+        // was leftover from an earlier refactor.
         let good = WarpUsageSnapshot(requestsToday: 7, sourceTable: "ai_queries", timestampColumn: "created_at", requestsAllTime: nil)
-        var callCount = 0
         let env = WarpEnvironment(
             candidateDbPaths: ["/fake/warp.sqlite"],
             fileExists: { $0 == "/fake/warp.sqlite" }
@@ -8678,7 +8882,6 @@ MainActor.assumeIsolated {
         awaitWarpFetch()
         expect(store.snapshot?.requestsToday == 7, "snapshot must survive a transient .busy")
         expect(store.lastError?.contains("retry") == true)
-        _ = callCount   // suppress unused warning
     }
 
     run("WarpUsageStore: clear() drops snapshot + tablesMissing + schemaUnknown flags") {
@@ -8703,6 +8906,176 @@ MainActor.assumeIsolated {
         expect(ProviderCopy.help(for: "WARP") == nil)
         expect(ProviderCopy.help(for: "warp-terminal") == nil)
         expect(ProviderCopy.help(for: "warp.dev") == nil)
+    }
+
+    // chk1 audit Bug #7 regression guard: disable must clear
+    // lastError, lastUpdatedAt, and tccState.
+    run("WarpUsageStore: disable clears lastError + lastUpdatedAt + tccState (chk1 Bug #7)") {
+        let snap = WarpUsageSnapshot(
+            requestsToday: 7, sourceTable: "ai_queries", timestampColumn: "created_at", requestsAllTime: nil
+        )
+        let store = makeWarpStoreForTest(flagEnabled: true, readOutcome: .success(snap))
+        store.fetch()
+        awaitWarpFetch()
+        expect(store.snapshot != nil, "precondition: fetch populated snapshot")
+        expect(store.lastUpdatedAt != nil, "precondition: fetch stamped lastUpdatedAt")
+        // Disable and re-fetch.
+        defaults.set(false, forKey: "features.warp.enabled")
+        store.fetch()
+        awaitWarpFetch()
+        expect(store.snapshot == nil, "Bug #7: snapshot must clear on disable")
+        expect(store.lastUpdatedAt == nil, "Bug #7: lastUpdatedAt must clear on disable")
+        expect(store.lastError == nil, "Bug #7: lastError must clear on disable")
+        expectEqual(store.tccState, .granted)   // Bug #7: tccState must reset on disable
+        expect(store.tablesMissing == false, "Bug #7: tablesMissing must clear on disable")
+        expect(store.schemaUnknown == false, "Bug #7: schemaUnknown must clear on disable")
+    }
+
+    // chk1 audit Bug #8 regression guard: TCC denial branch must
+    // clear lastUpdatedAt on the SAME store (Codex R1 P3).
+    run("WarpUsageStore: same-store TCC transition to .denied clears lastUpdatedAt (chk1 Bug #8)") {
+        final class TCCBox: @unchecked Sendable {
+            var state: TCCState = .granted
+        }
+        let box = TCCBox()
+        let snap = WarpUsageSnapshot(
+            requestsToday: 3, sourceTable: "ai_queries", timestampColumn: "ts", requestsAllTime: nil
+        )
+        defaults.set(true, forKey: "features.warp.enabled")
+        let env = WarpEnvironment(
+            candidateDbPaths: ["/fake/warp.sqlite"],
+            fileExists: { $0 == "/fake/warp.sqlite" }
+        )
+        let store = WarpUsageStore(
+            defaults: defaults,
+            environment: env,
+            tccProbe: { _ in box.state },
+            readSnapshot: { _, _ in .success(snap) }
+        )
+        store.fetch()
+        awaitWarpFetch()
+        expect(store.lastUpdatedAt != nil, "precondition: fetch stamped lastUpdatedAt")
+        // Mutate to .denied and re-fetch on the SAME store.
+        box.state = .denied
+        store.fetch()
+        awaitWarpFetch()
+        expectEqual(store.tccState, .denied)
+        expect(store.snapshot == nil, "Bug #8: same store — snapshot must clear on TCC deny")
+        expect(store.lastUpdatedAt == nil, "Bug #8: same store — lastUpdatedAt must clear (Codex R1 P3 regression)")
+        expect(store.lastError == nil, "Bug #8: same store — lastError must clear")
+    }
+
+    // chk1 audit Bug #9 regression guard: pathMissing (no candidate
+    // exists) branch must also clear lastUpdatedAt on the SAME store.
+    run("WarpUsageStore: same-store transition to pathMissing clears lastUpdatedAt (chk1 Bug #9)") {
+        final class PathBox: @unchecked Sendable {
+            var exists = true
+        }
+        let box = PathBox()
+        let snap = WarpUsageSnapshot(
+            requestsToday: 5, sourceTable: "ai_queries", timestampColumn: "ts", requestsAllTime: nil
+        )
+        defaults.set(true, forKey: "features.warp.enabled")
+        let env = WarpEnvironment(
+            candidateDbPaths: ["/fake/warp.sqlite"],
+            fileExists: { path in box.exists && path == "/fake/warp.sqlite" }
+        )
+        let store = WarpUsageStore(
+            defaults: defaults,
+            environment: env,
+            tccProbe: { _ in .granted },
+            readSnapshot: { _, _ in .success(snap) }
+        )
+        store.fetch()
+        awaitWarpFetch()
+        expect(store.lastUpdatedAt != nil, "precondition: fetch stamped lastUpdatedAt")
+        // Simulate the DB file disappearing (user uninstalled Warp).
+        box.exists = false
+        store.fetch()
+        awaitWarpFetch()
+        expectEqual(store.tccState, .pathMissing)
+        expect(store.snapshot == nil, "Bug #9: same store — snapshot must clear on pathMissing")
+        expect(store.lastUpdatedAt == nil, "Bug #9: same store — lastUpdatedAt must clear (Codex R1 P3 regression)")
+        expect(store.lastError == nil, "Bug #9: same store — lastError must clear")
+    }
+
+    // Codex R3 P2 on chk1 audit Bug #8 + Bug #9: the read-time
+    // transitions (SQLiteReader throws .notFound / .openFailed
+    // AFTER the pre-read probe/path check passed) map to
+    // .pathMissing / .denied in applyOutcome. Previously
+    // applyOutcome cleared snapshot but NOT lastUpdatedAt — the
+    // same stale-timestamp bug the pre-read fix eliminated. Pin
+    // that both async-outcome paths also clear lastUpdatedAt.
+    run("WarpUsageStore: read-time throws .notFound -> pathMissing clears lastUpdatedAt (Codex R3 chk1 Bug #9)") {
+        final class ReadBox: @unchecked Sendable {
+            var shouldThrowNotFound = false
+        }
+        let box = ReadBox()
+        let snap = WarpUsageSnapshot(
+            requestsToday: 4, sourceTable: "ai_queries", timestampColumn: "ts", requestsAllTime: nil
+        )
+        defaults.set(true, forKey: "features.warp.enabled")
+        let env = WarpEnvironment(
+            candidateDbPaths: ["/fake/warp.sqlite"],
+            fileExists: { $0 == "/fake/warp.sqlite" }
+        )
+        let store = WarpUsageStore(
+            defaults: defaults,
+            environment: env,
+            tccProbe: { _ in .granted },
+            readSnapshot: { _, _ in
+                if box.shouldThrowNotFound {
+                    throw SQLiteReaderError.notFound("/fake/warp.sqlite")
+                }
+                return .success(snap)
+            }
+        )
+        store.fetch()
+        awaitWarpFetch()
+        expect(store.lastUpdatedAt != nil, "precondition: fetch stamped lastUpdatedAt")
+        // Trigger read-time .notFound on the same store.
+        box.shouldThrowNotFound = true
+        store.fetch()
+        awaitWarpFetch()
+        expectEqual(store.tccState, .pathMissing)
+        expect(store.snapshot == nil, "Codex R3: same store — snapshot must clear on read-time pathMissing")
+        expect(store.lastUpdatedAt == nil, "Codex R3: same store — lastUpdatedAt must clear on read-time pathMissing")
+    }
+
+    run("WarpUsageStore: read-time throws .openFailed -> denied clears lastUpdatedAt (Codex R3 chk1 Bug #8)") {
+        final class ReadBox: @unchecked Sendable {
+            var shouldThrowOpenFailed = false
+        }
+        let box = ReadBox()
+        let snap = WarpUsageSnapshot(
+            requestsToday: 4, sourceTable: "ai_queries", timestampColumn: "ts", requestsAllTime: nil
+        )
+        defaults.set(true, forKey: "features.warp.enabled")
+        let env = WarpEnvironment(
+            candidateDbPaths: ["/fake/warp.sqlite"],
+            fileExists: { $0 == "/fake/warp.sqlite" }
+        )
+        let store = WarpUsageStore(
+            defaults: defaults,
+            environment: env,
+            tccProbe: { _ in .granted },
+            readSnapshot: { _, _ in
+                if box.shouldThrowOpenFailed {
+                    throw SQLiteReaderError.openFailed(rc: 14, message: "unable to open database file")
+                }
+                return .success(snap)
+            }
+        )
+        store.fetch()
+        awaitWarpFetch()
+        expect(store.lastUpdatedAt != nil, "precondition: fetch stamped lastUpdatedAt")
+        // Trigger read-time .openFailed on the same store.
+        box.shouldThrowOpenFailed = true
+        store.fetch()
+        awaitWarpFetch()
+        expectEqual(store.tccState, .denied)
+        expect(store.snapshot == nil, "Codex R3: same store — snapshot must clear on read-time denied")
+        expect(store.lastUpdatedAt == nil, "Codex R3: same store — lastUpdatedAt must clear on read-time denied")
     }
 
     defaults.removePersistentDomain(forName: suite)

@@ -340,12 +340,20 @@ public enum JetBrainsUsageFetcher {
     /// exercise the parser directly without a file on disk.
     ///
     /// Codex R2 P3: iterate ALL matching `AIAssistantQuotaManager2`
-    /// component blocks in file-order, keep the FIRST that yields a
-    /// full valid snapshot. IntelliJ's PersistentStateComponent
+    /// component blocks. IntelliJ's PersistentStateComponent
     /// serialiser has been observed to emit a stale duplicate
-    /// component before a fresh write in some crash-recovery paths,
-    /// and previously the parser would return `.malformedPayload`
-    /// from the stale one instead of continuing to the valid one.
+    /// component alongside a fresh write in some crash-recovery
+    /// paths.
+    ///
+    /// chk1 audit Bug #5: iterate `bodies.reversed()` so a
+    /// LATER-in-file component wins over an EARLIER stale duplicate.
+    /// Rationale: PersistentStateComponent writes are effectively
+    /// append-then-truncate — a partial crash-recovery scenario
+    /// leaves the stale content BEFORE the fresh content in the
+    /// file. Additionally, if two candidate parses succeed, we
+    /// prefer the one whose `quotaInfo.until` is the LATEST — that
+    /// is semantically the freshest snapshot regardless of file
+    /// order.
     public static func parseXMLText(_ text: String) -> JetBrainsReadOutcome {
         // Find every AIAssistantQuotaManager2 component. Deliberately
         // regex-based rather than an XML DOM because IntelliJ's
@@ -356,25 +364,51 @@ public enum JetBrainsUsageFetcher {
         let bodies = allMatchBodies(componentPattern, in: text)
         if bodies.isEmpty { return .componentMissing }
 
-        // Try each candidate component body — return the first
-        // successful parse. Only if EVERY candidate fails do we
-        // surface .malformedPayload.
+        // First pass: collect every valid parse, tagged with its
+        // file-order index so tie-breaks can prefer later-in-file
+        // deterministically. Codex R1 P2 on chk1 audit Bug #5:
+        // `max(by:)` keeps the FIRST element when the comparator
+        // reports equal, so two components with identical `until`
+        // would pick the earlier one — contradicting the
+        // "append-then-truncate → later wins" rationale.
+        var successes: [(snap: JetBrainsQuotaSnapshot, index: Int)] = []
         var sawAnyPayload = false
-        for body in bodies {
+        for (index, body) in bodies.enumerated() {
             let outcome = parseComponentBody(body)
             switch outcome {
-            case .success:
-                return outcome
+            case .success(let snap):
+                successes.append((snap, index))
             case .malformedPayload:
                 sawAnyPayload = true
-                continue
             case .componentMissing:
-                // A component with an entirely empty body — still
-                // a "component missing" signal for this candidate.
                 continue
             }
         }
-        return sawAnyPayload ? .malformedPayload : .componentMissing
+        if successes.isEmpty {
+            return sawAnyPayload ? .malformedPayload : .componentMissing
+        }
+        if successes.count == 1 {
+            return .success(successes[0].snap)
+        }
+        // Multiple valid parses — pick the freshest by
+        // `subscriptionUntil`. Codex R1 P2: on equal-`until`
+        // ties, prefer the LATER-in-file candidate so the
+        // append-then-truncate rationale still holds. A missing
+        // `until` on ANY candidate means we cannot compare on
+        // that axis; fall back to the LAST valid parse in
+        // file-order.
+        let allHaveUntil = successes.allSatisfy { $0.snap.subscriptionUntil != nil }
+        if allHaveUntil {
+            let freshest = successes.max(by: { lhs, rhs in
+                let l = lhs.snap.subscriptionUntil ?? .distantPast
+                let r = rhs.snap.subscriptionUntil ?? .distantPast
+                if l != r { return l < r }
+                // Equal `until` → higher file index wins.
+                return lhs.index < rhs.index
+            })!
+            return .success(freshest.snap)
+        }
+        return .success(successes.last!.snap)
     }
 
     /// Parse a single `<component>` body. Extracted so

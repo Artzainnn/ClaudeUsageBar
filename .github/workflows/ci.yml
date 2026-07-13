@@ -127,6 +127,11 @@ jobs:
 
       - name: Reject JetBrains AI live-endpoint use (DMCA constraint)
         run: |
+          # chk1 audit Bug #12: fail fast on any error inside this
+          # block, so a malformed input file or an awk crash does
+          # NOT silently pass the guard.
+          set -euo pipefail
+
           # PR 12-BE — the JetBrains AI Assistant provider is
           # deliberately LOCAL-ONLY. Calling `api.jetbrains.ai` or
           # `grazie.aws.intellij.net` from this app would breach
@@ -144,6 +149,20 @@ jobs:
           # inside a comment (`// ...` OR `/* ... */`), and emits
           # only the string-literal bytes. Then we grep the
           # extracted string content for the forbidden hosts.
+          #
+          # KNOWN LIMITATIONS (chk1 audit Bugs #10, #11):
+          #  1. Swift extended raw strings (`##"..."##`, `###"..."###`)
+          #     — the machine detects the FIRST `#"` as a level-1 raw
+          #     open. In practice this still emits the string body
+          #     (opening pounds treated as code, closing pounds inside
+          #     the body until `"#`), so the forbidden host inside
+          #     the body IS grepped. Coverage is accidental, not
+          #     designed. Prefer level-1 raw strings when possible.
+          #  2. Interpolated hosts (`let h = "api.jetbrains.ai"; URL(string: "https://\(h)/")`)
+          #     — the string-literal scan only sees the LITERAL body,
+          #     not the interpolated value. Any static-grep guard
+          #     shares this blind spot. A code review must catch
+          #     this shape.
           FORBIDDEN='api\.jetbrains\.ai|grazie\.aws\.intellij\.net'
           FAIL=0
           while IFS= read -r file; do
@@ -202,15 +221,170 @@ jobs:
                 if (mode == "line_comment") { mode="code"; }
               }
             ' "$file")
-            if echo "$strings" | grep -qE "$FORBIDDEN"; then
+            # `grep -qE` exits 1 on no-match; under `set -e` that
+            # would abort the whole script. Use the || true idiom
+            # and inspect the return via a captured variable.
+            #
+            # Codex R2 P2: `echo … | grep -q` under `pipefail` can
+            # report rc=141 (SIGPIPE) when grep matches early and
+            # closes the pipe. Use a here-string so no pipe exists.
+            match_rc=0
+            grep -qE "$FORBIDDEN" <<< "$strings" || match_rc=$?
+            if [ $match_rc -eq 0 ]; then
               echo "::error file=$file::DMCA live-endpoint reference to a forbidden JetBrains host in a Swift string literal." >&2
               FAIL=1
+            elif [ $match_rc -ne 1 ]; then
+              # grep returned something other than 0 (match) or 1
+              # (no match) — a real error (bad regex, I/O failure).
+              # Escalate so silent guard-failure is impossible.
+              echo "::error file=$file::grep failed with rc=$match_rc while scanning for DMCA hosts." >&2
+              exit 1
             fi
           done < <(find app -name '*.swift' -type f)
           if [ $FAIL -eq 1 ]; then
             echo "::error::JetBrains live-endpoint use detected. DMCA constraint — this app must NOT contact api.jetbrains.ai or grazie.aws.intellij.net. See .pr-bodies/RESUME.md 'Known caveats'." >&2
             exit 1
           fi
+
+      - name: Self-test the DMCA guard against a synthetic hostile fixture
+        run: |
+          # chk1 audit omission #4: without a self-test, a silent
+          # regression to the awk state machine (e.g. R3 P2's dead
+          # triple-quote branch) would leave clean CI even though
+          # the guard is broken. This step INJECTS a known-hostile
+          # Swift file at $RUNNER_TEMP, runs the same extraction
+          # pipeline, and ASSERTS grep fires. If the guard is
+          # broken, this step fails and the PR is blocked.
+          set -euo pipefail
+          TMP="${RUNNER_TEMP:-/tmp}/dmca-guard-selftest.swift"
+          cat > "$TMP" << 'HOSTILE'
+          // this comment mentioning api.jetbrains.ai must NOT trip
+          import Foundation
+          let single = "https://api.jetbrains.ai/v1"
+          let raw = #"https://grazie.aws.intellij.net"#
+          let multi = """
+          embedded quote "trap" then https://api.jetbrains.ai/second
+          """
+          HOSTILE
+          strings=$(awk '
+            BEGIN { mode="code"; }
+            {
+              i = 1;
+              while (i <= length($0)) {
+                c = substr($0, i, 1);
+                d = substr($0, i, 2);
+                t = substr($0, i, 3);
+                if (mode == "code") {
+                  if (d == "//") { mode="line_comment"; i += 2; continue; }
+                  if (d == "/*") { mode="block_comment"; i += 2; continue; }
+                  if (t == "\"\"\"") { mode="ms"; i += 3; continue; }
+                  if (d == "#\"") { mode="raw"; i += 2; continue; }
+                  if (c == "\"") { mode="s"; i += 1; continue; }
+                  i += 1; continue;
+                }
+                if (mode == "line_comment") { i = length($0)+1; continue; }
+                if (mode == "block_comment") {
+                  if (d == "*/") { mode="code"; i += 2; continue; }
+                  i += 1; continue;
+                }
+                if (mode == "s") {
+                  if (c == "\\") { printf "%s", substr($0, i, 2); i += 2; continue; }
+                  if (c == "\"") { mode="code"; printf "\n"; i += 1; continue; }
+                  printf "%s", c; i += 1; continue;
+                }
+                if (mode == "ms") {
+                  if (t == "\"\"\"") { mode="code"; printf "\n"; i += 3; continue; }
+                  printf "%s", c; i += 1; continue;
+                }
+                if (mode == "raw") {
+                  if (d == "\"#") { mode="code"; printf "\n"; i += 2; continue; }
+                  printf "%s", c; i += 1; continue;
+                }
+              }
+              if (mode == "line_comment") { mode="code"; }
+            }
+          ' "$TMP")
+          # ALL THREE hostile string forms must appear in the extracted
+          # output. If any is missing, the guard has regressed and we
+          # fail loudly.
+          # Codex R2 P2: use here-strings to avoid SIGPIPE/141
+          # false-failure under `set -o pipefail`.
+          if ! grep -qE 'api\.jetbrains\.ai/v1' <<< "$strings"; then
+            echo "::error::DMCA guard self-test FAILED: single-line string form not extracted." >&2
+            exit 1
+          fi
+          if ! grep -qE 'grazie\.aws\.intellij\.net' <<< "$strings"; then
+            echo "::error::DMCA guard self-test FAILED: raw string form (#\"...\"#) not extracted." >&2
+            exit 1
+          fi
+          if ! grep -qE 'api\.jetbrains\.ai/second' <<< "$strings"; then
+            echo "::error::DMCA guard self-test FAILED: multi-line string form (\"\"\"...\"\"\") not extracted." >&2
+            exit 1
+          fi
+          rm -f "$TMP"
+          echo "DMCA guard self-test PASSED: all three string forms extracted."
+
+          # Codex R1 P3 on the earlier version of this self-test: the
+          # positive assertions above only prove the extractor FINDS
+          # hostile literals. They do NOT prove the extractor CORRECTLY
+          # EXCLUDES comments — a regression that started emitting
+          # comment bytes would still pass the positive tests. Add a
+          # NEGATIVE self-test: a fixture that contains the forbidden
+          # host ONLY in comments (no string literal) must emit an
+          # extracted-strings output that does NOT contain the host.
+          CTMP="${RUNNER_TEMP:-/tmp}/dmca-guard-selftest-comments.swift"
+          cat > "$CTMP" << 'COMMENTS_ONLY'
+          import Foundation
+          // https://api.jetbrains.ai/comment-line — MUST NOT be extracted
+          /* block comment mentioning grazie.aws.intellij.net — MUST NOT be extracted */
+          let benign = "not a real host"
+          COMMENTS_ONLY
+          comment_strings=$(awk '
+            BEGIN { mode="code"; }
+            {
+              i = 1;
+              while (i <= length($0)) {
+                c = substr($0, i, 1);
+                d = substr($0, i, 2);
+                t = substr($0, i, 3);
+                if (mode == "code") {
+                  if (d == "//") { mode="line_comment"; i += 2; continue; }
+                  if (d == "/*") { mode="block_comment"; i += 2; continue; }
+                  if (t == "\"\"\"") { mode="ms"; i += 3; continue; }
+                  if (d == "#\"") { mode="raw"; i += 2; continue; }
+                  if (c == "\"") { mode="s"; i += 1; continue; }
+                  i += 1; continue;
+                }
+                if (mode == "line_comment") { i = length($0)+1; continue; }
+                if (mode == "block_comment") {
+                  if (d == "*/") { mode="code"; i += 2; continue; }
+                  i += 1; continue;
+                }
+                if (mode == "s") {
+                  if (c == "\\") { printf "%s", substr($0, i, 2); i += 2; continue; }
+                  if (c == "\"") { mode="code"; printf "\n"; i += 1; continue; }
+                  printf "%s", c; i += 1; continue;
+                }
+                if (mode == "ms") {
+                  if (t == "\"\"\"") { mode="code"; printf "\n"; i += 3; continue; }
+                  printf "%s", c; i += 1; continue;
+                }
+                if (mode == "raw") {
+                  if (d == "\"#") { mode="code"; printf "\n"; i += 2; continue; }
+                  printf "%s", c; i += 1; continue;
+                }
+              }
+              if (mode == "line_comment") { mode="code"; }
+            }
+          ' "$CTMP")
+          if grep -qE 'api\.jetbrains\.ai|grazie\.aws\.intellij\.net' <<< "$comment_strings"; then
+            echo "::error::DMCA guard self-test FAILED: comment-only fixture leaked forbidden host bytes." >&2
+            echo "Extracted output was:" >&2
+            echo "$comment_strings" >&2
+            exit 1
+          fi
+          rm -f "$CTMP"
+          echo "DMCA guard self-test PASSED: comments correctly excluded from extraction."
 
   build-and-test:
     name: Build and test (macOS)

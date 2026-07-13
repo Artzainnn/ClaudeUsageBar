@@ -191,9 +191,11 @@ public final class WarpUsageStore: @preconcurrency UsageProvider {
     public func fetch() {
         fetchGeneration &+= 1
         guard isEnabled else {
-            snapshot = nil
-            tablesMissing = false
-            schemaUnknown = false
+            // chk1 audit Bug #7: the disable branch must clear
+            // every stale published field. Previously
+            // `lastError`, `lastUpdatedAt`, and `tccState`
+            // persisted from the last enabled session.
+            resetToDisabledBaseline()
             return
         }
         let launchGeneration = fetchGeneration
@@ -215,19 +217,18 @@ public final class WarpUsageStore: @preconcurrency UsageProvider {
                 }
             }
             self.tccState = seenDenied ? .denied : .pathMissing
-            self.snapshot = nil
-            self.tablesMissing = false
-            self.schemaUnknown = false
-            self.lastError = nil
+            // chk1 audit Bug #9: also clear lastUpdatedAt so a
+            // stale "Last updated 3h ago" caption does not sit
+            // beside a needs-access / not-installed tile.
+            self.applyNonGrantedReset()
             return
         }
         let probed = tccProbe(path)
         self.tccState = probed
         if probed != .granted {
-            self.snapshot = nil
-            self.tablesMissing = false
-            self.schemaUnknown = false
-            self.lastError = nil
+            // chk1 audit Bug #8: also clear lastUpdatedAt on
+            // TCC-denied. Same rationale as Bug #9 above.
+            self.applyNonGrantedReset()
             return
         }
 
@@ -266,12 +267,33 @@ public final class WarpUsageStore: @preconcurrency UsageProvider {
     }
 
     public func clear() {
+        resetToDisabledBaseline()
+        fetchGeneration &+= 1
+    }
+
+    /// Reset every published field to the "disabled" baseline —
+    /// used by both the disable branch of `fetch()` and by
+    /// `clear()`. chk1 audit Bug #7: keep the two sites in
+    /// lockstep so state hygiene can't drift between them.
+    private func resetToDisabledBaseline() {
+        snapshot = nil
+        lastUpdatedAt = nil
+        lastError = nil
+        tccState = .granted
+        tablesMissing = false
+        schemaUnknown = false
+    }
+
+    /// Reset published state after a TCC deny / pathMissing outcome
+    /// while KEEPING the just-set `tccState` intact. chk1 audit
+    /// Bugs #8, #9: previously `lastUpdatedAt` was retained on
+    /// these branches, leaving a stale "Last updated" caption.
+    private func applyNonGrantedReset() {
         snapshot = nil
         lastUpdatedAt = nil
         lastError = nil
         tablesMissing = false
         schemaUnknown = false
-        fetchGeneration &+= 1
     }
 
     private enum WorkOutcome: Sendable {
@@ -305,17 +327,22 @@ public final class WarpUsageStore: @preconcurrency UsageProvider {
             self.schemaUnknown = true
             self.lastError = nil
         case .pathMissing:
+            // Codex R3 P2 on chk1 audit Bug #9: a read-time
+            // .notFound transition (file disappeared between the
+            // probe and the sqlite open) previously left
+            // lastUpdatedAt intact — the same stale-timestamp
+            // regression Bug #9 fixed for the pre-read branch,
+            // resurfacing here. Route through the shared reset.
             self.tccState = .pathMissing
-            self.snapshot = nil
-            self.tablesMissing = false
-            self.schemaUnknown = false
-            self.lastError = nil
+            self.applyNonGrantedReset()
         case .denied:
+            // Codex R3 P2 on chk1 audit Bug #8: same class of
+            // regression — a read-time .openFailed transition
+            // (TCC denial revealed by sqlite_open_v2 after the
+            // parent-dir probe passed) previously left
+            // lastUpdatedAt intact.
             self.tccState = .denied
-            self.snapshot = nil
-            self.tablesMissing = false
-            self.schemaUnknown = false
-            self.lastError = nil
+            self.applyNonGrantedReset()
         case .transientBusy:
             self.lastError = "Warp is holding the database — retry on next tick."
         case .otherError(let msg):
