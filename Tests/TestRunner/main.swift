@@ -635,6 +635,35 @@ MainActor.assumeIsolated {
 
 // MARK: - ProviderCopy (Settings toggle copy — PR 3-UI)
 
+run("ProviderCopy id matches ClaudeCodeUsageStore.id — exercises the real Settings path (PR 10b-UI regression guard)") {
+    // Codex round-2 finding: a raw-string test locks in the wrong side
+    // of the contract. If either the store id or the ProviderCopy case
+    // drifts, ProviderToggleRow (which calls
+    // `ProviderCopy.help(for: box.id)` at
+    // app/ClaudeUsageBar.swift:2401) silently loses the row's help and
+    // disclosure. Read the store's OWN id so drift on either side is
+    // caught.
+    MainActor.assumeIsolated {
+        let store = ClaudeCodeUsageStore()
+        expect(ProviderCopy.help(for: store.id) != nil)
+        expect(ProviderCopy.disclosure(for: store.id) != nil)
+        // Also guard via ProviderBox — the wrapping layer between the
+        // store and the Settings row.
+        let box = ProviderBox(store)
+        expect(ProviderCopy.help(for: box.id) != nil)
+        expect(ProviderCopy.disclosure(for: box.id) != nil)
+    }
+    // Pin the literal too so any refactor of the store id must update
+    // both sides in lockstep.
+    expect(ProviderCopy.help(for: "claudeCode") != nil)
+    expect(ProviderCopy.disclosure(for: "claudeCode") != nil)
+    // Guard against near-miss casings that would still round-trip
+    // through Settings but drop the strings.
+    expect(ProviderCopy.help(for: "claude-code") == nil)
+    expect(ProviderCopy.help(for: "claudecode") == nil)
+    expect(ProviderCopy.help(for: "ClaudeCode") == nil)
+}
+
 run("ProviderCopy.help returns Codex copy and nil for unknown") {
     let codex = ProviderCopy.help(for: "codex")
     expect(codex != nil)
@@ -753,6 +782,41 @@ run("ProviderCopy: Copilot disclosure warns about classic PATs, expiry, and non-
     // Codex round-1 finding #1: revocation clarity.
     expect(disc?.contains("revoke") == true)
     expect(disc?.contains("github.com") == true)
+}
+
+run("ProviderCopy: Claude Code help names the JSONL path and 'nothing leaves your Mac' guarantee (PR 10b-UI)") {
+    // The user needs to know that (1) this reads a local file, (2) it
+    // reads Claude Code's OWN file — no key required, (3) costs are
+    // computed locally from a bundled snapshot, (4) NOTHING is
+    // transmitted. Any of these being unclear at Settings time is a
+    // trust hazard for a menu-bar app.
+    let help = ProviderCopy.help(for: "claudeCode")
+    expect(help != nil)
+    // Path is named verbatim so a user searching Finder / a shell can
+    // find it.
+    expect(help?.contains("~/.claude/projects") == true)
+    // The privacy guarantee must be stated explicitly.
+    expect(help?.contains("Nothing leaves your Mac") == true || help?.contains("nothing leaves your Mac") == true)
+    // No key / no sign-in — anticipates the user asking "what do I paste?".
+    expect(help?.contains("no key") == true || help?.contains("no sign-in") == true || help?.contains("No key") == true || help?.contains("No sign-in") == true)
+    // Cost method is disclosed — bundled snapshot of Anthropic rates.
+    expect(help?.contains("bundled snapshot") == true || help?.contains("Anthropic") == true)
+}
+
+run("ProviderCopy: Claude Code disclosure states 'estimate not receipt' + unpriced-model behaviour (PR 10b-UI)") {
+    // Costs are estimates. If we don't say so, a user could see $47 in
+    // the tile and be surprised when their Anthropic bill says $52. The
+    // disclosure must (1) explicitly call the numbers estimates, (2)
+    // clarify they are NOT a receipt from Anthropic, (3) explain the
+    // unpriced-model fallback so a new Claude release doesn't look like
+    // free tokens.
+    let disc = ProviderCopy.disclosure(for: "claudeCode")
+    expect(disc != nil)
+    expect(disc?.contains("estimate") == true || disc?.contains("Estimates") == true || disc?.contains("estimates") == true)
+    expect(disc?.contains("receipt") == true)
+    // The unpriced-fallback behaviour surfaced so the user is not
+    // confused when a new Claude release shows $0 despite heavy usage.
+    expect(disc?.contains("$0") == true || disc?.contains("Pricing update available") == true || disc?.contains("unpriced") == true)
 }
 
 run("ProviderCopy: Perplexity disclosure warns about undocumented API and cookie power") {
