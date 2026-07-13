@@ -110,7 +110,17 @@ let package = Package(
                 // so the fetcher has its own `readClineUiMessagesText`
                 // helper with a 64 MB streaming reader.
                 "ClineUsageFetcher.swift",
-                "ClineUsageStore.swift"
+                "ClineUsageStore.swift",
+                // PR 11-BE — Windsurf + Cursor providers. Both read a
+                // VS Code-style state.vscdb through SQLiteReader (PR #66)
+                // and reuse TCCProbe + LocalProviderAccessGuide.
+                // Cursor also performs live fetches to cursor.com and
+                // api2.cursor.sh (via a Sendable transport protocol,
+                // stubbed in tests).
+                "WindsurfUsageFetcher.swift",
+                "WindsurfUsageStore.swift",
+                "CursorUsageFetcher.swift",
+                "CursorUsageStore.swift"
                 // AnthropicUsageStore.swift depends on UsageManager
                 // (defined in ClaudeUsageBar.swift), so it stays in the
                 // app-bundle compile only, not in the SwiftPM library

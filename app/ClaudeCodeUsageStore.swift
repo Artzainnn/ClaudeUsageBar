@@ -309,10 +309,18 @@ public final class ClaudeCodeUsageStore: @preconcurrency UsageProvider {
     public nonisolated static func formatUSD(_ amount: Double) -> String {
         guard amount.isFinite else { return "$0.00" }
         if amount > 0 && amount < 0.005 { return "<$0.01" }
-        // Round to cents, then split into integer and cents parts so the
-        // thousands separator (added via formatWithCommas) applies only
-        // to the dollars portion.
-        let cents = Int((amount * 100.0).rounded())
+        // 3cc round-3 finding #3: guard Int((huge * 100.0).rounded())
+        // against a trap. `Int(exactly:)` returns nil when the Double
+        // is outside Int range; clamp to Int.max / .min in that case.
+        let scaled = (amount * 100.0).rounded()
+        let cents: Int
+        if let n = Int(exactly: scaled) {
+            cents = n
+        } else if scaled > 0 {
+            cents = Int.max
+        } else {
+            cents = Int.min + 1     // reserve Int.min so abs() cannot trap
+        }
         let sign = cents < 0 ? "-" : ""
         let abs_ = abs(cents)
         let dollars = abs_ / 100

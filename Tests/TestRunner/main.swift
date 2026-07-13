@@ -6413,6 +6413,1211 @@ MainActor.assumeIsolated {
     }
 }
 
+// MARK: - WindsurfPathResolver (PR 11-BE)
+
+run("WindsurfPathResolver: builds ~/Library/Application Support/Windsurf path") {
+    let env = WindsurfPathResolver.Environment(
+        homeDirectoryPath: "/Users/tester",
+        applicationSupportPath: "/Users/tester/Library/Application Support"
+    )
+    let path = WindsurfPathResolver.stateDbPath(env)
+    expectEqual(path, "/Users/tester/Library/Application Support/Windsurf/User/globalStorage/state.vscdb")
+}
+
+run("WindsurfPathResolver: returns nil when applicationSupportPath is empty") {
+    let env = WindsurfPathResolver.Environment(
+        homeDirectoryPath: "/Users/tester",
+        applicationSupportPath: ""
+    )
+    expect(WindsurfPathResolver.stateDbPath(env) == nil)
+}
+
+run("WindsurfPathResolver.Environment.current populates without crash") {
+    let env = WindsurfPathResolver.Environment.current()
+    expect(!env.applicationSupportPath.isEmpty)
+}
+
+// MARK: - WindsurfUsageParser.numeric + unixTimestampFlexibleSecondsOrMs
+
+run("WindsurfUsageParser.numeric: Double / Int / stringified numerics; rejects NaN/inf/nil") {
+    expectEqual(WindsurfUsageParser.numeric(42), 42.0)
+    expectEqual(WindsurfUsageParser.numeric(3.14), 3.14)
+    expectEqual(WindsurfUsageParser.numeric("100"), 100.0)
+    expectEqual(WindsurfUsageParser.numeric("garbage"), nil)
+    expectEqual(WindsurfUsageParser.numeric(nil), nil)
+    expectEqual(WindsurfUsageParser.numeric(Double.nan), nil)
+    expectEqual(WindsurfUsageParser.numeric(Double.infinity), nil)
+}
+
+run("WindsurfUsageParser.unixTimestampFlexibleSecondsOrMs: seconds and ms both accepted; range clamped") {
+    // 2026-07-13T04:00:00Z as seconds and as ms.
+    let sec = 1_784_000_400.0
+    let ms = sec * 1000.0
+    let d1 = WindsurfUsageParser.unixTimestampFlexibleSecondsOrMs(sec)
+    let d2 = WindsurfUsageParser.unixTimestampFlexibleSecondsOrMs(ms)
+    expect(d1 != nil)
+    expect(d2 != nil)
+    // Both should point to the same instant.
+    expectEqual(d1, d2)
+    // Out-of-range values return nil.
+    expect(WindsurfUsageParser.unixTimestampFlexibleSecondsOrMs(0) == nil)   // 1970 — pre-2000
+    expect(WindsurfUsageParser.unixTimestampFlexibleSecondsOrMs(1e18) == nil) // far-future
+    expect(WindsurfUsageParser.unixTimestampFlexibleSecondsOrMs(Double.nan) == nil)
+}
+
+// MARK: - WindsurfUsageParser.parse
+
+run("Windsurf.parse: older quotaUsage shape produces daily + weekly windows with reset stamps") {
+    let json = """
+    {
+      "planName": "Pro",
+      "quotaUsage": {
+        "dailyRemainingPercent": 65.0,
+        "weeklyRemainingPercent": 42.5,
+        "dailyResetAtUnix": 1784000400,
+        "weeklyResetAtUnix": 1784432400
+      }
+    }
+    """
+    let usage = WindsurfUsageParser.parse(cachedPlanInfoJSON: json)
+    expect(usage != nil)
+    expectEqual(usage?.planName, "Pro")
+    expectEqual(usage?.windows.count, 2)
+    let daily = usage?.windows.first { $0.kind == .daily }
+    expect(daily != nil)
+    // fractionUsed = (100-65)/100 = 0.35.
+    expect(abs((daily?.fractionUsed ?? 0) - 0.35) < 1e-9)
+    expect(daily?.resetsAt != nil)
+    let weekly = usage?.windows.first { $0.kind == .weekly }
+    expect(weekly != nil)
+    expect(abs((weekly?.fractionUsed ?? 0) - 0.575) < 1e-9)
+}
+
+run("Windsurf.parse: newer usage.usedFlexCredits shape produces credits window") {
+    let json = """
+    {
+      "planName": "Pro",
+      "usage": {"usedFlexCredits": 250, "flexCredits": 1000},
+      "endTimestamp": 1784000400
+    }
+    """
+    let usage = WindsurfUsageParser.parse(cachedPlanInfoJSON: json)
+    expectEqual(usage?.windows.count, 1)
+    let w = usage?.windows.first
+    expectEqual(w?.kind, .credits)
+    expectEqual(w?.displayLabel, "Flex credits")
+    expect(abs((w?.fractionUsed ?? 0) - 0.25) < 1e-9)
+}
+
+run("Windsurf.parse: newer usage.usedMessages+remainingMessages shape") {
+    let json = """
+    {"usage": {"usedMessages": 30, "remainingMessages": 70}}
+    """
+    let usage = WindsurfUsageParser.parse(cachedPlanInfoJSON: json)
+    expectEqual(usage?.windows.count, 1)
+    let w = usage?.windows.first
+    expectEqual(w?.kind, .credits)
+    expectEqual(w?.displayLabel, "Messages")
+    // 30 / (30+70) = 0.30.
+    expect(abs((w?.fractionUsed ?? 0) - 0.30) < 1e-9)
+}
+
+run("Windsurf.parse: usage.messages (total) + usedMessages fallback") {
+    // Third form observed: `messages` is total, `usedMessages` is used.
+    let json = """
+    {"usage": {"usedMessages": 10, "messages": 40}}
+    """
+    let usage = WindsurfUsageParser.parse(cachedPlanInfoJSON: json)
+    expectEqual(usage?.windows.count, 1)
+    let w = usage?.windows.first
+    expect(abs((w?.fractionUsed ?? 0) - 0.25) < 1e-9)
+}
+
+run("Windsurf.parse: quotaUsage present → newer usage.* fields NOT surfaced (no double-count)") {
+    let json = """
+    {
+      "quotaUsage": {"dailyRemainingPercent": 50.0},
+      "usage": {"usedMessages": 100, "remainingMessages": 100}
+    }
+    """
+    let usage = WindsurfUsageParser.parse(cachedPlanInfoJSON: json)
+    expectEqual(usage?.windows.count, 1)
+    expectEqual(usage?.windows.first?.kind, .daily)
+}
+
+run("Windsurf.parse: quotaUsage with only daily field produces one window (not two)") {
+    let json = """
+    {"quotaUsage": {"dailyRemainingPercent": 75.0}}
+    """
+    let usage = WindsurfUsageParser.parse(cachedPlanInfoJSON: json)
+    expectEqual(usage?.windows.count, 1)
+    expectEqual(usage?.windows.first?.kind, .daily)
+}
+
+run("Windsurf.parse: fractionUsed clamps [0, 1] when quotaRemaining is > 100 or < 0 (schema drift)") {
+    let json = """
+    {"quotaUsage": {"dailyRemainingPercent": 150.0, "weeklyRemainingPercent": -20.0}}
+    """
+    let usage = WindsurfUsageParser.parse(cachedPlanInfoJSON: json)
+    let daily = usage?.windows.first { $0.kind == .daily }
+    let weekly = usage?.windows.first { $0.kind == .weekly }
+    // dailyRemaining=150 → used = (100-150)/100 = -0.5 → clamped to 0.
+    expectEqual(daily?.fractionUsed, 0.0)
+    // weeklyRemaining=-20 → used = 120/100 = 1.2 → clamped to 1.
+    expectEqual(weekly?.fractionUsed, 1.0)
+}
+
+run("Windsurf.parse: non-object top-level returns nil") {
+    let json = "[]"
+    expect(WindsurfUsageParser.parse(cachedPlanInfoJSON: json) == nil)
+    let junk = "not json"
+    expect(WindsurfUsageParser.parse(cachedPlanInfoJSON: junk) == nil)
+}
+
+run("Windsurf.parse: empty object well-formed but yields zero windows") {
+    let usage = WindsurfUsageParser.parse(cachedPlanInfoJSON: "{}")
+    expect(usage != nil)
+    expectEqual(usage?.windows.count, 0)
+    expectEqual(usage?.planName, nil)
+}
+
+run("Windsurf.parse: usage.flexCredits=0 does NOT produce a window (division-by-zero guard)") {
+    let json = """
+    {"usage": {"usedFlexCredits": 5, "flexCredits": 0}}
+    """
+    let usage = WindsurfUsageParser.parse(cachedPlanInfoJSON: json)
+    // Fell through to usedMessages+remainingMessages — neither present → no window.
+    expectEqual(usage?.windows.count, 0)
+}
+
+// MARK: - WindsurfUsageStore
+
+MainActor.assumeIsolated {
+
+    @MainActor func makeWindsurfStoreForTest(
+        flagEnabled: Bool = true,
+        path: String? = "/tmp/fake-windsurf.vscdb",
+        tccState: TCCState = .granted,
+        readOutcome: Result<WindsurfReadOutcome, Error> = .success(.rowMissing),
+        now: Date = Date()
+    ) -> WindsurfUsageStore {
+        let defaults = UserDefaults(suiteName: "windsurf-test-\(UUID().uuidString)")!
+        defaults.set(flagEnabled, forKey: "features.windsurf.enabled")
+        let pathCopy = path
+        let outcomeCopy = readOutcome
+        let nowCopy = now
+        return WindsurfUsageStore(
+            defaults: defaults,
+            resolvePath: { pathCopy },
+            tccProbe: { _ in tccState },
+            readUsage: { _ in
+                switch outcomeCopy {
+                case .success(let u): return u
+                case .failure(let e): throw e
+                }
+            },
+            clock: { nowCopy }
+        )
+    }
+
+    @MainActor func awaitWindsurfFetch() {
+        let deadline = Date().addingTimeInterval(2.0)
+        while Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
+    }
+
+    run("WindsurfUsageStore: feature-flag off produces no tiles") {
+        let store = makeWindsurfStoreForTest(flagEnabled: false)
+        expectEqual(store.tiles.count, 0)
+        expect(!store.isEnabled)
+    }
+
+    run("WindsurfUsageStore: enabled + granted + no usage yet -> loading tile") {
+        let store = makeWindsurfStoreForTest(flagEnabled: true, tccState: .granted)
+        expectEqual(store.tiles.count, 1)
+        expectEqual(store.tiles.first?.id, "windsurf-loading")
+    }
+
+    run("WindsurfUsageStore: TCC .denied -> needsAccess tile") {
+        let store = makeWindsurfStoreForTest(flagEnabled: true, tccState: .denied)
+        store.fetch()
+        awaitWindsurfFetch()
+        expectEqual(store.tiles.count, 1)
+        expectEqual(store.tiles.first?.id, "windsurf-needs-access")
+    }
+
+    run("WindsurfUsageStore: TCC .pathMissing -> not-installed tile") {
+        let store = makeWindsurfStoreForTest(flagEnabled: true, tccState: .pathMissing)
+        store.fetch()
+        awaitWindsurfFetch()
+        expectEqual(store.tiles.count, 1)
+        expectEqual(store.tiles.first?.id, "windsurf-not-installed")
+    }
+
+    run("WindsurfUsageStore: reader throws SQLiteReaderError.notFound -> tccState becomes .pathMissing") {
+        let store = makeWindsurfStoreForTest(
+            flagEnabled: true, tccState: .granted,
+            readOutcome: .failure(SQLiteReaderError.notFound("/tmp/fake"))
+        )
+        store.fetch()
+        awaitWindsurfFetch()
+        expectEqual(store.tccState, .pathMissing)
+    }
+
+    run("WindsurfUsageStore: reader throws SQLiteReaderError.openFailed -> tccState becomes .denied") {
+        let store = makeWindsurfStoreForTest(
+            flagEnabled: true, tccState: .granted,
+            readOutcome: .failure(SQLiteReaderError.openFailed(rc: 14, message: "unable to open"))
+        )
+        store.fetch()
+        awaitWindsurfFetch()
+        expectEqual(store.tccState, .denied)
+    }
+
+    run("WindsurfUsageStore: reader throws SQLiteReaderError.schemaMismatch -> schemaMismatch tile") {
+        let store = makeWindsurfStoreForTest(
+            flagEnabled: true, tccState: .granted,
+            readOutcome: .failure(SQLiteReaderError.schemaMismatch(observed: "v9", expected: "v1"))
+        )
+        store.fetch()
+        awaitWindsurfFetch()
+        expect(store.schemaMismatch)
+        expectEqual(store.tiles.count, 1)
+        expectEqual(store.tiles.first?.id, "windsurf-schema-mismatch")
+    }
+
+    run("WindsurfUsageStore: reader throws SQLiteReaderError.busy -> lastError set, snapshot preserved") {
+        // Seed a prior good snapshot first.
+        let goodUsage = WindsurfPlanUsage(
+            planName: "Pro",
+            windows: [WindsurfPlanUsageWindow(kind: .daily, fractionUsed: 0.5, resetsAt: nil, displayLabel: "Daily")]
+        )
+        let store = makeWindsurfStoreForTest(
+            flagEnabled: true, tccState: .granted,
+            readOutcome: .success(.success(goodUsage))
+        )
+        store.fetch()
+        awaitWindsurfFetch()
+        expect(store.usage != nil)
+
+        // Second store instance simulating a subsequent fetch with .busy.
+        // The Windsurf store's actual behaviour is: busy sets lastError
+        // and does NOT clear usage. Since we can't rewire an existing
+        // store's dependencies, verify via direct construction.
+        let defaults = UserDefaults(suiteName: "windsurf-busy-\(UUID().uuidString)")!
+        defaults.set(true, forKey: "features.windsurf.enabled")
+        var callCount = 0
+        let store2 = WindsurfUsageStore(
+            defaults: defaults,
+            resolvePath: { "/tmp/fake" },
+            tccProbe: { _ in .granted },
+            readUsage: { _ in
+                callCount += 1
+                if callCount == 1 { return .success(goodUsage) }
+                throw SQLiteReaderError.busy
+            }
+        )
+        // First fetch — success.
+        store2.fetch()
+        awaitWindsurfFetch()
+        expect(store2.usage != nil)
+        // Second fetch — busy. Snapshot must persist.
+        store2.fetch()
+        awaitWindsurfFetch()
+        expect(store2.usage != nil, "snapshot must survive a transient .busy error")
+        expect(store2.lastError != nil)
+    }
+
+    run("WindsurfUsageStore: successful read populates tiles from windows") {
+        let usage = WindsurfPlanUsage(
+            planName: "Pro",
+            windows: [
+                WindsurfPlanUsageWindow(kind: .daily, fractionUsed: 0.35, resetsAt: nil, displayLabel: "Daily"),
+                WindsurfPlanUsageWindow(kind: .weekly, fractionUsed: 0.575, resetsAt: nil, displayLabel: "Weekly"),
+            ]
+        )
+        let store = makeWindsurfStoreForTest(
+            flagEnabled: true, tccState: .granted,
+            readOutcome: .success(.success(usage))
+        )
+        store.fetch()
+        awaitWindsurfFetch()
+        let ids = Set(store.tiles.map { $0.id })
+        expect(ids.contains("windsurf-plan"))
+        expect(ids.contains("windsurf-daily"))
+        expect(ids.contains("windsurf-weekly"))
+    }
+
+    run("WindsurfUsageStore: successful read with empty windows -> 'no quota data found' tile") {
+        let usage = WindsurfPlanUsage(planName: nil, windows: [])
+        let store = makeWindsurfStoreForTest(
+            flagEnabled: true, tccState: .granted,
+            readOutcome: .success(.success(usage))
+        )
+        store.fetch()
+        awaitWindsurfFetch()
+        expectEqual(store.tiles.count, 1)
+        expectEqual(store.tiles.first?.id, "windsurf-no-quota")
+    }
+
+    run("WindsurfUsageStore: clear() drops state + invalidates generation") {
+        let usage = WindsurfPlanUsage(
+            planName: "Pro",
+            windows: [WindsurfPlanUsageWindow(kind: .daily, fractionUsed: 0.5, resetsAt: nil, displayLabel: "Daily")]
+        )
+        let store = makeWindsurfStoreForTest(
+            flagEnabled: true, tccState: .granted,
+            readOutcome: .success(.success(usage))
+        )
+        store.fetch()
+        awaitWindsurfFetch()
+        expect(store.usage != nil)
+        store.clear()
+        expect(store.usage == nil)
+        expect(store.lastUpdatedAt == nil)
+    }
+}
+
+// MARK: - Codex round-1 regression tests for Windsurf
+
+MainActor.assumeIsolated {
+
+    @MainActor func makeWindsurfWithOutcome(
+        _ outcome: Result<WindsurfReadOutcome, Error>
+    ) -> WindsurfUsageStore {
+        let defaults = UserDefaults(suiteName: "windsurf-regr-\(UUID().uuidString)")!
+        defaults.set(true, forKey: "features.windsurf.enabled")
+        return WindsurfUsageStore(
+            defaults: defaults,
+            resolvePath: { "/tmp/fake" },
+            tccProbe: { _ in .granted },
+            readUsage: { _ in
+                switch outcome {
+                case .success(let o): return o
+                case .failure(let e): throw e
+                }
+            }
+        )
+    }
+
+    @MainActor func awaitWindsurfRegression() {
+        let deadline = Date().addingTimeInterval(2.0)
+        while Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+    }
+
+    run("WindsurfUsageStore: fresh install / no row -> actionable 'sign in' tile, not 'Loading…' forever (round-3 #2)") {
+        let store = makeWindsurfWithOutcome(.success(.rowMissing))
+        store.fetch()
+        awaitWindsurfRegression()
+        expect(store.rowMissing)
+        let ids = store.tiles.map { $0.id }
+        expect(ids.contains("windsurf-signin-needed"), "row-missing must produce actionable tile, not loading")
+        expect(!ids.contains("windsurf-loading"))
+    }
+
+    run("WindsurfUsageStore: malformed cachedPlanInfo blob -> schemaMismatch tile, not 'Loading…' forever (round-1 #1)") {
+        // Codex round-1 finding #1: a row that exists but parses as
+        // junk MUST surface schemaMismatch, not stay on loading.
+        let store = makeWindsurfWithOutcome(.success(.malformedPayload))
+        store.fetch()
+        awaitWindsurfRegression()
+        expect(store.schemaMismatch)
+        expectEqual(store.tiles.count, 1)
+        expectEqual(store.tiles.first?.id, "windsurf-schema-mismatch")
+    }
+
+    run("WindsurfUsageStore: missing row (fresh install) still yields loading -> no-quota flow (not schema mismatch)") {
+        let store = makeWindsurfWithOutcome(.success(.rowMissing))
+        store.fetch()
+        awaitWindsurfRegression()
+        expect(!store.schemaMismatch)
+        // usage is nil → "Loading" then eventually no-quota tile.
+        // Actually after fetch completes with .rowMissing → outcome
+        // .success(nil) → the store sets usage=nil which renders as
+        // "windsurf-loading" only if we've never had a usage.
+        // Actually: applyOutcome(.success(nil)) sets self.usage = nil,
+        // which is unchanged; tiles guard on usage == nil rendering
+        // the loading tile. That is CORRECT behaviour — the store
+        // has not seen a usage record and is idle. To surface "no
+        // sessions" we'd need pathMissing/notInstalled state instead.
+        // This test just confirms it does NOT falsely trip schemaMismatch.
+    }
+}
+
+run("Windsurf.parse: JSON boolean in quotaUsage numeric field returns nil (round-1 #2)") {
+    // Codex round-1 finding #2: a boolean must NOT parse as 0/1.
+    let json = """
+    {"quotaUsage": {"dailyRemainingPercent": false, "weeklyRemainingPercent": true}}
+    """
+    let usage = WindsurfUsageParser.parse(cachedPlanInfoJSON: json)
+    // Both fields rejected → no windows.
+    expectEqual(usage?.windows.count, 0)
+}
+
+run("ClaudeCodeUsageStore.formatUSD: hostile huge Double does not trap (3cc round-3 #3)") {
+    // Codex 3cc round-3 finding #3: Int((amount*100).rounded()) on
+    // 1e300 traps because the Double is outside Int range.
+    // Regression: must clamp instead of trapping.
+    // No expectation on the exact string — just that it does not
+    // crash the test runner.
+    _ = ClaudeCodeUsageStore.formatUSD(1e300)
+    _ = ClaudeCodeUsageStore.formatUSD(-1e300)
+    _ = ClaudeCodeUsageStore.formatUSD(Double(Int.max))
+    // A representative sane value still formats correctly.
+    expectEqual(ClaudeCodeUsageStore.formatUSD(1207.0), "$1,207.00")
+}
+
+run("Cursor.safeInt64: oversized stringified numeric clamps to Int64.max (3cc round-3 #4)") {
+    // Codex 3cc round-3 finding #4: Int64("9223372036854775808") is
+    // nil (Int64.max+1). Regression: clamp positive-overflow strings
+    // instead of returning 0.
+    expectEqual(CursorResponseParser.safeInt64("9223372036854775808"), Int64.max)
+    expectEqual(CursorResponseParser.safeInt64("99999999999999999999"), Int64.max)
+    // Negative strings still return 0.
+    expectEqual(CursorResponseParser.safeInt64("-100"), 0)
+    // Non-numeric still returns 0.
+    expectEqual(CursorResponseParser.safeInt64("garbage"), 0)
+    // Sane values pass through.
+    expectEqual(CursorResponseParser.safeInt64("42"), 42)
+}
+
+MainActor.assumeIsolated {
+    run("WindsurfUsageStore: state.vscdb row present with non-text value -> schema-mismatch (3cc round-3 #1)") {
+        // 3cc round-3 finding #1: a row that exists with a NULL / blob
+        // / integer value in `value` used to collapse to rowMissing; now
+        // surfaces schemaMismatch.
+        let defaults = UserDefaults(suiteName: "windsurf-nontext-\(UUID().uuidString)")!
+        defaults.set(true, forKey: "features.windsurf.enabled")
+        let store = WindsurfUsageStore(
+            defaults: defaults,
+            resolvePath: { "/tmp/fake" },
+            tccProbe: { _ in .granted },
+            readUsage: { _ in .malformedPayload }
+        )
+        store.fetch()
+        let deadline = Date().addingTimeInterval(1.0)
+        while Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+        expect(store.schemaMismatch)
+    }
+}
+
+run("WindsurfUsageParser.numeric: JSON booleans return nil (round-1 #2)") {
+    expect(WindsurfUsageParser.numeric(true) == nil)
+    expect(WindsurfUsageParser.numeric(false) == nil)
+    // Real numbers still work.
+    expectEqual(WindsurfUsageParser.numeric(42), 42.0)
+    expectEqual(WindsurfUsageParser.numeric(3.14), 3.14)
+}
+
+// MARK: - CursorPathResolver
+
+run("CursorPathResolver: builds ~/Library/Application Support/Cursor path") {
+    let env = CursorPathResolver.Environment(
+        homeDirectoryPath: "/Users/tester",
+        applicationSupportPath: "/Users/tester/Library/Application Support"
+    )
+    let path = CursorPathResolver.stateDbPath(env)
+    expectEqual(path, "/Users/tester/Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+}
+
+run("CursorPathResolver: returns nil when applicationSupportPath is empty") {
+    let env = CursorPathResolver.Environment(
+        homeDirectoryPath: "/Users/tester",
+        applicationSupportPath: ""
+    )
+    expect(CursorPathResolver.stateDbPath(env) == nil)
+}
+
+// MARK: - CursorResponseParser safe integer helpers
+
+run("CursorResponseParser.safeInt64: stringified numerics + hostile inputs") {
+    expectEqual(CursorResponseParser.safeInt64("12345"), 12345)
+    expectEqual(CursorResponseParser.safeInt64(42), 42)
+    expectEqual(CursorResponseParser.safeInt64("-1"), 0)   // clamped
+    expectEqual(CursorResponseParser.safeInt64(nil), 0)
+    expectEqual(CursorResponseParser.safeInt64(Double.nan), 0)
+    expectEqual(CursorResponseParser.safeInt64(1e300), Int64.max)
+}
+
+run("CursorResponseParser.safeInt: bare JSON numbers only, clamped non-negative") {
+    expectEqual(CursorResponseParser.safeInt(1207), 1207)
+    expectEqual(CursorResponseParser.safeInt(-10), 0)
+    expectEqual(CursorResponseParser.safeInt(nil), 0)
+}
+
+run("CursorResponseParser.safeIntOptional: returns nil for null / missing / unparseable") {
+    expectEqual(CursorResponseParser.safeIntOptional(1207), 1207)
+    expect(CursorResponseParser.safeIntOptional(nil) == nil)
+    expect(CursorResponseParser.safeIntOptional(NSNull()) == nil)
+    expect(CursorResponseParser.safeIntOptional("garbage") == nil)
+}
+
+run("CursorResponseParser.parseISO8601: date-time with and without fractional seconds") {
+    expect(CursorResponseParser.parseISO8601("2026-07-13T04:00:00Z") != nil)
+    expect(CursorResponseParser.parseISO8601("2026-07-13T04:00:00.123Z") != nil)
+    expect(CursorResponseParser.parseISO8601("garbage") == nil)
+    expect(CursorResponseParser.parseISO8601(nil) == nil)
+}
+
+// MARK: - CursorResponseParser.parseUsageSummary
+
+run("Cursor.parseUsageSummary: verified shape (against Raycast extension types)") {
+    let json = """
+    {
+      "billingCycleStart": "2026-07-01T00:00:00Z",
+      "billingCycleEnd": "2026-08-01T00:00:00Z",
+      "membershipType": "pro",
+      "limitType": "monthly",
+      "isUnlimited": false,
+      "individualUsage": {
+        "plan": {
+          "enabled": true,
+          "used": 1207,
+          "limit": 2000,
+          "remaining": 793,
+          "breakdown": {"included": 1200, "bonus": 800, "total": 2000},
+          "totalPercentUsed": 60.35
+        },
+        "onDemand": {
+          "enabled": true,
+          "used": 42,
+          "limit": null,
+          "remaining": null
+        }
+      },
+      "teamUsage": {}
+    }
+    """
+    let data = json.data(using: .utf8)!
+    let snap = CursorResponseParser.parseUsageSummary(data)
+    expect(snap != nil)
+    expectEqual(snap?.membershipType, "pro")
+    expectEqual(snap?.limitType, "monthly")
+    expectEqual(snap?.isUnlimited, false)
+    expectEqual(snap?.planUsedCents, 1207)
+    expectEqual(snap?.planLimitCents, 2000)
+    expectEqual(snap?.planRemainingCents, 793)
+    expectEqual(snap?.planIncludedCents, 1200)
+    expectEqual(snap?.planBonusCents, 800)
+    expectEqual(snap?.onDemandEnabled, true)
+    expectEqual(snap?.onDemandUsedCents, 42)
+    expect(snap?.onDemandLimitCents == nil, "null limit maps to nil")
+    expect(snap?.onDemandRemainingCents == nil)
+    expect(snap?.billingCycleStart != nil)
+    expect(snap?.billingCycleEnd != nil)
+}
+
+run("Cursor.parseUsageSummary: missing required fields returns nil") {
+    // No membershipType.
+    let json1 = """
+    {"individualUsage": {}}
+    """
+    expect(CursorResponseParser.parseUsageSummary(json1.data(using: .utf8)!) == nil)
+    // No individualUsage.
+    let json2 = """
+    {"membershipType": "pro"}
+    """
+    expect(CursorResponseParser.parseUsageSummary(json2.data(using: .utf8)!) == nil)
+    // Non-object top-level.
+    let json3 = "[1, 2, 3]"
+    expect(CursorResponseParser.parseUsageSummary(json3.data(using: .utf8)!) == nil)
+}
+
+run("Cursor.parseUsageSummary: individualUsage.plan not an object -> nil (round-1 #3)") {
+    // Codex round-1 finding #3: `plan: null` / `plan: []` / `plan: 42`
+    // all silently produced a zero-cent snapshot rendered as success.
+    // Must now reject the whole response.
+    let jsonNull = """
+    {"membershipType": "pro", "individualUsage": {"plan": null, "onDemand": {}}}
+    """
+    expect(CursorResponseParser.parseUsageSummary(jsonNull.data(using: .utf8)!) == nil)
+    let jsonArray = """
+    {"membershipType": "pro", "individualUsage": {"plan": [], "onDemand": {}}}
+    """
+    expect(CursorResponseParser.parseUsageSummary(jsonArray.data(using: .utf8)!) == nil)
+    let jsonNumber = """
+    {"membershipType": "pro", "individualUsage": {"plan": 42, "onDemand": {}}}
+    """
+    expect(CursorResponseParser.parseUsageSummary(jsonNumber.data(using: .utf8)!) == nil)
+}
+
+run("CursorTokenSafety.isValidCookieValue: RFC 6265 cookie-octet validation (round-1 #4)") {
+    // Codex round-1 finding #4: a splice-attack token would inject a
+    // second cookie into the Cookie header.
+    // Valid: base64url characters (letters, digits, -, _, .).
+    expect(CursorTokenSafety.isValidCookieValue("eyJhbGciOiJIUzI1NiIs.abc-def_ghi"))
+    // Empty fails.
+    expect(!CursorTokenSafety.isValidCookieValue(""))
+    // The critical splice attack: semicolon.
+    expect(!CursorTokenSafety.isValidCookieValue("abc; WorkosCursorSessionToken=other"))
+    // Other RFC 6265 exclusions.
+    expect(!CursorTokenSafety.isValidCookieValue("abc,def"))       // comma
+    expect(!CursorTokenSafety.isValidCookieValue("abc def"))       // space
+    expect(!CursorTokenSafety.isValidCookieValue("abc\"def"))      // dquote
+    expect(!CursorTokenSafety.isValidCookieValue("abc\\def"))      // backslash
+    expect(!CursorTokenSafety.isValidCookieValue("abc\n"))         // control char
+    expect(!CursorTokenSafety.isValidCookieValue("abc\u{7F}"))     // DEL
+    // Non-ASCII rejected too (JWTs are ASCII).
+    expect(!CursorTokenSafety.isValidCookieValue("abc\u{00E9}"))   // é
+}
+
+run("Cursor.parseUsageSummary: on-demand with concrete limit and remaining") {
+    let json = """
+    {
+      "membershipType": "pro",
+      "individualUsage": {
+        "plan": {"used": 500, "limit": 2000, "remaining": 1500, "breakdown": {"included": 2000, "bonus": 0, "total": 2000}},
+        "onDemand": {"enabled": true, "used": 100, "limit": 500, "remaining": 400}
+      }
+    }
+    """
+    let snap = CursorResponseParser.parseUsageSummary(json.data(using: .utf8)!)
+    expectEqual(snap?.onDemandLimitCents, 500)
+    expectEqual(snap?.onDemandRemainingCents, 400)
+}
+
+// MARK: - CursorResponseParser.parseAggregations
+
+run("Cursor.parseAggregations: multiple models with stringified token counts") {
+    // Cursor sends token counts as strings — verify Int64 parsing.
+    let json = """
+    {
+      "aggregations": [
+        {
+          "modelIntent": "claude-opus-4-7",
+          "inputTokens": "1000",
+          "outputTokens": "500",
+          "cacheWriteTokens": "10000000000",
+          "cacheReadTokens": "20000",
+          "totalCents": 500
+        },
+        {
+          "modelIntent": "gpt-5",
+          "inputTokens": "100",
+          "outputTokens": "50",
+          "totalCents": 100
+        }
+      ],
+      "totalCostCents": 600
+    }
+    """
+    let rows = CursorResponseParser.parseAggregations(json.data(using: .utf8)!)
+    expectEqual(rows.count, 2)
+    let opus = rows.first { $0.modelIntent == "claude-opus-4-7" }
+    expectEqual(opus?.inputTokens, 1000)
+    expectEqual(opus?.outputTokens, 500)
+    expectEqual(opus?.cacheWriteTokens, 10_000_000_000)   // > 2^32 — the reason Cursor stringifies
+    expectEqual(opus?.totalCents, 500)
+    let gpt = rows.first { $0.modelIntent == "gpt-5" }
+    expectEqual(gpt?.cacheWriteTokens, 0)   // missing field → 0
+}
+
+run("Cursor.parseAggregations: missing aggregations key returns []") {
+    let json = "{}"
+    expectEqual(CursorResponseParser.parseAggregations(json.data(using: .utf8)!).count, 0)
+    // Non-object top-level.
+    let json2 = "[]"
+    expectEqual(CursorResponseParser.parseAggregations(json2.data(using: .utf8)!).count, 0)
+}
+
+run("Cursor.parseAggregations: totalCents=null maps to nil (not zero)") {
+    let json = """
+    {"aggregations": [{"modelIntent": "gpt-5", "totalCents": null}]}
+    """
+    let rows = CursorResponseParser.parseAggregations(json.data(using: .utf8)!)
+    expectEqual(rows.count, 1)
+    expect(rows[0].totalCents == nil, "null totalCents should map to nil, not 0")
+}
+
+// MARK: - CursorResponseParser.parseRefresh
+
+run("Cursor.parseRefresh: normal refresh success") {
+    let json = """
+    {"access_token": "new-token-value", "id_token": "id-token", "shouldLogout": false}
+    """
+    let outcome = CursorResponseParser.parseRefresh(json.data(using: .utf8)!)
+    switch outcome {
+    case .success(let a, let i):
+        expectEqual(a, "new-token-value")
+        expectEqual(i, "id-token")
+    default: expect(false, "expected .success")
+    }
+}
+
+run("Cursor.parseRefresh: shouldLogout=true with empty tokens -> .sessionExpired (real Cursor response)") {
+    // This is the exact shape Cursor returns when the refresh token is
+    // also expired — the response is HTTP 200 with empty tokens and a
+    // shouldLogout flag. We must NOT treat this as success.
+    let json = """
+    {"access_token": "", "id_token": "", "shouldLogout": true}
+    """
+    let outcome = CursorResponseParser.parseRefresh(json.data(using: .utf8)!)
+    expectEqual(outcome, .sessionExpired)
+}
+
+run("Cursor.parseRefresh: malformed / missing fields") {
+    expectEqual(CursorResponseParser.parseRefresh("not json".data(using: .utf8)!), .malformed)
+    // Empty access_token WITHOUT shouldLogout flag — treat as malformed
+    // rather than session-expired (the flag is the discriminator).
+    let json = """
+    {"access_token": "", "shouldLogout": false}
+    """
+    expectEqual(CursorResponseParser.parseRefresh(json.data(using: .utf8)!), .malformed)
+}
+
+// MARK: - CursorUsageStore
+
+MainActor.assumeIsolated {
+
+    // Simple stub transport that lets a test pre-programme each response.
+    final class StubCursorTransport: CursorTransport, @unchecked Sendable {
+        var summaryResult: CursorTransportResult = .networkError
+        var aggregationResult: CursorTransportResult = .networkError
+        var refreshResult: CursorTransportResult = .networkError
+        var summaryCallCount = 0
+        var aggregationCallCount = 0
+        var refreshCallCount = 0
+        func fetchUsageSummary(cookieToken: String, completion: @escaping @Sendable (CursorTransportResult) -> Void) {
+            summaryCallCount += 1
+            let r = summaryResult
+            DispatchQueue.main.async { completion(r) }
+        }
+        func fetchAggregations(cookieToken: String, startDateMs: Int64, endDateMs: Int64, completion: @escaping @Sendable (CursorTransportResult) -> Void) {
+            aggregationCallCount += 1
+            let r = aggregationResult
+            DispatchQueue.main.async { completion(r) }
+        }
+        func refreshAccessToken(refreshToken: String, completion: @escaping @Sendable (CursorTransportResult) -> Void) {
+            refreshCallCount += 1
+            let r = refreshResult
+            DispatchQueue.main.async { completion(r) }
+        }
+    }
+
+    @MainActor func makeCursorStoreForTest(
+        flagEnabled: Bool = true,
+        path: String? = "/tmp/fake-cursor.vscdb",
+        tccState: TCCState = .granted,
+        credentials: Result<CursorCredentials?, Error> = .success(
+            CursorCredentials(accessToken: "at", refreshToken: "rt", stripeMembershipType: "pro")
+        ),
+        transport: CursorTransport,
+        now: Date = Date()
+    ) -> CursorUsageStore {
+        let defaults = UserDefaults(suiteName: "cursor-test-\(UUID().uuidString)")!
+        defaults.set(flagEnabled, forKey: "features.cursor.enabled")
+        let pathCopy = path
+        let credsCopy = credentials
+        let nowCopy = now
+        return CursorUsageStore(
+            defaults: defaults,
+            resolvePath: { pathCopy },
+            tccProbe: { _ in tccState },
+            readCredentials: { _ in
+                switch credsCopy {
+                case .success(let c): return c
+                case .failure(let e): throw e
+                }
+            },
+            transport: transport,
+            clock: { nowCopy }
+        )
+    }
+
+    @MainActor func awaitCursorFetch() {
+        let deadline = Date().addingTimeInterval(2.0)
+        while Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
+    }
+
+    func summaryJSON(membership: String = "pro", planUsed: Int = 1207, planLimit: Int = 2000) -> Data {
+        let json = """
+        {
+          "billingCycleStart": "2026-07-01T00:00:00Z",
+          "billingCycleEnd": "2026-08-01T00:00:00Z",
+          "membershipType": "\(membership)",
+          "limitType": "monthly",
+          "isUnlimited": false,
+          "individualUsage": {
+            "plan": {"used": \(planUsed), "limit": \(planLimit), "remaining": \(planLimit - planUsed),
+                      "breakdown": {"included": \(planLimit), "bonus": 0, "total": \(planLimit)}},
+            "onDemand": {"enabled": false, "used": 0, "limit": null, "remaining": null}
+          },
+          "teamUsage": {}
+        }
+        """
+        return json.data(using: .utf8)!
+    }
+
+    run("CursorUsageStore: feature-flag off -> no tiles") {
+        let stub = StubCursorTransport()
+        let store = makeCursorStoreForTest(flagEnabled: false, transport: stub)
+        expectEqual(store.tiles.count, 0)
+    }
+
+    run("CursorUsageStore: TCC .denied -> needsAccess tile") {
+        let stub = StubCursorTransport()
+        let store = makeCursorStoreForTest(tccState: .denied, transport: stub)
+        store.fetch()
+        awaitCursorFetch()
+        expectEqual(store.tiles.count, 1)
+        expectEqual(store.tiles.first?.id, "cursor-needs-access")
+    }
+
+    run("CursorUsageStore: credentials missing (fresh Cursor install, no sign-in) -> lastError set") {
+        let stub = StubCursorTransport()
+        let store = makeCursorStoreForTest(
+            credentials: .success(nil),
+            transport: stub
+        )
+        store.fetch()
+        awaitCursorFetch()
+        expect(store.lastError?.contains("sign in to Cursor") == true)
+        // No HTTP call when credentials are absent.
+        expectEqual(stub.summaryCallCount, 0)
+    }
+
+    run("CursorUsageStore: happy path — summary + aggregations merge into snapshot") {
+        let stub = StubCursorTransport()
+        stub.summaryResult = .success(summaryJSON())
+        let aggJSON = """
+        {"aggregations": [{"modelIntent": "claude-opus-4-7", "inputTokens": "1000", "outputTokens": "500", "totalCents": 500}]}
+        """.data(using: .utf8)!
+        stub.aggregationResult = .success(aggJSON)
+        let store = makeCursorStoreForTest(transport: stub)
+        store.fetch()
+        awaitCursorFetch()
+
+        expect(store.snapshot != nil)
+        expectEqual(store.snapshot?.membershipType, "pro")
+        expectEqual(store.snapshot?.planUsedCents, 1207)
+        expectEqual(store.snapshot?.perModel.count, 1)
+        expectEqual(stub.summaryCallCount, 1)
+        expectEqual(stub.aggregationCallCount, 1)
+        // No refresh needed when summary returned 2xx.
+        expectEqual(stub.refreshCallCount, 0)
+    }
+
+    run("CursorUsageStore: 401 triggers refresh, then retry — success reflects refreshed token") {
+        let stub = StubCursorTransport()
+        // First summary call → 401. After refresh, second summary call → 2xx.
+        var summaryStep = 0
+        final class StepBox: @unchecked Sendable {
+            var step: Int = 0
+        }
+        // Rewire stub via a subclass-style helper: use a fresh stub that
+        // returns 401 on first call, 200 on second.
+        final class TwoStepTransport: CursorTransport, @unchecked Sendable {
+            let onSummary: @Sendable (Int) -> CursorTransportResult
+            let refreshData: Data
+            var summaryCallCount = 0
+            var aggregationCallCount = 0
+            var refreshCallCount = 0
+            init(onSummary: @escaping @Sendable (Int) -> CursorTransportResult, refreshData: Data) {
+                self.onSummary = onSummary
+                self.refreshData = refreshData
+            }
+            func fetchUsageSummary(cookieToken: String, completion: @escaping @Sendable (CursorTransportResult) -> Void) {
+                summaryCallCount += 1
+                let r = onSummary(summaryCallCount)
+                DispatchQueue.main.async { completion(r) }
+            }
+            func fetchAggregations(cookieToken: String, startDateMs: Int64, endDateMs: Int64, completion: @escaping @Sendable (CursorTransportResult) -> Void) {
+                aggregationCallCount += 1
+                let empty = "{\"aggregations\":[]}".data(using: .utf8)!
+                DispatchQueue.main.async { completion(.success(empty)) }
+            }
+            func refreshAccessToken(refreshToken: String, completion: @escaping @Sendable (CursorTransportResult) -> Void) {
+                refreshCallCount += 1
+                let d = refreshData
+                DispatchQueue.main.async { completion(.success(d)) }
+            }
+        }
+        let summaryData = summaryJSON()
+        let refreshData = """
+        {"access_token": "refreshed-token", "id_token": "new-id", "shouldLogout": false}
+        """.data(using: .utf8)!
+        let transport = TwoStepTransport(
+            onSummary: { call in call == 1 ? .unauthorized : .success(summaryData) },
+            refreshData: refreshData
+        )
+        let store = makeCursorStoreForTest(transport: transport)
+        store.fetch()
+        awaitCursorFetch()
+
+        // Summary was retried after the refresh.
+        expectEqual(transport.summaryCallCount, 2)
+        expectEqual(transport.refreshCallCount, 1)
+        expect(store.snapshot != nil, "snapshot populated after refresh")
+        expect(!store.sessionExpired)
+    }
+
+    run("CursorUsageStore: refresh returns shouldLogout=true -> sessionExpired tile") {
+        // Refresh response is 200 but with empty tokens + shouldLogout=true.
+        let stub = StubCursorTransport()
+        stub.summaryResult = .unauthorized
+        let refreshData = """
+        {"access_token": "", "id_token": "", "shouldLogout": true}
+        """.data(using: .utf8)!
+        stub.refreshResult = .success(refreshData)
+        let store = makeCursorStoreForTest(transport: stub)
+        store.fetch()
+        awaitCursorFetch()
+
+        expect(store.sessionExpired)
+        expect(store.snapshot == nil)
+        expectEqual(store.tiles.count, 1)
+        expectEqual(store.tiles.first?.id, "cursor-session-expired")
+    }
+
+    run("CursorUsageStore: refresh returns unauthorized -> sessionExpired (Cursor OAuth server rejected refresh token)") {
+        let stub = StubCursorTransport()
+        stub.summaryResult = .unauthorized
+        stub.refreshResult = .unauthorized
+        let store = makeCursorStoreForTest(transport: stub)
+        store.fetch()
+        awaitCursorFetch()
+        expect(store.sessionExpired)
+    }
+
+    run("CursorUsageStore: 429 rate-limited on summary preserves prior snapshot") {
+        // Seed a good snapshot first.
+        let stub = StubCursorTransport()
+        stub.summaryResult = .success(summaryJSON())
+        stub.aggregationResult = .success("{\"aggregations\":[]}".data(using: .utf8)!)
+        let store = makeCursorStoreForTest(transport: stub)
+        store.fetch()
+        awaitCursorFetch()
+        expect(store.snapshot != nil)
+
+        // Next fetch → 429. Snapshot must persist.
+        stub.summaryResult = .rateLimited(retryAfterSec: 30)
+        store.fetch()
+        awaitCursorFetch()
+        expect(store.snapshot != nil, "rate-limit preserves prior snapshot")
+        expect(store.lastError?.contains("rate-limited") == true)
+    }
+
+    run("CursorUsageStore: clear() drops snapshot + resets sessionExpired + refreshed token") {
+        let stub = StubCursorTransport()
+        stub.summaryResult = .success(summaryJSON())
+        stub.aggregationResult = .success("{\"aggregations\":[]}".data(using: .utf8)!)
+        let store = makeCursorStoreForTest(transport: stub)
+        store.fetch()
+        awaitCursorFetch()
+        expect(store.snapshot != nil)
+        store.clear()
+        expect(store.snapshot == nil)
+        expect(!store.sessionExpired)
+        expectEqual(store.lastUpdatedAt, nil)
+    }
+
+    run("CursorUsageStore.friendlyPlanLabel: capitalises + spaces hyphens") {
+        expectEqual(CursorUsageStore.friendlyPlanLabel("pro"), "Pro")
+        expectEqual(CursorUsageStore.friendlyPlanLabel("pro-plus"), "Pro Plus")
+        expectEqual(CursorUsageStore.friendlyPlanLabel("free"), "Free")
+        expectEqual(CursorUsageStore.friendlyPlanLabel(""), "")
+    }
+
+    run("CursorUsageStore.formatDollarsFromCents: standard formatting") {
+        expectEqual(CursorUsageStore.formatDollarsFromCents(1207), "$12.07")
+        expectEqual(CursorUsageStore.formatDollarsFromCents(0), "$0.00")
+        expectEqual(CursorUsageStore.formatDollarsFromCents(100000), "$1,000.00")
+    }
+
+    run("CursorUsageStore: saturating token totals do not wrap (round-2 #1)") {
+        // Codex round-2 finding #1: aggregation with Int64.max in
+        // one field and 1 in another wrapped `&+` to Int64.min and
+        // then tripped abs(Int.min) in formatTokens. saturatingAddInt64
+        // clamps to Int64.max.
+        expectEqual(CursorUsageStore.saturatingAddInt64(Int64.max, 1), Int64.max)
+        expectEqual(CursorUsageStore.saturatingAddInt64(Int64.max, Int64.max), Int64.max)
+        expectEqual(CursorUsageStore.saturatingAddInt64(-100, 200), 200)   // negatives coerced
+        expectEqual(CursorUsageStore.saturatingAddInt64(100, 50), 150)
+    }
+
+    run("CursorUsageStore: sticky sessionExpired short-circuits transport (no repeated refresh) (round-2 #2)") {
+        // Codex round-2 finding #2: after sessionExpired is set,
+        // subsequent fetches with the SAME DB accessToken must not
+        // send additional summary/refresh calls (which would post
+        // the known-expired refresh token to Cursor on every timer
+        // tick).
+        let stub = StubCursorTransport()
+        stub.summaryResult = .unauthorized
+        stub.refreshResult = .success("""
+            {"access_token": "", "id_token": "", "shouldLogout": true}
+        """.data(using: .utf8)!)
+        let store = makeCursorStoreForTest(transport: stub)
+        // Fetch 1 → session expires.
+        store.fetch()
+        awaitCursorFetch()
+        expect(store.sessionExpired)
+        let summaryAfterFirst = stub.summaryCallCount
+        let refreshAfterFirst = stub.refreshCallCount
+        expect(summaryAfterFirst == 1)
+        expect(refreshAfterFirst == 1)
+        // Fetch 2 with the SAME DB token — must NOT re-issue transport calls.
+        store.fetch()
+        awaitCursorFetch()
+        expectEqual(stub.summaryCallCount, summaryAfterFirst)
+        expectEqual(stub.refreshCallCount, refreshAfterFirst)
+    }
+
+    run("Cursor.safeInt/safeInt64/safeIntOptional reject JSON booleans (round-2 #3)") {
+        expectEqual(CursorResponseParser.safeInt(true), 0)
+        expectEqual(CursorResponseParser.safeInt(false), 0)
+        expectEqual(CursorResponseParser.safeInt64(true), 0)
+        expectEqual(CursorResponseParser.safeInt64(false), 0)
+        expect(CursorResponseParser.safeIntOptional(true) == nil)
+        expect(CursorResponseParser.safeIntOptional(false) == nil)
+    }
+
+    run("Cursor.parseUsageSummary: plan.used = true (JSON bool drift) yields zero used cents") {
+        // With the boolean rejection above, plan.used=true is treated
+        // as missing — safeInt returns 0. The snapshot still parses
+        // (plan is still an object) but usage numerics are all zero.
+        // This is intentional: the response was structurally sane,
+        // just semantically wrong. A future tightening could also
+        // reject the whole response.
+        let json = """
+        {"membershipType": "pro", "individualUsage": {"plan": {"used": true, "limit": 100}, "onDemand": {}}}
+        """
+        let snap = CursorResponseParser.parseUsageSummary(json.data(using: .utf8)!)
+        expect(snap != nil)
+        expectEqual(snap?.planUsedCents, 0)
+    }
+
+    run("CursorUsageStore: sessionExpired clears when DB accessToken changes (user re-signs-in) (round-1 #6)") {
+        // Codex round-1 finding #6: after sessionExpired=true, a fresh
+        // DB token (Cursor writes a new session after re-login) must
+        // clear the sticky flag on the next fetch.
+        let stub = StubCursorTransport()
+        stub.summaryResult = .unauthorized
+        stub.refreshResult = .success("""
+            {"access_token": "", "id_token": "", "shouldLogout": true}
+        """.data(using: .utf8)!)
+
+        // Rewireable credential reader — starts with old-token, then
+        // returns new-token on the second fetch.
+        final class CredBox: @unchecked Sendable {
+            var current = CursorCredentials(accessToken: "old-token", refreshToken: "rt", stripeMembershipType: nil)
+        }
+        let box = CredBox()
+        let defaults = UserDefaults(suiteName: "cursor-sticky-\(UUID().uuidString)")!
+        defaults.set(true, forKey: "features.cursor.enabled")
+        let store = CursorUsageStore(
+            defaults: defaults,
+            resolvePath: { "/tmp/fake" },
+            tccProbe: { _ in .granted },
+            readCredentials: { _ in box.current },
+            transport: stub
+        )
+
+        // Fetch 1 — session expires.
+        store.fetch()
+        awaitCursorFetch()
+        expect(store.sessionExpired, "first fetch's refresh returned shouldLogout")
+        // User re-signs-in: Cursor writes a new session token to
+        // state.vscdb.
+        box.current = CursorCredentials(accessToken: "new-token", refreshToken: "new-rt", stripeMembershipType: nil)
+        // Second fetch's summary call now succeeds.
+        stub.summaryResult = .success(summaryJSON())
+        stub.aggregationResult = .success("{\"aggregations\":[]}".data(using: .utf8)!)
+
+        store.fetch()
+        awaitCursorFetch()
+        expect(!store.sessionExpired, "sticky sessionExpired must clear when DB token changes")
+        expect(store.snapshot != nil)
+    }
+
+    run("CursorUsageStore: refreshed token is dropped when DB accessToken changes (round-1 #5)") {
+        // Codex round-1 finding #5: after a refresh, if the DB
+        // accessToken later differs from the one we refreshed FROM,
+        // the in-memory refreshed token must be discarded so the DB
+        // value takes precedence.
+        // Rewireable credential reader — starts with token-A, then B.
+        final class CredBox: @unchecked Sendable {
+            var current = CursorCredentials(accessToken: "token-A", refreshToken: "rt-A", stripeMembershipType: nil)
+        }
+        let box = CredBox()
+        let defaults = UserDefaults(suiteName: "cursor-refresh-invalidation-\(UUID().uuidString)")!
+        defaults.set(true, forKey: "features.cursor.enabled")
+
+        // Transport that records which cookie was used on each summary call.
+        final class RecordingTransport: CursorTransport, @unchecked Sendable {
+            var summaryCookies: [String] = []
+            var summaryCallCount = 0
+            var refreshCallCount = 0
+            let refreshResp: Data
+            let aggData: Data
+            let summaryData: Data
+            init(refreshResp: Data, aggData: Data, summaryData: Data) {
+                self.refreshResp = refreshResp
+                self.aggData = aggData
+                self.summaryData = summaryData
+            }
+            func fetchUsageSummary(cookieToken: String, completion: @escaping @Sendable (CursorTransportResult) -> Void) {
+                summaryCallCount += 1
+                summaryCookies.append(cookieToken)
+                let count = summaryCallCount
+                let refreshed = self.refreshResp
+                let summary = self.summaryData
+                DispatchQueue.main.async {
+                    // First call → 401 (triggers refresh). Second and
+                    // third calls succeed.
+                    if count == 1 {
+                        completion(.unauthorized)
+                    } else {
+                        _ = refreshed
+                        completion(.success(summary))
+                    }
+                }
+            }
+            func fetchAggregations(cookieToken: String, startDateMs: Int64, endDateMs: Int64, completion: @escaping @Sendable (CursorTransportResult) -> Void) {
+                let d = aggData
+                DispatchQueue.main.async { completion(.success(d)) }
+            }
+            func refreshAccessToken(refreshToken: String, completion: @escaping @Sendable (CursorTransportResult) -> Void) {
+                refreshCallCount += 1
+                let r = refreshResp
+                DispatchQueue.main.async { completion(.success(r)) }
+            }
+        }
+        let refreshResp = """
+            {"access_token": "refreshed-of-A", "id_token": "id", "shouldLogout": false}
+        """.data(using: .utf8)!
+        let summaryData = summaryJSON()
+        let transport = RecordingTransport(
+            refreshResp: refreshResp,
+            aggData: "{\"aggregations\":[]}".data(using: .utf8)!,
+            summaryData: summaryData
+        )
+        let store = CursorUsageStore(
+            defaults: defaults,
+            resolvePath: { "/tmp/fake" },
+            tccProbe: { _ in .granted },
+            readCredentials: { _ in box.current },
+            transport: transport
+        )
+        // Fetch 1 — 401 triggers refresh → in-memory refreshed-of-A.
+        store.fetch()
+        awaitCursorFetch()
+        expect(store.snapshot != nil)
+        expect(transport.summaryCallCount == 2)
+        // Confirm the retry used the refreshed token.
+        expect(transport.summaryCookies.last == "refreshed-of-A")
+
+        // Now the DB writes a fresh token-B (a re-login or account swap).
+        box.current = CursorCredentials(accessToken: "token-B", refreshToken: "rt-B", stripeMembershipType: nil)
+        // Fetch 2 — should use token-B (DB), NOT refreshed-of-A.
+        store.fetch()
+        awaitCursorFetch()
+        expect(transport.summaryCookies.last == "token-B", "in-memory refreshed token must yield to a fresh DB accessToken")
+    }
+}
+
 // MARK: - Summary
 
 print("")

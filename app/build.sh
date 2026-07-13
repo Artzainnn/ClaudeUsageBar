@@ -67,6 +67,10 @@ swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_arm64" \
     ClaudeCodeUsageStore.swift \
     ClineUsageFetcher.swift \
     ClineUsageStore.swift \
+    WindsurfUsageFetcher.swift \
+    WindsurfUsageStore.swift \
+    CursorUsageFetcher.swift \
+    CursorUsageStore.swift \
     -framework SwiftUI \
     -framework AppKit \
     -framework WebKit \
@@ -101,6 +105,10 @@ swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_x86_64" \
     ClaudeCodeUsageStore.swift \
     ClineUsageFetcher.swift \
     ClineUsageStore.swift \
+    WindsurfUsageFetcher.swift \
+    WindsurfUsageStore.swift \
+    CursorUsageFetcher.swift \
+    CursorUsageStore.swift \
     -framework SwiftUI \
     -framework AppKit \
     -framework WebKit \
