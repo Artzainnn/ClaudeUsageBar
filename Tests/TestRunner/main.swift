@@ -5346,6 +5346,834 @@ run("ClaudeCodeUsageStore.monthToDateRange: covers start-of-month through now") 
     expect(!range.contains(june30))
 }
 
+// MARK: - ClinePathResolver (PR 10c-BE)
+
+run("ClinePathResolver.resolveScanRoots: enumerates VS Code + Insiders + VSCodium + Cursor + Windsurf + CLI defaults") {
+    let env = ClinePathResolver.Environment(
+        clineDataDir: nil,
+        clineDir: nil,
+        homeDirectoryPath: "/Users/tester",
+        applicationSupportPath: "/Users/tester/Library/Application Support"
+    )
+    let roots = ClinePathResolver.resolveScanRoots(env)
+    let ids = roots.map(\.id)
+    // Five VS Code family hosts + CLI (~/.cline).
+    expect(ids.contains("Cline CLI (~/.cline)"))
+    expect(ids.contains("VS Code"))
+    expect(ids.contains("VS Code Insiders"))
+    expect(ids.contains("VSCodium"))
+    expect(ids.contains("Cursor"))
+    expect(ids.contains("Windsurf"))
+    // Every root points to a `tasks` directory under saoudrizwan.claude-dev
+    // for the VS Code family.
+    for root in roots where root.id.hasPrefix("VS Code") || root.id == "Cursor" || root.id == "Windsurf" || root.id == "VSCodium" {
+        expect(root.tasksDirectoryPath.hasSuffix("/saoudrizwan.claude-dev/tasks"), "\(root.id) tasks path = \(root.tasksDirectoryPath)")
+    }
+    // CLI variants end at `/tasks` under `data`.
+    let cli = roots.first(where: { $0.id == "Cline CLI (~/.cline)" })!
+    expectEqual(cli.tasksDirectoryPath, "/Users/tester/.cline/data/tasks")
+}
+
+run("ClinePathResolver.resolveScanRoots: CLINE_DATA_DIR is included and comes first") {
+    let env = ClinePathResolver.Environment(
+        clineDataDir: "/opt/cline-data",
+        clineDir: nil,
+        homeDirectoryPath: "/Users/tester",
+        applicationSupportPath: "/Users/tester/Library/Application Support"
+    )
+    let roots = ClinePathResolver.resolveScanRoots(env)
+    expectEqual(roots.first?.id, "Cline CLI ($CLINE_DATA_DIR)")
+    expectEqual(roots.first?.tasksDirectoryPath, "/opt/cline-data/tasks")
+}
+
+run("ClinePathResolver.resolveScanRoots: CLINE_DIR appends '/data/tasks'") {
+    let env = ClinePathResolver.Environment(
+        clineDataDir: nil,
+        clineDir: "/opt/cline",
+        homeDirectoryPath: "/Users/tester",
+        applicationSupportPath: "/Users/tester/Library/Application Support"
+    )
+    let roots = ClinePathResolver.resolveScanRoots(env)
+    let clineDirRoot = roots.first(where: { $0.id == "Cline CLI ($CLINE_DIR)" })
+    expect(clineDirRoot != nil)
+    expectEqual(clineDirRoot?.tasksDirectoryPath, "/opt/cline/data/tasks")
+}
+
+run("ClinePathResolver.resolveScanRoots: symlink dedupe via stat() (round-3 finding)") {
+    // Codex round-3 finding: if two env-vars point at the same
+    // directory via a symlink, dedupe must collapse them via
+    // device+inode identity (stat, not lstat).
+    //
+    // CLINE_DATA_DIR gets `/tasks` appended → `.../real/tasks`.
+    // CLINE_DIR gets `/data/tasks` appended. For a symlink test the
+    // two must resolve to the same on-disk tasks directory. Setup:
+    //   real/tasks         (created)
+    //   real/data          → symlink to `real` (so `real/data/tasks`
+    //                       == `real/real/tasks` via symlink? no —
+    //                       cleaner: make `data` a symlink to `.`
+    //                       so `real/data/tasks` == `real/tasks`).
+    let tempDir = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("cline-symlink-\(UUID().uuidString)")
+    let realDir = tempDir.appendingPathComponent("real")
+    let realTasks = realDir.appendingPathComponent("tasks")
+    try? FileManager.default.createDirectory(at: realTasks, withIntermediateDirectories: true)
+    // Symlink real/data -> real/.  (so real/data/tasks == real/tasks)
+    let dataSymlink = realDir.appendingPathComponent("data")
+    try? FileManager.default.createSymbolicLink(
+        atPath: dataSymlink.path,
+        withDestinationPath: "."
+    )
+    defer { try? FileManager.default.removeItem(at: tempDir) }
+
+    // CLINE_DATA_DIR points at real: appends /tasks -> real/tasks.
+    // CLINE_DIR points at real: appends /data/tasks -> real/data/tasks
+    // which resolves via symlink to real/./tasks == real/tasks.
+    // Both should stat to the same device+inode.
+    let env = ClinePathResolver.Environment(
+        clineDataDir: realDir.path,
+        clineDir: realDir.path,
+        homeDirectoryPath: "/Users/tester-doesnotexist",
+        applicationSupportPath: "/Users/tester-doesnotexist/Library/Application Support"
+    )
+    let roots = ClinePathResolver.resolveScanRoots(env)
+    let matching = roots.filter { $0.tasksDirectoryPath.contains(tempDir.lastPathComponent) }
+    expect(matching.count == 1, "symlink+target should collapse via stat() identity; got \(matching.count)")
+}
+
+run("ClinePathResolver.resolveScanRoots: case-insensitive path dedupe (round-1 finding #2)") {
+    // Codex round-1 finding #2: on the default case-insensitive
+    // macOS filesystem, CLINE_DIR=/users/tester/.cline (lowercase u)
+    // and the default HOME=/Users/tester point at the same directory.
+    // String-based standardizingPath dedupe misses this — case-folded
+    // fallback catches it.
+    let env = ClinePathResolver.Environment(
+        clineDataDir: nil,
+        clineDir: "/users/tester/.cline",       // lowercase 'u'
+        homeDirectoryPath: "/Users/tester",      // canonical 'U'
+        applicationSupportPath: "/Users/tester/Library/Application Support"
+    )
+    let roots = ClinePathResolver.resolveScanRoots(env)
+    let cliRoots = roots.filter { $0.tasksDirectoryPath.lowercased().hasSuffix(".cline/data/tasks") }
+    expect(cliRoots.count == 1, "case-insensitive fs dedupe should collapse /users and /Users variants; got \(cliRoots.count)")
+}
+
+run("ClinePathResolver.resolveScanRoots: dedupes identical paths (CLINE_DIR pointing at ~/.cline)") {
+    // If CLINE_DIR resolves to $HOME/.cline, CLINE_DIR/data/tasks and
+    // ~/.cline/data/tasks are the same path. Should collapse to one root
+    // rather than double-scan and appear as two entries.
+    let env = ClinePathResolver.Environment(
+        clineDataDir: nil,
+        clineDir: "/Users/tester/.cline",
+        homeDirectoryPath: "/Users/tester",
+        applicationSupportPath: "/Users/tester/Library/Application Support"
+    )
+    let roots = ClinePathResolver.resolveScanRoots(env)
+    let cliRoots = roots.filter { $0.tasksDirectoryPath == "/Users/tester/.cline/data/tasks" }
+    expectEqual(cliRoots.count, 1)
+}
+
+run("ClinePathResolver.resolveScanRoots: empty homeDirectoryPath still yields env-var roots") {
+    let env = ClinePathResolver.Environment(
+        clineDataDir: "/opt/cline-data",
+        clineDir: nil,
+        homeDirectoryPath: "",
+        applicationSupportPath: ""
+    )
+    let roots = ClinePathResolver.resolveScanRoots(env)
+    expect(roots.contains(where: { $0.id == "Cline CLI ($CLINE_DATA_DIR)" }))
+    // The VS Code family entries require applicationSupportPath — empty means none.
+    expect(!roots.contains(where: { $0.id == "VS Code" }))
+}
+
+run("ClinePathResolver.Environment.current populates without crash") {
+    let env = ClinePathResolver.Environment.current()
+    // HOME is always non-empty on macOS.
+    expect(!env.homeDirectoryPath.isEmpty)
+    expect(!env.applicationSupportPath.isEmpty)
+}
+
+// MARK: - ClineUsageFetcher — safeCost / extractTimestamp / extractModel
+
+run("ClineUsageFetcher.safeCost: negative and NaN clamp to 0; finite pass through; huge values cap at 1M") {
+    expectEqual(ClineUsageFetcher.safeCost(0.005), 0.005)
+    expectEqual(ClineUsageFetcher.safeCost(0), 0)
+    expectEqual(ClineUsageFetcher.safeCost(-1.0), 0)
+    expectEqual(ClineUsageFetcher.safeCost(Double.nan), 0)
+    expectEqual(ClineUsageFetcher.safeCost(Double.infinity), 0)
+    expectEqual(ClineUsageFetcher.safeCost(1_500_000.0), 1_000_000.0)
+    // String forms accepted (some tools re-encode as strings).
+    expectEqual(ClineUsageFetcher.safeCost("0.5"), 0.5)
+    expectEqual(ClineUsageFetcher.safeCost(nil), 0)
+}
+
+run("ClineUsageFetcher.extractTimestamp: milliseconds-since-epoch (JS Date.now) parses; before 2000 or after 2100 rejected") {
+    // 2026-07-13T04:00:00Z as ms.
+    let ms = 1_784_000_400_000.0
+    let ts = ClineUsageFetcher.extractTimestamp(ms)
+    expect(ts != nil)
+    // 1970-01-01 (0 ms) → nil (before 2000 clamp).
+    expect(ClineUsageFetcher.extractTimestamp(0) == nil)
+    // Very-distant future → nil.
+    expect(ClineUsageFetcher.extractTimestamp(1e18) == nil)
+    // Non-finite → nil.
+    expect(ClineUsageFetcher.extractTimestamp(Double.nan) == nil)
+    // Nil / non-numeric → nil.
+    expect(ClineUsageFetcher.extractTimestamp(nil) == nil)
+    expect(ClineUsageFetcher.extractTimestamp("garbage") == nil)
+}
+
+run("ClineUsageFetcher.extractModel: reads modelInfo.modelId when present; falls back to 'unknown'") {
+    let withInfo: [String: Any] = ["modelInfo": ["modelId": "claude-opus-4-7"] as [String: Any]]
+    expectEqual(ClineUsageFetcher.extractModel(withInfo), "claude-opus-4-7")
+    let withoutInfo: [String: Any] = ["ts": 1_784_000_400_000]
+    expectEqual(ClineUsageFetcher.extractModel(withoutInfo), "unknown")
+    let emptyId: [String: Any] = ["modelInfo": ["modelId": ""] as [String: Any]]
+    expectEqual(ClineUsageFetcher.extractModel(emptyId), "unknown")
+    let wrongTypeInfo: [String: Any] = ["modelInfo": "not-an-object"]
+    expectEqual(ClineUsageFetcher.extractModel(wrongTypeInfo), "unknown")
+}
+
+// MARK: - ClineUsageFetcher.parse — happy path
+
+/// Build a synthetic Cline ui_messages.json array with one usage record.
+func makeClineArray(
+    say: String = "api_req_started",
+    tokensIn: Int = 100, tokensOut: Int = 50,
+    cacheWrites: Int = 0, cacheReads: Int = 0,
+    cost: Double = 0.005,
+    model: String? = "claude-opus-4-7",
+    ts: Double? = 1_784_000_400_000,   // 2026-07-13T04:00:00Z ms
+    extraMessages: [[String: Any]] = []
+) -> String {
+    let textPayload: [String: Any] = [
+        "tokensIn": tokensIn,
+        "tokensOut": tokensOut,
+        "cacheWrites": cacheWrites,
+        "cacheReads": cacheReads,
+        "cost": cost,
+    ]
+    let textData = try! JSONSerialization.data(withJSONObject: textPayload, options: [])
+    let text = String(data: textData, encoding: .utf8)!
+    var msg: [String: Any] = [
+        "type": "say",
+        "say": say,
+        "text": text,
+    ]
+    if let ts = ts { msg["ts"] = ts }
+    if let model = model {
+        msg["modelInfo"] = ["modelId": model, "providerId": "anthropic", "mode": "act"] as [String: Any]
+    }
+    var arr: [[String: Any]] = [msg]
+    arr.append(contentsOf: extraMessages)
+    let data = try! JSONSerialization.data(withJSONObject: arr, options: [])
+    return String(data: data, encoding: .utf8)!
+}
+
+run("Cline.parse: single api_req_started record parses tokens + cost + model") {
+    let contents = makeClineArray(tokensIn: 100, tokensOut: 50, cost: 0.005, model: "claude-opus-4-7")
+    var mal = 0
+    let recs = ClineUsageFetcher.parse(uiMessages: contents, sourceFile: "/tmp/a.json", malformedRecordCount: &mal)
+    expect(recs != nil)
+    expectEqual(recs?.count, 1)
+    let r = recs![0]
+    expectEqual(r.tokensIn, 100)
+    expectEqual(r.tokensOut, 50)
+    expectEqual(r.cacheWrites, 0)
+    expectEqual(r.cacheReads, 0)
+    expect(abs(r.costUSD - 0.005) < 1e-9)
+    expectEqual(r.model, "claude-opus-4-7")
+    expectEqual(r.sayKind, .apiReqStarted)
+    expect(r.timestamp != nil)
+    expectEqual(r.sourceFile, "/tmp/a.json")
+    expectEqual(mal, 0)
+}
+
+run("Cline.parse: deleted_api_reqs and subagent_usage are also counted") {
+    let deleted = makeClineArray(say: "deleted_api_reqs", tokensIn: 10, cost: 0.001)
+    let subagent = makeClineArray(say: "subagent_usage", tokensOut: 20, cost: 0.002)
+    var mal = 0
+    let d = ClineUsageFetcher.parse(uiMessages: deleted, sourceFile: "/tmp/d.json", malformedRecordCount: &mal)
+    let s = ClineUsageFetcher.parse(uiMessages: subagent, sourceFile: "/tmp/s.json", malformedRecordCount: &mal)
+    expectEqual(d?.count, 1)
+    expectEqual(d?.first?.sayKind, .deletedApiReqs)
+    expectEqual(s?.count, 1)
+    expectEqual(s?.first?.sayKind, .subagentUsage)
+}
+
+run("Cline.parse: non-say records and non-usage say kinds are skipped silently") {
+    // Build an array of mixed message types — an "ask" record, a
+    // "say" of an unrelated kind ("text"), and one valid usage record.
+    let arr: [[String: Any]] = [
+        ["type": "ask", "ask": "followup", "ts": 1_784_000_400_000, "text": "Hi"],
+        ["type": "say", "say": "text", "ts": 1_784_000_400_000, "text": "Cline is thinking"],
+        ["type": "say", "say": "api_req_started", "ts": 1_784_000_400_000,
+         "text": "{\"tokensIn\":1,\"cost\":0.0001}"] as [String: Any],
+    ]
+    let data = try! JSONSerialization.data(withJSONObject: arr, options: [])
+    let contents = String(data: data, encoding: .utf8)!
+    var mal = 0
+    let recs = ClineUsageFetcher.parse(uiMessages: contents, sourceFile: "/tmp/mixed.json", malformedRecordCount: &mal)
+    expectEqual(recs?.count, 1)
+    expectEqual(mal, 0)
+}
+
+run("Cline.parse: entirely-zero usage record is dropped (Cline's own 'no charge' marker)") {
+    let contents = makeClineArray(tokensIn: 0, tokensOut: 0, cost: 0)
+    var mal = 0
+    let recs = ClineUsageFetcher.parse(uiMessages: contents, sourceFile: "/tmp/z.json", malformedRecordCount: &mal)
+    expectEqual(recs?.count, 0)
+}
+
+run("Cline.parse: malformed text-field JSON is counted, not fatal") {
+    let arr: [[String: Any]] = [
+        ["type": "say", "say": "api_req_started", "ts": 1_784_000_400_000, "text": "{ not valid json"],
+        ["type": "say", "say": "api_req_started", "ts": 1_784_000_400_000, "text": "{\"tokensIn\":5,\"cost\":0.001}"],
+    ]
+    let data = try! JSONSerialization.data(withJSONObject: arr, options: [])
+    let contents = String(data: data, encoding: .utf8)!
+    var mal = 0
+    let recs = ClineUsageFetcher.parse(uiMessages: contents, sourceFile: "/tmp/m.json", malformedRecordCount: &mal)
+    expectEqual(recs?.count, 1)
+    expectEqual(mal, 1)
+}
+
+run("Cline.parse: non-array top-level content returns nil") {
+    var mal = 0
+    let recs = ClineUsageFetcher.parse(uiMessages: "{\"not\":\"an array\"}", sourceFile: "/tmp/wrong.json", malformedRecordCount: &mal)
+    expect(recs == nil)
+    // Non-JSON garbage also returns nil.
+    let bad = ClineUsageFetcher.parse(uiMessages: "not valid json at all", sourceFile: "/tmp/x.json", malformedRecordCount: &mal)
+    expect(bad == nil)
+}
+
+run("Cline.parse: hostile 1e300 in tokensIn clamps to Int.max instead of trapping") {
+    let arr: [[String: Any]] = [
+        ["type": "say", "say": "api_req_started", "ts": 1_784_000_400_000,
+         "text": "{\"tokensIn\":1e300,\"cost\":0.001}"] as [String: Any],
+    ]
+    let data = try! JSONSerialization.data(withJSONObject: arr, options: [])
+    let contents = String(data: data, encoding: .utf8)!
+    var mal = 0
+    let recs = ClineUsageFetcher.parse(uiMessages: contents, sourceFile: "/tmp/big.json", malformedRecordCount: &mal)
+    expectEqual(recs?.count, 1)
+    expectEqual(recs?.first?.tokensIn, Int.max)
+}
+
+run("Cline.parse: message without modelInfo defaults to 'unknown'") {
+    // Simulate an older Cline record with no modelInfo field.
+    let arr: [[String: Any]] = [
+        ["type": "say", "say": "api_req_started", "ts": 1_784_000_400_000,
+         "text": "{\"tokensIn\":10,\"cost\":0.001}"] as [String: Any],
+    ]
+    let data = try! JSONSerialization.data(withJSONObject: arr, options: [])
+    let contents = String(data: data, encoding: .utf8)!
+    var mal = 0
+    let recs = ClineUsageFetcher.parse(uiMessages: contents, sourceFile: "/tmp/old.json", malformedRecordCount: &mal)
+    expectEqual(recs?.count, 1)
+    expectEqual(recs?.first?.model, "unknown")
+}
+
+// MARK: - Snapshot roll-ups
+
+run("ClineUsageSnapshot.tokens(in:) — sums records within range, saturates on overflow") {
+    let now = ClaudeCodeUsageFetcher.parseTimestamp("2026-07-13T04:00:00Z")!
+    let a = ClineUsageRecord(
+        model: "claude-opus-4-7", timestamp: now,
+        sayKind: .apiReqStarted,
+        tokensIn: Int.max, tokensOut: 0, cacheWrites: 0, cacheReads: 0,
+        costUSD: 0.0, sourceFile: "/tmp/a.json"
+    )
+    let b = ClineUsageRecord(
+        model: "claude-opus-4-7", timestamp: now,
+        sayKind: .apiReqStarted,
+        tokensIn: Int.max, tokensOut: 0, cacheWrites: 0, cacheReads: 0,
+        costUSD: 0.0, sourceFile: "/tmp/b.json"
+    )
+    let snap = ClineUsageSnapshot(records: [a, b])
+    let range = (now.addingTimeInterval(-3600))...(now.addingTimeInterval(3600))
+    // Naive Int64 add would wrap; saturating keeps Int.max.
+    expectEqual(snap.tokens(in: range), Int.max)
+}
+
+run("ClineUsageSnapshot.breakdownByModel — descending by cost, aggregates per model") {
+    let now = ClaudeCodeUsageFetcher.parseTimestamp("2026-07-13T04:00:00Z")!
+    let opusA = ClineUsageRecord(
+        model: "claude-opus-4-7", timestamp: now,
+        sayKind: .apiReqStarted,
+        tokensIn: 100, tokensOut: 50, cacheWrites: 0, cacheReads: 0,
+        costUSD: 5.0, sourceFile: "/tmp/a.json"
+    )
+    let opusB = ClineUsageRecord(
+        model: "claude-opus-4-7", timestamp: now,
+        sayKind: .apiReqStarted,
+        tokensIn: 200, tokensOut: 100, cacheWrites: 0, cacheReads: 0,
+        costUSD: 10.0, sourceFile: "/tmp/b.json"
+    )
+    let sonnet = ClineUsageRecord(
+        model: "claude-sonnet-4-6", timestamp: now,
+        sayKind: .apiReqStarted,
+        tokensIn: 100, tokensOut: 50, cacheWrites: 0, cacheReads: 0,
+        costUSD: 1.0, sourceFile: "/tmp/s.json"
+    )
+    let snap = ClineUsageSnapshot(records: [sonnet, opusA, opusB])
+    let range = (now.addingTimeInterval(-3600))...(now.addingTimeInterval(3600))
+    let bd = snap.breakdownByModel(in: range)
+    expectEqual(bd.count, 2)
+    expectEqual(bd[0].model, "claude-opus-4-7")
+    expect(abs(bd[0].costUSD - 15.0) < 1e-9)
+    expectEqual(bd[0].tokens, 450)
+    expectEqual(bd[1].model, "claude-sonnet-4-6")
+}
+
+// MARK: - discoverFiles
+
+run("Cline.discoverFiles: missing scan root returns []; existing but empty returns []") {
+    let missing = ClinePathResolver.ScanRoot(id: "test-missing", tasksDirectoryPath: "/nonexistent/\(UUID().uuidString)/tasks")
+    expectEqual(ClineUsageFetcher.discoverFiles(under: [missing]).count, 0)
+    // Existing but empty.
+    let tempDir = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("cline-disc-empty-\(UUID().uuidString)/tasks")
+    try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tempDir.deletingLastPathComponent()) }
+    let empty = ClinePathResolver.ScanRoot(id: "test-empty", tasksDirectoryPath: tempDir.path)
+    expectEqual(ClineUsageFetcher.discoverFiles(under: [empty]).count, 0)
+}
+
+run("Cline.discoverFiles: finds ui_messages.json under every task dir; ignores files and unrelated names") {
+    let tempDir = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("cline-disc-\(UUID().uuidString)/tasks")
+    try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tempDir.deletingLastPathComponent()) }
+
+    // Two valid task directories.
+    let taskA = tempDir.appendingPathComponent("task-a-uuid")
+    let taskB = tempDir.appendingPathComponent("task-b-uuid")
+    try? FileManager.default.createDirectory(at: taskA, withIntermediateDirectories: true)
+    try? FileManager.default.createDirectory(at: taskB, withIntermediateDirectories: true)
+    try? "[]".write(to: taskA.appendingPathComponent("ui_messages.json"), atomically: true, encoding: .utf8)
+    try? "[]".write(to: taskB.appendingPathComponent("ui_messages.json"), atomically: true, encoding: .utf8)
+    // Non-ui_messages file inside a task dir — must NOT be picked up.
+    try? "".write(to: taskA.appendingPathComponent("api_conversation_history.json"), atomically: true, encoding: .utf8)
+    // Task dir without ui_messages.json — must NOT be picked up.
+    let taskC = tempDir.appendingPathComponent("task-c-no-ui")
+    try? FileManager.default.createDirectory(at: taskC, withIntermediateDirectories: true)
+    // Loose file in tasks dir — must NOT be picked up (only directories).
+    try? "".write(to: tempDir.appendingPathComponent("stray-file.json"), atomically: true, encoding: .utf8)
+
+    let root = ClinePathResolver.ScanRoot(id: "test", tasksDirectoryPath: tempDir.path)
+    let out = ClineUsageFetcher.discoverFiles(under: [root])
+    expectEqual(out.count, 2)
+    expect(out.allSatisfy { $0.lastPathComponent == "ui_messages.json" })
+    // Sorted by absolute path.
+    expect(out[0].path < out[1].path)
+}
+
+// MARK: - parse(files:) end-to-end
+
+run("Cline.parse(files:) — sorts records by timestamp ascending; counts per file") {
+    let tempDir = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("cline-e2e-\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tempDir) }
+
+    // File A: later record. File B: earlier.
+    let laterContent = makeClineArray(cost: 0.01, ts: 1_784_000_400_000)   // July 2026
+    let earlierContent = makeClineArray(cost: 0.02, ts: 1_720_000_000_000) // July 2024
+    let fileA = tempDir.appendingPathComponent("a.json")
+    let fileB = tempDir.appendingPathComponent("b.json")
+    try? laterContent.write(to: fileA, atomically: true, encoding: .utf8)
+    try? earlierContent.write(to: fileB, atomically: true, encoding: .utf8)
+
+    let snap = ClineUsageFetcher.parse(files: [fileA, fileB])
+    expectEqual(snap.records.count, 2)
+    // Sorted ascending.
+    expect(snap.records[0].timestamp! < snap.records[1].timestamp!)
+    // Per-file record counts recorded.
+    expectEqual(snap.recordsPerFile[fileA.path], 1)
+    expectEqual(snap.recordsPerFile[fileB.path], 1)
+}
+
+run("Cline.parse(files:) — non-array top-level content counts as unreadable and does not raise") {
+    let tempDir = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("cline-unreadable-\(UUID().uuidString)")
+    try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tempDir) }
+    let bad = tempDir.appendingPathComponent("bad.json")
+    try? "{\"not\":\"array\"}".write(to: bad, atomically: true, encoding: .utf8)
+    let snap = ClineUsageFetcher.parse(files: [bad])
+    expectEqual(snap.records.count, 0)
+    expectEqual(snap.unreadableFileCount, 1)
+}
+
+run("Cline.parse(files:) — missing file counted as unreadable, does not throw") {
+    let missing = URL(fileURLWithPath: "/nonexistent/never-\(UUID().uuidString).json")
+    let snap = ClineUsageFetcher.parse(files: [missing])
+    expectEqual(snap.records.count, 0)
+    expectEqual(snap.unreadableFileCount, 1)
+}
+
+// MARK: - ClineUsageStore
+
+MainActor.assumeIsolated {
+
+    @MainActor func makeClineStoreForTest(
+        flagEnabled: Bool = true,
+        scanRoots: [ClinePathResolver.ScanRoot] = [ClinePathResolver.ScanRoot(id: "test", tasksDirectoryPath: "/tmp/fake")],
+        tccState: TCCState = .granted,
+        files: [URL] = [],
+        snapshot: ClineUsageSnapshot = ClineUsageSnapshot(records: []),
+        now: Date = Date()
+    ) -> ClineUsageStore {
+        let defaults = UserDefaults(suiteName: "cline-test-\(UUID().uuidString)")!
+        defaults.set(flagEnabled, forKey: "features.cline.enabled")
+        let rootsCopy = scanRoots
+        let filesCopy = files
+        let snapshotCopy = snapshot
+        let nowCopy = now
+        return ClineUsageStore(
+            defaults: defaults,
+            resolveScanRoots: { rootsCopy },
+            tccProbe: { _ in tccState },
+            discoverFiles: { _ in filesCopy },
+            parseFiles: { _ in snapshotCopy },
+            clock: { nowCopy }
+        )
+    }
+
+    @MainActor func awaitClineFetch() {
+        let deadline = Date().addingTimeInterval(2.0)
+        while Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
+    }
+
+    run("ClineUsageStore: feature-flag off produces no tiles and no fetch state") {
+        let store = makeClineStoreForTest(flagEnabled: false)
+        expectEqual(store.tiles.count, 0)
+        expect(!store.isEnabled)
+        expect(!store.isConfigured)
+        store.fetch()
+        expect(store.snapshot == nil)
+        expect(store.lastUpdatedAt == nil)
+    }
+
+    run("ClineUsageStore: enabled + granted + empty snapshot -> loading tile") {
+        let store = makeClineStoreForTest(flagEnabled: true, tccState: .granted)
+        let tiles = store.tiles
+        expectEqual(tiles.count, 1)
+        expectEqual(tiles.first?.id, "cline-loading")
+    }
+
+    run("ClineUsageStore: TCC .denied renders needsAccess tile only") {
+        let store = makeClineStoreForTest(flagEnabled: true, tccState: .denied)
+        store.fetch()
+        awaitClineFetch()
+        let tiles = store.tiles
+        expectEqual(tiles.count, 1)
+        expectEqual(tiles.first?.id, "cline-needs-access")
+    }
+
+    run("ClineUsageStore: mixed TCC (one granted, one denied) shows partial-access diagnostic tile (round-1 finding #1)") {
+        // Codex round-1 finding #1: a partial-access mix must be
+        // surfaced so the tile is not misleadingly labelled as
+        // complete. Store aggregates to .granted (some data
+        // available) but exposes deniedRootCount so the tile shows
+        // "Partial access" alongside the numbers.
+        let now = ClaudeCodeUsageFetcher.parseTimestamp("2026-07-13T04:00:00Z")!
+        let rec = ClineUsageRecord(
+            model: "claude-opus-4-7", timestamp: now,
+            sayKind: .apiReqStarted,
+            tokensIn: 1000, tokensOut: 500, cacheWrites: 0, cacheReads: 0,
+            costUSD: 0.0175, sourceFile: "/tmp/granted/tasks/a/ui_messages.json"
+        )
+        let defaults = UserDefaults(suiteName: "cline-mixed-\(UUID().uuidString)")!
+        defaults.set(true, forKey: "features.cline.enabled")
+        let grantedRoot = ClinePathResolver.ScanRoot(id: "VS Code", tasksDirectoryPath: "/tmp/granted/tasks")
+        let deniedRoot = ClinePathResolver.ScanRoot(id: "Cursor", tasksDirectoryPath: "/tmp/denied/tasks")
+        let store = ClineUsageStore(
+            defaults: defaults,
+            resolveScanRoots: { [grantedRoot, deniedRoot] },
+            tccProbe: { path in
+                path.hasPrefix("/tmp/granted") ? .granted : .denied
+            },
+            discoverFiles: { _ in [URL(fileURLWithPath: "/tmp/granted/tasks/a/ui_messages.json")] },
+            parseFiles: { _ in ClineUsageSnapshot(records: [rec]) },
+            clock: { now }
+        )
+        store.fetch()
+        awaitClineFetch()
+        // Aggregated tccState is granted (we have SOME readable roots).
+        expectEqual(store.tccState, .granted)
+        // deniedRootCount reflects the Cursor root.
+        expectEqual(store.deniedRootCount, 1)
+        // Tiles include the partial-access diagnostic AND the usage tiles.
+        let ids = Set(store.tiles.map { $0.id })
+        expect(ids.contains("cline-partial-access"))
+        expect(ids.contains("cline-cost-today"))
+    }
+
+    run("ClineUsageStore: partial-access tile is visible DURING loading (round-2 finding #3)") {
+        // Codex round-2 finding #3: the partial-access diagnostic
+        // must show up even while parse is in flight — otherwise a
+        // slow parse hides the access problem.
+        let defaults = UserDefaults(suiteName: "cline-partial-loading-\(UUID().uuidString)")!
+        defaults.set(true, forKey: "features.cline.enabled")
+        let grantedRoot = ClinePathResolver.ScanRoot(id: "VS Code", tasksDirectoryPath: "/tmp/granted/tasks")
+        let deniedRoot = ClinePathResolver.ScanRoot(id: "Cursor", tasksDirectoryPath: "/tmp/denied/tasks")
+        final class Gate: @unchecked Sendable { let sem = DispatchSemaphore(value: 0) }
+        let gate = Gate()
+        let store = ClineUsageStore(
+            defaults: defaults,
+            resolveScanRoots: { [grantedRoot, deniedRoot] },
+            tccProbe: { path in path.hasPrefix("/tmp/granted") ? .granted : .denied },
+            discoverFiles: { _ in [URL(fileURLWithPath: "/tmp/granted/tasks/a/ui_messages.json")] },
+            parseFiles: { _ in
+                // Block parse so snapshot is nil at tile-render time.
+                gate.sem.wait()
+                return ClineUsageSnapshot(records: [])
+            }
+        )
+        store.fetch()
+        // Give the queue a moment to reach the blocking parseFiles.
+        RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+        // Snapshot is nil at this point — tiles must still show the
+        // partial-access diagnostic alongside the loading tile.
+        let ids = Set(store.tiles.map { $0.id })
+        expect(ids.contains("cline-partial-access"), "partial access diagnostic must be visible during loading")
+        expect(ids.contains("cline-loading"))
+        // Release the parser.
+        gate.sem.signal()
+        awaitClineFetch()
+    }
+
+    run("ClineUsageStore: granted-root-set change clears old snapshot before new fetch runs (round-2 finding #4)") {
+        // Codex round-2 finding #4: user revokes access on one root
+        // between fetches. The OLD snapshot (which included that
+        // root's data) must be dropped so the tile does not show
+        // stale numbers while the new parse runs.
+        let now = ClaudeCodeUsageFetcher.parseTimestamp("2026-07-13T04:00:00Z")!
+        let rec = ClineUsageRecord(
+            model: "claude-opus-4-7", timestamp: now,
+            sayKind: .apiReqStarted,
+            tokensIn: 1000, tokensOut: 500, cacheWrites: 0, cacheReads: 0,
+            costUSD: 0.0175, sourceFile: "/tmp/both/tasks/a/ui_messages.json"
+        )
+        let defaults = UserDefaults(suiteName: "cline-rootchange-\(UUID().uuidString)")!
+        defaults.set(true, forKey: "features.cline.enabled")
+        final class Toggle: @unchecked Sendable {
+            var scenario: Int = 1   // 1 = both granted, 2 = one granted + one denied
+        }
+        let toggle = Toggle()
+        let vsCode = ClinePathResolver.ScanRoot(id: "VS Code", tasksDirectoryPath: "/tmp/both/tasks")
+        let cursor = ClinePathResolver.ScanRoot(id: "Cursor", tasksDirectoryPath: "/tmp/cursor/tasks")
+        // Second scenario also blocks parse so the OLD snapshot's
+        // fate is visible before the new one applies.
+        final class Gate: @unchecked Sendable { let sem = DispatchSemaphore(value: 0) }
+        let gate = Gate()
+        final class ParseCount: @unchecked Sendable { var value: Int = 0 }
+        let parseCount = ParseCount()
+        let store = ClineUsageStore(
+            defaults: defaults,
+            resolveScanRoots: { [vsCode, cursor] },
+            tccProbe: { path in
+                if toggle.scenario == 1 { return .granted }
+                return path.hasPrefix("/tmp/both") ? .granted : .denied
+            },
+            discoverFiles: { _ in [URL(fileURLWithPath: "/tmp/both/tasks/a/ui_messages.json")] },
+            parseFiles: { _ in
+                parseCount.value += 1
+                if parseCount.value == 2 {
+                    gate.sem.wait()   // block ONLY the second fetch
+                }
+                return ClineUsageSnapshot(records: [rec])
+            },
+            clock: { now }
+        )
+        // Fetch #1: both granted, snapshot populated.
+        store.fetch()
+        awaitClineFetch()
+        expect(store.snapshot != nil)
+        expectEqual(store.deniedRootCount, 0)
+        // Scenario change: Cursor now denied. Fetch #2 runs; the
+        // OLD snapshot must be cleared before the new parse applies.
+        toggle.scenario = 2
+        store.fetch()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+        // At this point fetch #2's parse is blocked. The store must
+        // have already discarded the stale snapshot.
+        expect(store.snapshot == nil, "stale snapshot must be cleared when granted-root-set changes")
+        expectEqual(store.deniedRootCount, 1)
+        // Release the parse.
+        gate.sem.signal()
+        awaitClineFetch()
+    }
+
+    run("ClineUsageStore: every root denied -> .denied state, no usage tiles (round-1 finding #1 correlate)") {
+        let defaults = UserDefaults(suiteName: "cline-alldenied-\(UUID().uuidString)")!
+        defaults.set(true, forKey: "features.cline.enabled")
+        let denied1 = ClinePathResolver.ScanRoot(id: "VS Code", tasksDirectoryPath: "/tmp/denied1/tasks")
+        let denied2 = ClinePathResolver.ScanRoot(id: "Cursor", tasksDirectoryPath: "/tmp/denied2/tasks")
+        let store = ClineUsageStore(
+            defaults: defaults,
+            resolveScanRoots: { [denied1, denied2] },
+            tccProbe: { _ in .denied },
+            discoverFiles: { _ in [] },
+            parseFiles: { _ in ClineUsageSnapshot(records: []) }
+        )
+        store.fetch()
+        // If every root is denied, aggregated .denied; UI shows the
+        // needsAccess tile only.
+        expectEqual(store.tccState, .denied)
+        let tiles = store.tiles
+        expectEqual(tiles.count, 1)
+        expectEqual(tiles.first?.id, "cline-needs-access")
+    }
+
+    run("ClineUsageStore: no scan root exists -> 'not installed' tile") {
+        // Zero scan roots -> aggregated to .pathMissing.
+        let store = makeClineStoreForTest(scanRoots: [], tccState: .pathMissing)
+        store.fetch()
+        awaitClineFetch()
+        let tiles = store.tiles
+        expectEqual(tiles.count, 1)
+        expectEqual(tiles.first?.id, "cline-not-installed")
+    }
+
+    run("ClineUsageStore: fetch populates snapshot and emits usage tiles") {
+        let now = ClaudeCodeUsageFetcher.parseTimestamp("2026-07-13T04:00:00Z")!
+        let rec = ClineUsageRecord(
+            model: "claude-opus-4-7", timestamp: now,
+            sayKind: .apiReqStarted,
+            tokensIn: 1000, tokensOut: 500, cacheWrites: 0, cacheReads: 0,
+            costUSD: 0.0175, sourceFile: "/tmp/fake/tasks/a/ui_messages.json"
+        )
+        let snap = ClineUsageSnapshot(records: [rec])
+        let store = makeClineStoreForTest(
+            flagEnabled: true, tccState: .granted,
+            files: [URL(fileURLWithPath: "/tmp/fake/tasks/a/ui_messages.json")],
+            snapshot: snap,
+            now: now
+        )
+        store.fetch()
+        awaitClineFetch()
+
+        expect(store.snapshot != nil)
+        expect(store.lastUpdatedAt != nil)
+        let ids = Set(store.tiles.map { $0.id })
+        expect(ids.contains("cline-tokens-today"))
+        expect(ids.contains("cline-cost-today"))
+        expect(ids.contains("cline-cost-mtd"))
+        expect(ids.contains("cline-by-model"))
+    }
+
+    run("ClineUsageStore: clear() drops snapshot + lastUpdated + invalidates in-flight fetch") {
+        let now = ClaudeCodeUsageFetcher.parseTimestamp("2026-07-13T04:00:00Z")!
+        let rec = ClineUsageRecord(
+            model: "claude-opus-4-7", timestamp: now,
+            sayKind: .apiReqStarted,
+            tokensIn: 100, tokensOut: 50, cacheWrites: 0, cacheReads: 0,
+            costUSD: 0.0175, sourceFile: "/tmp/fake/a.json"
+        )
+        let store = makeClineStoreForTest(
+            flagEnabled: true, tccState: .granted,
+            files: [URL(fileURLWithPath: "/tmp/fake/a.json")],
+            snapshot: ClineUsageSnapshot(records: [rec]),
+            now: now
+        )
+        store.fetch()
+        awaitClineFetch()
+        expect(store.snapshot != nil)
+        store.clear()
+        expect(store.snapshot == nil)
+        expect(store.lastUpdatedAt == nil)
+    }
+
+    run("ClineUsageStore: TCC granted -> denied invalidates in-flight fetch (no stale repopulate)") {
+        let now = ClaudeCodeUsageFetcher.parseTimestamp("2026-07-13T04:00:00Z")!
+        let rec = ClineUsageRecord(
+            model: "claude-opus-4-7", timestamp: now,
+            sayKind: .apiReqStarted,
+            tokensIn: 1000, tokensOut: 500, cacheWrites: 0, cacheReads: 0,
+            costUSD: 0.0175, sourceFile: "/tmp/fake/a.json"
+        )
+        let defaults = UserDefaults(suiteName: "cline-tcc-\(UUID().uuidString)")!
+        defaults.set(true, forKey: "features.cline.enabled")
+        final class TCCToggle: @unchecked Sendable { var state: TCCState = .granted }
+        let toggle = TCCToggle()
+        let root = ClinePathResolver.ScanRoot(id: "test", tasksDirectoryPath: "/tmp/fake")
+        let store = ClineUsageStore(
+            defaults: defaults,
+            resolveScanRoots: { [root] },
+            tccProbe: { _ in toggle.state },
+            discoverFiles: { _ in [URL(fileURLWithPath: "/tmp/fake/a.json")] },
+            parseFiles: { _ in ClineUsageSnapshot(records: [rec]) },
+            clock: { now }
+        )
+        store.fetch()
+        awaitClineFetch()
+        expect(store.snapshot != nil)
+        toggle.state = .denied
+        store.fetch()
+        expect(store.snapshot == nil)
+        expectEqual(store.tccState, .denied)
+    }
+
+    run("ClineUsageStore: TRULY in-flight fetch A releases AFTER fetch B's denial — A must not repopulate (round-1 finding #4)") {
+        // Codex round-1 finding #4: the prior test does not create a
+        // genuinely in-flight race. This test uses a semaphore inside
+        // the parseFiles closure so fetch A is definitively BLOCKED
+        // when fetch B fires with .denied. Then we release A and
+        // verify the final state is empty, not repopulated.
+        let now = ClaudeCodeUsageFetcher.parseTimestamp("2026-07-13T04:00:00Z")!
+        let rec = ClineUsageRecord(
+            model: "claude-opus-4-7", timestamp: now,
+            sayKind: .apiReqStarted,
+            tokensIn: 1000, tokensOut: 500, cacheWrites: 0, cacheReads: 0,
+            costUSD: 0.0175, sourceFile: "/tmp/fake/a.json"
+        )
+        let defaults = UserDefaults(suiteName: "cline-inflight-\(UUID().uuidString)")!
+        defaults.set(true, forKey: "features.cline.enabled")
+        final class TCCToggle: @unchecked Sendable { var state: TCCState = .granted }
+        final class Gate: @unchecked Sendable { let sem = DispatchSemaphore(value: 0) }
+        let toggle = TCCToggle()
+        let gate = Gate()
+        let root = ClinePathResolver.ScanRoot(id: "test", tasksDirectoryPath: "/tmp/fake")
+        let snap = ClineUsageSnapshot(records: [rec])
+        let store = ClineUsageStore(
+            defaults: defaults,
+            resolveScanRoots: { [root] },
+            tccProbe: { _ in toggle.state },
+            discoverFiles: { _ in [URL(fileURLWithPath: "/tmp/fake/a.json")] },
+            parseFiles: { _ in
+                // First invocation blocks on the semaphore; subsequent
+                // invocations don't reach here because state changes to
+                // .denied before workQueue schedules them.
+                gate.sem.wait()
+                return snap
+            },
+            clock: { now }
+        )
+        // Kick off fetch A. Its parseFiles closure will block.
+        store.fetch()
+        // Give the background queue a moment to reach the blocking
+        // parseFiles closure.
+        RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+        // While fetch A is still blocked, flip TCC and invoke fetch B
+        // (which bumps generation and returns early with .denied).
+        toggle.state = .denied
+        store.fetch()
+        expectEqual(store.tccState, .denied)
+        // Release fetch A. Its background closure returns the snapshot;
+        // the main-actor apply hop should see fetchGeneration mismatch
+        // AND isEnabled true but tccState .denied — either guard drops
+        // the completion, so state stays empty.
+        gate.sem.signal()
+        awaitClineFetch()
+        expect(store.snapshot == nil, "in-flight fetch A must NOT repopulate snapshot after fetch B denied")
+        expectEqual(store.tccState, .denied)
+    }
+}
+
 // MARK: - Summary
 
 print("")

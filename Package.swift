@@ -100,7 +100,13 @@ let package = Package(
                 // Store lands in a follow-up file (same PR).
                 "ClaudeCodePricing.swift",
                 "ClaudeCodeUsageFetcher.swift",
-                "ClaudeCodeUsageStore.swift"
+                "ClaudeCodeUsageStore.swift",
+                // PR 10c-BE — Cline local ui_messages.json reader.
+                // Reuses ClaudeCodeUsageFetcher.safeInt/readJsonlLines
+                // + ClaudeCodeUsageRecord.saturatingAdd + TCCProbe /
+                // FileWatcher / LocalProviderAccessGuide from PR #66.
+                "ClineUsageFetcher.swift",
+                "ClineUsageStore.swift"
                 // AnthropicUsageStore.swift depends on UsageManager
                 // (defined in ClaudeUsageBar.swift), so it stays in the
                 // app-bundle compile only, not in the SwiftPM library

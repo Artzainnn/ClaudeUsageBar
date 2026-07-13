@@ -65,6 +65,8 @@ swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_arm64" \
     ClaudeCodePricing.swift \
     ClaudeCodeUsageFetcher.swift \
     ClaudeCodeUsageStore.swift \
+    ClineUsageFetcher.swift \
+    ClineUsageStore.swift \
     -framework SwiftUI \
     -framework AppKit \
     -framework WebKit \
@@ -97,6 +99,8 @@ swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_x86_64" \
     ClaudeCodePricing.swift \
     ClaudeCodeUsageFetcher.swift \
     ClaudeCodeUsageStore.swift \
+    ClineUsageFetcher.swift \
+    ClineUsageStore.swift \
     -framework SwiftUI \
     -framework AppKit \
     -framework WebKit \
