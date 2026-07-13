@@ -312,6 +312,10 @@ public enum ProviderCopy {
             return "Reads your local Claude Code session logs (`~/.claude/projects/**/*.jsonl`) to show tokens used today, cost today, and cost month-to-date, broken down by model. Nothing leaves your Mac; no key or sign-in is needed. Costs are calculated locally from a bundled snapshot of Anthropic's published rates."
         case "cline":
             return "Reads your local Cline session logs. In VS Code, VS Code Insiders, VSCodium, Cursor, or Windsurf: `<host>/User/globalStorage/saoudrizwan.claude-dev/tasks/{taskId}/ui_messages.json`. For the Cline CLI: `$CLINE_DATA_DIR/tasks/…`, `$CLINE_DIR/data/tasks/…`, or `~/.cline/data/tasks/…`. Shows tokens used today, cost today, and cost month-to-date, broken down by model. Nothing leaves your Mac; no key or sign-in is needed. Costs come from Cline's own precomputed per-turn total — the same number you see inside the extension or CLI."
+        case "windsurf":
+            return "Reads Windsurf's own local plan info from `~/Library/Application Support/Windsurf/User/globalStorage/state.vscdb` (the `windsurf.settings.cachedPlanInfo` row) to show your plan name and remaining daily / weekly / credit windows, with reset times. Nothing leaves your Mac; no key or pasted credential is needed in this app. Sign in to Windsurf itself and open a Cascade chat once so Windsurf writes the row, then click Refresh here."
+        case "cursor":
+            return "Reads Cursor's own local session from `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb` (the `cursorAuth/accessToken`, `cursorAuth/refreshToken`, and `cursorAuth/stripeMembershipType` rows), then calls Cursor's own web dashboard API to show your plan, month-to-date usage against the billing cycle, any on-demand spend, and the top models this cycle by cost. No key or paste is required in this app — it reuses Cursor's local session. The access token is sent as a session cookie to `cursor.com`, and the refresh token may be sent to `api2.cursor.sh` if a refresh is needed. Sign in to Cursor first."
         default:
             return nil
         }
@@ -333,6 +337,8 @@ public enum ProviderCopy {
             return "Costs are estimates based on Anthropic's published per-token rates at the time this build was released. They are not a receipt from Anthropic and may differ from your actual bill. When new Claude models ship, unpriced records show tokens but $0 cost until the next app update; a 'Pricing update available' tile appears when this happens."
         case "cline":
             return "Costs come from Cline itself — this app reads Cline's precomputed per-turn total and sums them. If Cline's rate table is out of date, or the API-request record was not fully written (a crash mid-turn), the numbers will not match your provider's bill exactly. If a Cline install exists on this Mac but its data cannot be read, a 'Partial access' tile appears; grant Full Disk Access in System Settings to include it."
+        case "cursor":
+            return "Uses Cursor's own web dashboard API. It is not a public API — Cursor may change or remove it at any time, in which case this tile will stop updating until this app is updated. If your access token expires the app refreshes it silently against `api2.cursor.sh`'s OAuth endpoint using the same client ID Cursor.app itself uses. If the refresh reports 'logged out' or fails, or if a refreshed token is still rejected on retry, a 'Sign in again in Cursor' tile appears — clearing this provider does not sign you out of Cursor; sign in inside Cursor itself, then click Refresh here."
         default:
             return nil
         }

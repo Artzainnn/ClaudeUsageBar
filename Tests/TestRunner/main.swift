@@ -675,7 +675,15 @@ run("ProviderCopy.help returns Codex copy and nil for unknown") {
     expect(ProviderCopy.help(for: "unknown-provider") == nil)
 }
 
-run("ProviderCopy.disclosure warns about the private API for Codex only") {
+run("ProviderCopy.disclosure warns about the private Codex API") {
+    // Codex R3 finding P3#1 (PR 11-UI): title used to say "for Codex
+    // only" — since PR 11-UI, Cursor also carries a private-API
+    // disclosure, so the "only" claim was stale. The invariants below
+    // are still Codex-specific: this test proves that Codex's own
+    // disclosure names its specific endpoint, not that no other
+    // provider has any private-API disclosure. Provider-specific
+    // private-API disclosure tests live in each provider's own
+    // regression block (see the Cursor private-API test above).
     let codex = ProviderCopy.disclosure(for: "codex")
     expect(codex != nil)
     expect(codex?.contains("private Codex API") == true)
@@ -876,6 +884,168 @@ run("ProviderCopy id 'cline' matches ClineUsageStore.id — exercises the real S
     expect(ProviderCopy.help(for: "Cline") == nil)
     expect(ProviderCopy.help(for: "CLINE") == nil)
     expect(ProviderCopy.help(for: "cline-code") == nil)
+}
+
+run("ProviderCopy id 'windsurf' matches WindsurfUsageStore.id — exercises the real Settings path (PR 11-UI regression guard)") {
+    // Same regression guard as PRs 10b-UI/10c-UI: read the store's OWN id
+    // so drift on either side is caught. ProviderToggleRow calls
+    // `ProviderCopy.help(for: box.id)`; walk exactly that path.
+    MainActor.assumeIsolated {
+        let store = WindsurfUsageStore()
+        expect(ProviderCopy.help(for: store.id) != nil)
+        // Pure-local, no live API — no disclosure by design.
+        expect(ProviderCopy.disclosure(for: store.id) == nil)
+        let box = ProviderBox(store)
+        expect(ProviderCopy.help(for: box.id) != nil)
+        expect(ProviderCopy.disclosure(for: box.id) == nil)
+    }
+    // Pin the literal too.
+    expect(ProviderCopy.help(for: "windsurf") != nil)
+    expect(ProviderCopy.disclosure(for: "windsurf") == nil)
+    // Near-miss casings return nil so a silent rename disaster is caught.
+    expect(ProviderCopy.help(for: "Windsurf") == nil)
+    expect(ProviderCopy.help(for: "WINDSURF") == nil)
+    expect(ProviderCopy.help(for: "wind-surf") == nil)
+    expect(ProviderCopy.help(for: "windsurf-app") == nil)
+}
+
+run("ProviderCopy id 'cursor' matches CursorUsageStore.id — exercises the real Settings path (PR 11-UI regression guard)") {
+    // Same regression guard as PRs 10b-UI/10c-UI/windsurf: read the
+    // store's OWN id, then also the ProviderBox-wrapped id — the exact
+    // path ProviderToggleRow walks in Settings.
+    MainActor.assumeIsolated {
+        let store = CursorUsageStore()
+        expect(ProviderCopy.help(for: store.id) != nil)
+        expect(ProviderCopy.disclosure(for: store.id) != nil)
+        let box = ProviderBox(store)
+        expect(ProviderCopy.help(for: box.id) != nil)
+        expect(ProviderCopy.disclosure(for: box.id) != nil)
+    }
+    // Pin the literal too.
+    expect(ProviderCopy.help(for: "cursor") != nil)
+    expect(ProviderCopy.disclosure(for: "cursor") != nil)
+    // Near-miss casings return nil so a silent rename disaster is caught.
+    expect(ProviderCopy.help(for: "Cursor") == nil)
+    expect(ProviderCopy.help(for: "CURSOR") == nil)
+    expect(ProviderCopy.help(for: "cursor-app") == nil)
+    expect(ProviderCopy.help(for: "cursorai") == nil)
+}
+
+run("ProviderCopy: Windsurf help names the state.vscdb path, pure-local posture, no key (PR 11-UI)") {
+    // The Windsurf help must (1) name the exact state.vscdb path so a
+    // curious user can verify what the app reads, (2) name the
+    // cachedPlanInfo row so what-we-read is unambiguous, (3) assert
+    // "Nothing leaves your Mac" so pure-local posture is explicit, and
+    // (4) tell the user no key/pasted credential is needed AT THIS END.
+    // Codex R1 finding P2#1 + P3#4: never assert "no sign-in is needed"
+    // — Windsurf itself needs a sign-in for the row to exist, and
+    // saying otherwise inside our help would be inaccurate. The next
+    // assertion explicitly rejects that phrasing.
+    let help = ProviderCopy.help(for: "windsurf")
+    expect(help != nil)
+    // Path — the deepest unambiguous fragment appears verbatim.
+    expect(help?.contains("state.vscdb") == true)
+    expect(help?.contains("Windsurf/User/globalStorage") == true)
+    // Row name — so the user can grep the file if they inspect it.
+    expect(help?.contains("windsurf.settings.cachedPlanInfo") == true)
+    // Pure-local promise — this is the entire disclosure surface for
+    // Windsurf, so it MUST be stated in help itself.
+    expect(help?.contains("Nothing leaves your Mac") == true)
+    // No-key / no-pasted-credential requirement — pinned specifically
+    // to the "no key" or "no pasted credential" phrasing so drift to
+    // the false "no sign-in is needed" claim is caught.
+    expect(help?.contains("no key") == true || help?.contains("no pasted credential") == true)
+    // Codex R1 finding P3#4 — the false claim "no sign-in is needed"
+    // must NEVER appear. Windsurf's own sign-in is what causes the row
+    // to be written; our copy tells the user to sign in to Windsurf.
+    expect(help?.contains("no sign-in") == false)
+    expect(help?.contains("no sign in") == false)
+    // "Cascade" — the Windsurf feature that triggers a plan-info write.
+    expect(help?.contains("Cascade") == true)
+    // The sign-in prompt for the user is present so they know they must
+    // sign in to Windsurf (not to us).
+    expect(help?.contains("Sign in to Windsurf") == true)
+}
+
+run("ProviderCopy: Cursor help names the state.vscdb path, WorkOS session, and the destinations (PR 11-UI)") {
+    // The Cursor help must (1) name the state.vscdb path so a curious
+    // user can verify what the app reads, (2) name the three auth rows
+    // (accessToken / refreshToken / stripeMembershipType) so what-we-read
+    // is unambiguous, (3) name every network destination the token might
+    // be sent to (cursor.com + api2.cursor.sh) so the user is not
+    // surprised on a firewall log, and (4) not require any pasted key
+    // (Cursor's own sign-in is the credential source).
+    let help = ProviderCopy.help(for: "cursor")
+    expect(help != nil)
+    // Path — the deepest unambiguous fragment appears verbatim.
+    expect(help?.contains("state.vscdb") == true)
+    expect(help?.contains("Cursor/User/globalStorage") == true)
+    // Auth rows — all three are named.
+    expect(help?.contains("cursorAuth/accessToken") == true)
+    expect(help?.contains("cursorAuth/refreshToken") == true)
+    expect(help?.contains("cursorAuth/stripeMembershipType") == true)
+    // Both destinations are named — cursor.com for reads, api2.cursor.sh
+    // for OAuth refresh. If the user only sees "cursor.com" in help and
+    // then their firewall flags api2.cursor.sh they will (rightly) worry.
+    expect(help?.contains("cursor.com") == true)
+    expect(help?.contains("api2.cursor.sh") == true)
+    // No-key posture.
+    expect(help?.contains("No key") == true || help?.contains("no key") == true)
+}
+
+run("ProviderCopy: Cursor disclosure warns about private API + refresh flow + sign-in fallback (PR 11-UI)") {
+    // The Cursor disclosure must (1) call the endpoint private /
+    // undocumented / subject-to-change so the user knows breakage is
+    // possible, (2) surface that a silent OAuth refresh may happen via
+    // api2.cursor.sh so a network log with that host isn't a surprise,
+    // (3) tell the user that a hard failure surfaces a "sign in again
+    // in Cursor" tile, AND (4) tell them that clearing the provider
+    // does NOT sign them out of Cursor itself.
+    //
+    // Codex R1 finding P3#5: (3) and (4) are LOAD-BEARING SEPARATE
+    // facts and must be pinned INDEPENDENTLY. A disjunction that
+    // accepted either alone would silently allow the other to vanish.
+    let disc = ProviderCopy.disclosure(for: "cursor")
+    expect(disc != nil)
+    // Private-API framing — Codex R2 finding P3#3: case-insensitive AND
+    // API-qualified. Bare "private" would false-positive on unrelated
+    // text; "Private API" (capitalised) would false-negative.
+    let discLower = disc?.lowercased() ?? ""
+    expect(
+        discLower.contains("not a public api") ||
+        discLower.contains("private api") ||
+        discLower.contains("undocumented api")
+    )
+    // May-break framing.
+    expect(disc?.contains("change") == true || disc?.contains("stop working") == true || disc?.contains("stop updating") == true)
+    // OAuth refresh flow via api2.cursor.sh.
+    expect(disc?.contains("api2.cursor.sh") == true)
+    expect(disc?.contains("refresh") == true || disc?.contains("Refresh") == true)
+    // The sign-in-again fallback tile — pinned by verbatim wording.
+    expect(disc?.contains("Sign in again in Cursor") == true)
+    // Clearing != revoking on Cursor — Codex R2 finding P3#2: pin the
+    // FULL non-revocation phrase. `contains("does not sign")` would
+    // also pass "does not sign in automatically" which drops the
+    // security-relevant fact.
+    expect(
+        disc?.contains("does not sign you out") == true ||
+        (disc?.contains("does not revoke") == true && disc?.contains("Cursor") == true)
+    )
+    // The remediation direction — sign in inside Cursor itself.
+    expect(disc?.contains("sign in inside Cursor") == true || disc?.contains("Sign in again in Cursor") == true)
+    // Codex R1 finding P2#3: the copy must cover BOTH failure modes —
+    // (a) refresh itself fails / logout, AND (b) refresh succeeds but
+    // the retried summary is still 401 (sticky sessionExpired). Pin
+    // both branches so a rewrite that dropped one is caught. Codex R2
+    // finding P3#1: `contains("retry")` is too generic ("retry signing
+    // in" would false-positive on the wrong fact); pin the retried-
+    // rejection semantics explicitly.
+    expect(disc?.contains("fails") == true || disc?.contains("logged out") == true || disc?.contains("reports 'logged out'") == true)
+    expect(
+        disc?.contains("still rejected") == true ||
+        disc?.contains("refreshed token is still rejected") == true ||
+        disc?.contains("second 401") == true
+    )
 }
 
 run("ProviderCopy: Claude Code disclosure states 'estimate not receipt' + unpriced-model behaviour (PR 10b-UI)") {

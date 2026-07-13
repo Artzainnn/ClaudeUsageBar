@@ -97,6 +97,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // $CLINE_DATA_DIR / $CLINE_DIR / ~/.cline/data. Nothing leaves
         // the machine. Backend from PR #69.
         providers.append(ProviderBox(ClineUsageStore()))
+        // PR 11-UI: register Windsurf. Opt-in
+        // (features.windsurf.enabled defaults false); pure-local
+        // — reads `Windsurf/User/globalStorage/state.vscdb` for the
+        // `windsurf.settings.cachedPlanInfo` row. Nothing leaves the
+        // machine; no key or paste required. Backend from PR #71.
+        providers.append(ProviderBox(WindsurfUsageStore()))
+        // PR 11-UI: register Cursor. Opt-in
+        // (features.cursor.enabled defaults false); hybrid — reads
+        // Cursor's own `state.vscdb` for the WorkOS session token,
+        // then fetches from cursor.com's dashboard API. On 401
+        // silently refreshes via api2.cursor.sh's OAuth endpoint;
+        // on double-401 surfaces a "sign in again in Cursor" tile.
+        // Backend from PR #71.
+        providers.append(ProviderBox(CursorUsageStore()))
         // Model SwiftUI observes for the generic (non-Anthropic) provider
         // tiles. Anthropic continues to render through usageManager directly.
         providersModel = ProvidersModel(providers: providers)
