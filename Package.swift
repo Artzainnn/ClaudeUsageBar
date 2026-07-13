@@ -102,9 +102,13 @@ let package = Package(
                 "ClaudeCodeUsageFetcher.swift",
                 "ClaudeCodeUsageStore.swift",
                 // PR 10c-BE — Cline local ui_messages.json reader.
-                // Reuses ClaudeCodeUsageFetcher.safeInt/readJsonlLines
-                // + ClaudeCodeUsageRecord.saturatingAdd + TCCProbe /
-                // FileWatcher / LocalProviderAccessGuide from PR #66.
+                // Reuses ClaudeCodeUsageFetcher.safeInt +
+                // ClaudeCodeUsageRecord.saturatingAdd + TCCProbe +
+                // LocalProviderAccessGuide from PRs #66/#67. Does NOT
+                // reuse ClaudeCodeUsageFetcher.readJsonlLines — Cline's
+                // ui_messages.json is a single JSON array (not JSONL),
+                // so the fetcher has its own `readClineUiMessagesText`
+                // helper with a 64 MB streaming reader.
                 "ClineUsageFetcher.swift",
                 "ClineUsageStore.swift"
                 // AnthropicUsageStore.swift depends on UsageManager

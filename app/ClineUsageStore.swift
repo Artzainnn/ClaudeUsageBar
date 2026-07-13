@@ -255,14 +255,16 @@ public final class ClineUsageStore: @preconcurrency UsageProvider {
         // usage from the readable roots, but we surface the partial-
         // access warning via `deniedRootsCount` on the snapshot for a
         // future diagnostic tile (kept as store state below).
+        // chk1 Bug #2: `pathMissing` roots are counted by the "if no
+        // granted and no denied" branch below via the `.pathMissing`
+        // aggregate state, so we do not need a separate counter here.
         var grantedRoots: [ClinePathResolver.ScanRoot] = []
         var deniedRoots: [ClinePathResolver.ScanRoot] = []
-        var pathMissingCount = 0
         for root in scanRoots {
             switch tccProbe(root.tasksDirectoryPath) {
             case .granted:      grantedRoots.append(root)
             case .denied:       deniedRoots.append(root)
-            case .pathMissing:  pathMissingCount += 1
+            case .pathMissing:  break
             }
         }
         let aggregated: TCCState

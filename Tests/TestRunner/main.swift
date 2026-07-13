@@ -5712,6 +5712,33 @@ run("Cline.parse: malformed text-field JSON is counted, not fatal") {
     expectEqual(mal, 1)
 }
 
+run("Cline.parse: non-object elements in the array are skipped, valid records survive (chk1 Bug #1)") {
+    // chk1 Bug #1 regression guard: casting the top-level to
+    // `[[String: Any]]` used to be all-or-nothing — a single `null` /
+    // string / number in the array collapsed the whole file to
+    // unreadable. Per-element guarding must skip the bad element and
+    // keep the good ones.
+    let goodMsg: [String: Any] = [
+        "type": "say",
+        "say": "api_req_started",
+        "ts": 1_784_000_400_000,
+        "text": "{\"tokensIn\":10,\"cost\":0.001}",
+    ]
+    let mixed: [Any] = [goodMsg, NSNull(), "just a string", 42, goodMsg]
+    let data = try! JSONSerialization.data(withJSONObject: mixed, options: [])
+    let contents = String(data: data, encoding: .utf8)!
+    var mal = 0
+    let recs = ClineUsageFetcher.parse(
+        uiMessages: contents,
+        sourceFile: "/tmp/mixed-elements.json",
+        malformedRecordCount: &mal
+    )
+    expect(recs != nil)
+    // Two valid records must survive around the null / string / int noise.
+    expectEqual(recs?.count, 2)
+    expectEqual(mal, 0)
+}
+
 run("Cline.parse: non-array top-level content returns nil") {
     var mal = 0
     let recs = ClineUsageFetcher.parse(uiMessages: "{\"not\":\"an array\"}", sourceFile: "/tmp/wrong.json", malformedRecordCount: &mal)

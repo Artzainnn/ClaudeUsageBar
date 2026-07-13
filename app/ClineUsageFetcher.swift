@@ -397,13 +397,20 @@ public struct ClineUsageFetcher: Sendable {
         sourceFile: String,
         malformedRecordCount: inout Int
     ) -> [ClineUsageRecord]? {
+        // chk1 Bug #1: cast to `[Any]` at the top level, then per-element
+        // `as? [String: Any]` guard. Casting straight to `[[String: Any]]`
+        // is all-or-nothing — a single `null` / string / number in the
+        // array collapses the entire file to unreadable. A schema drift
+        // or a hand-edited log would otherwise silently drop hundreds of
+        // valid records.
         guard let data = contents.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data),
-              let arr = obj as? [[String: Any]] else {
+              let anyArr = obj as? [Any] else {
             return nil
         }
         var out: [ClineUsageRecord] = []
-        for msg in arr {
+        for element in anyArr {
+            guard let msg = element as? [String: Any] else { continue }
             // Only `type == "say"` records carry usage.
             guard let type = msg["type"] as? String, type == "say" else { continue }
             guard let sayRaw = msg["say"] as? String,
@@ -546,14 +553,17 @@ public struct ClineUsageFetcher: Sendable {
         var buffer = Data()
         buffer.reserveCapacity(chunkSize * 2)
         while true {
+            // chk1 Bug #3: the fallback `readData(ofLength:)` branch was
+            // gated on `#available(macOS 10.15.4, *)` but the app targets
+            // macOS 12.0 (see `app/build.sh` — `-target arm64-apple-macos12.0`),
+            // so the branch was unreachable dead code AND its
+            // `readData(ofLength:)` raises Objective-C NSException on error
+            // (uncatchable in Swift), unlike the throwing
+            // `read(upToCount:)`. Deleted entirely.
             let chunk: Data
             do {
-                if #available(macOS 10.15.4, *) {
-                    guard let read = try handle.read(upToCount: chunkSize) else { break }
-                    chunk = read
-                } else {
-                    chunk = handle.readData(ofLength: chunkSize)
-                }
+                guard let read = try handle.read(upToCount: chunkSize) else { break }
+                chunk = read
             } catch {
                 return nil
             }
