@@ -10807,6 +10807,49 @@ run("ProviderCopy disclosure(for: 'zoo') calls out that Zoo is the active fork o
     expect(disc.contains("10 000"))
 }
 
+// MARK: - ProviderCopy id 'gemini' (PR 15-UI)
+
+run("ProviderCopy id 'gemini' matches GeminiUsageStore.id — exercises the real Settings path (PR 15-UI regression guard)") {
+    MainActor.assumeIsolated {
+        let store = GeminiUsageStore()
+        expect(ProviderCopy.help(for: store.id) != nil)
+        expect(ProviderCopy.disclosure(for: store.id) != nil)
+        let box = ProviderBox(store)
+        expect(ProviderCopy.help(for: box.id) != nil)
+        expect(ProviderCopy.disclosure(for: box.id) != nil)
+    }
+    expect(ProviderCopy.help(for: "gemini") != nil)
+    expect(ProviderCopy.disclosure(for: "gemini") != nil)
+    expect(ProviderCopy.help(for: "Gemini") == nil)
+    expect(ProviderCopy.help(for: "gemini-cli") == nil)
+    expect(ProviderCopy.help(for: "gemini-2.5-pro") == nil)
+}
+
+run("ProviderCopy help(for: 'gemini') mentions the actual JSONL path AND the env-var override") {
+    let help = ProviderCopy.help(for: "gemini")!
+    expect(help.contains("~/.gemini/tmp/"))
+    expect(help.contains("session-"))
+    expect(help.contains("GEMINI_CLI_HOME"))
+    // Names the priced model families so a copy edit that drops the
+    // pricing list is caught.
+    expect(help.contains("2.5 Pro"))
+    expect(help.contains("2.0 Flash-Lite") || help.contains("Flash-Lite"))
+    // Nothing-leaves-your-Mac posture is a load-bearing user promise.
+    expect(help.contains("Nothing leaves"))
+}
+
+run("ProviderCopy disclosure(for: 'gemini') mentions the pricing-estimate posture AND the 200k-tier limitation") {
+    let disc = ProviderCopy.disclosure(for: "gemini")!
+    expect(disc.contains("estimates") || disc.contains("Estimates"))
+    expect(disc.contains("not a receipt") || disc.contains("actual bill"))
+    // 3cc R2 F1 verification — pricing snapshot may drift.
+    expect(disc.contains("Pricing update available"))
+    // 200k tier limitation is a load-bearing accuracy disclosure.
+    expect(disc.contains("200k") || disc.contains("Tiered"))
+    // Explicit "server-side quota NOT read" so users don't expect it.
+    expect(disc.contains("serviceusage") || disc.contains("Server-side quota") || disc.contains("server-side quota"))
+}
+
 // MARK: - GeminiUsageFetcher (PR 15-BE)
 
 run("GeminiUsageFetcher.parseLine: happy path — gemini message with tokens block") {
