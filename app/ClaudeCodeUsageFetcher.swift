@@ -739,8 +739,17 @@ public struct ClaudeCodeUsageFetcher: Sendable {
     /// simply won't bucket the record into today/MTD). Public so the
     /// test suite can exercise the parser against synthetic inputs.
     public static func parseTimestamp(_ raw: String) -> Date? {
-        if let d = isoFormatter.date(from: raw) { return d }
-        return isoFormatterNoFractional.date(from: raw)
+        let d = isoFormatter.date(from: raw) ?? isoFormatterNoFractional.date(from: raw)
+        guard let d = d else { return nil }
+        // PR 13-BE 3cc R1 F10 / R3 F18: clamp to [year2000, year2100).
+        // Outside this range the value is a schema break, not real
+        // usage; nil makes the record un-bucketable rather than
+        // corrupting today / MTD sums.
+        let sec = d.timeIntervalSince1970
+        let year2000: TimeInterval = 946_684_800   // 2000-01-01T00:00:00Z
+        let year2100: TimeInterval = 4_102_444_800 // 2100-01-01T00:00:00Z
+        guard sec >= year2000 && sec < year2100 else { return nil }
+        return d
     }
 
     /// Best-effort integer extraction. Accepts Int, Double, and
@@ -750,6 +759,13 @@ public struct ClaudeCodeUsageFetcher: Sendable {
     /// cost line. Public so tests can exercise the clamp against
     /// hostile inputs (NaN, infinity, 1e300, negatives).
     public static func safeInt(_ value: Any?) -> Int {
+        // PR 13-BE 3cc R3 F8: reject Bool early. Bool bridges to
+        // NSNumber which as-casts to Int as 1, silently coercing a
+        // JSON `true` into a token count of 1. A numeric field must
+        // never accept a Bool. This must precede the `as? Int` cast
+        // because Bool → NSNumber → Int can accidentally succeed as
+        // 1 via bridging.
+        if value is Bool { return 0 }
         if let i = value as? Int { return max(0, i) }
         if let d = value as? Double, d.isFinite {
             let rounded = d.rounded()

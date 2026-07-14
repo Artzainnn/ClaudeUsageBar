@@ -5051,6 +5051,15 @@ run("ClaudeCodeUsageFetcher.safeInt: Double at Int.max boundary clamps to Int.ma
     expectEqual(ClaudeCodeUsageFetcher.safeInt(boundary), Int.max)
 }
 
+run("ClaudeCodeUsageFetcher.safeInt: Bool rejected as 0 (PR 13-BE 3cc R3 F8)") {
+    // A JSON `true` bridges to NSNumber which as-casts to Int as 1.
+    // safeInt must reject via `is Bool` before the Int cast, otherwise
+    // a hostile Continue log with `promptTokens: true` silently
+    // becomes 1 token instead of 0.
+    expectEqual(ClaudeCodeUsageFetcher.safeInt(true), 0)
+    expectEqual(ClaudeCodeUsageFetcher.safeInt(false), 0)
+}
+
 // MARK: - ClaudeCodeUsageRecord.saturatingAdd (Codex round-1 finding #3/4)
 
 run("ClaudeCodeUsageRecord.saturatingAdd: normal addition") {
@@ -5345,6 +5354,19 @@ run("ClaudeCodeUsageFetcher.parseTimestamp: ISO8601 with fractional seconds") {
 run("ClaudeCodeUsageFetcher.parseTimestamp: ISO8601 without fractional seconds") {
     let d = ClaudeCodeUsageFetcher.parseTimestamp("2026-07-13T04:00:00Z")
     expect(d != nil)
+}
+
+run("ClaudeCodeUsageFetcher.parseTimestamp: out-of-bounds year clamped nil (PR 13-BE 3cc R1 F10 / R3 F18)") {
+    // Below year2000 floor.
+    expect(ClaudeCodeUsageFetcher.parseTimestamp("1999-12-31T23:59:59Z") == nil)
+    expect(ClaudeCodeUsageFetcher.parseTimestamp("1970-01-01T00:00:00Z") == nil)
+    // At year2100 ceiling (exclusive).
+    expect(ClaudeCodeUsageFetcher.parseTimestamp("2100-01-01T00:00:00Z") == nil)
+    expect(ClaudeCodeUsageFetcher.parseTimestamp("2150-06-15T12:00:00Z") == nil)
+    // Inside range.
+    expect(ClaudeCodeUsageFetcher.parseTimestamp("2050-06-15T12:00:00Z") != nil)
+    expect(ClaudeCodeUsageFetcher.parseTimestamp("2000-01-01T00:00:00Z") != nil)
+    expect(ClaudeCodeUsageFetcher.parseTimestamp("2099-12-31T23:59:59Z") != nil)
 }
 
 run("ClaudeCodeUsageFetcher.parseTimestamp: garbage returns nil") {
