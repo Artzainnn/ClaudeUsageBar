@@ -1,0 +1,157 @@
+# Auto-update ARCHITECTURE.md on every push to main.
+#
+# Uses the Anthropic API (Claude Sonnet) to re-scan the codebase and
+# regenerate ARCHITECTURE.md. Commits the updated file back to main
+# with `[skip ci]` so it doesn't recurse.
+#
+# Prerequisites:
+# - Repo secret `ANTHROPIC_API_KEY` (set via Settings → Secrets and
+#   variables → Actions → New repository secret).
+#
+# Does NOT run on push to feature branches — the file is refreshed
+# once, after merge, so PR diffs never fight over its contents.
+
+name: Update ARCHITECTURE.md
+
+on:
+  push:
+    branches: [main]
+    paths:
+      # Only re-generate when actual code changes land. Doc-only or
+      # workflow-only pushes skip the job.
+      - 'app/**/*.swift'
+      - 'app/build.sh'
+      - 'Package.swift'
+      - 'Tests/**/*.swift'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-architecture
+  cancel-in-progress: false
+
+jobs:
+  update-architecture:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Use a token that can push back to main. GITHUB_TOKEN has
+          # write access by default when `permissions: contents: write`
+          # is set above.
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify ANTHROPIC_API_KEY is set
+        env:
+          KEY_PRESENT: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+        run: |
+          if [ "$KEY_PRESENT" != "true" ]; then
+            echo "::error::ANTHROPIC_API_KEY not set. Add it via Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+
+      - name: Collect codebase snapshot
+        id: snapshot
+        run: |
+          set -euo pipefail
+          # Filenames are attacker-controlled at commit time (anyone
+          # with main-branch write access — the same trust boundary as
+          # the workflow itself). To defend against filenames
+          # containing spaces, newlines, or shell metacharacters, use
+          # -print0 + read -d '' throughout (never `for f in $(find …)`).
+          {
+            echo "## Directory tree"
+            find app Tests .github -type f \( -name '*.swift' -o -name '*.yml' -o -name '*.sh' \) -print0 \
+              | sort -z | tr '\0' '\n'
+            echo ""
+            echo "## Source files (line-counted)"
+            # `wc` handles the trailing "total" line for us.
+            find app Tests -name '*.swift' -print0 \
+              | xargs -0 wc -l 2>/dev/null | tail -50
+            echo ""
+            echo "## Recent commits (last 30)"
+            git log --oneline -30
+            echo ""
+            echo "## Every Swift file, contents"
+            while IFS= read -r -d '' f; do
+              printf '### %s\n' "$f"
+              printf '```swift\n'
+              cat -- "$f"
+              printf '```\n\n'
+            done < <(find app -name '*.swift' -print0 | sort -z)
+          } > /tmp/codebase-snapshot.md
+          # Guard against runaway snapshot size (10 MB cap).
+          size=$(wc -c < /tmp/codebase-snapshot.md)
+          if [ "$size" -gt 10485760 ]; then
+            echo "::warning::Codebase snapshot is ${size} bytes — truncating to 10 MB."
+            head -c 10485760 /tmp/codebase-snapshot.md > /tmp/codebase-snapshot.truncated.md
+            mv /tmp/codebase-snapshot.truncated.md /tmp/codebase-snapshot.md
+          fi
+          echo "snapshot_bytes=$size" >> "$GITHUB_OUTPUT"
+
+      - name: Call Anthropic API to regenerate ARCHITECTURE.md
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+          # Build the JSON payload with jq to avoid shell-quoting hell.
+          # System prompt tells Claude to preserve the section
+          # structure and update only content that has changed.
+          existing=$(cat ARCHITECTURE.md 2>/dev/null || echo "(none — first generation)")
+          snapshot=$(cat /tmp/codebase-snapshot.md)
+
+          jq -n \
+            --arg system "You are updating a project's ARCHITECTURE.md. The file has 16 numbered sections: Project Overview, Directory Structure, Architecture Pattern, Core Components, Data Flow, Database Schema, API Layer, State Management, Authentication & Authorization, Configuration, Key Abstractions, Error Handling, Testing, Build & Deployment, Integrations, Cross-Cutting Concerns. Preserve this section structure. Only update content that has actually changed. If a section is still accurate, leave its text unchanged. Return ONLY the full new ARCHITECTURE.md body — no preamble, no code fences." \
+            --arg existing "$existing" \
+            --arg snapshot "$snapshot" \
+            '{
+              model: "claude-sonnet-4-6",
+              max_tokens: 16000,
+              system: $system,
+              messages: [
+                {
+                  role: "user",
+                  content: "Existing ARCHITECTURE.md:\n\n\($existing)\n\n---\n\nCurrent codebase snapshot:\n\n\($snapshot)\n\n---\n\nReturn the full updated ARCHITECTURE.md."
+                }
+              ]
+            }' > /tmp/anthropic-payload.json
+
+          curl -fsSL \
+            -X POST https://api.anthropic.com/v1/messages \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: ${ANTHROPIC_API_KEY}" \
+            -H "anthropic-version: 2023-06-01" \
+            -d @/tmp/anthropic-payload.json > /tmp/anthropic-response.json
+
+          # Extract the response body.
+          jq -r '.content[0].text' /tmp/anthropic-response.json > ARCHITECTURE.md
+
+          # Sanity check: response is at least 500 bytes and has the
+          # expected section headings.
+          size=$(wc -c < ARCHITECTURE.md)
+          if [ "$size" -lt 500 ]; then
+            echo "::error::Anthropic response too small (${size} bytes). Not committing."
+            cat ARCHITECTURE.md >&2
+            exit 1
+          fi
+          if ! grep -qE '## 1\. Project Overview' ARCHITECTURE.md; then
+            echo "::error::Anthropic response missing '## 1. Project Overview' — refusing to commit."
+            exit 1
+          fi
+
+      - name: Commit if changed
+        run: |
+          set -euo pipefail
+          git config user.name  'ARCHITECTURE.md updater'
+          git config user.email 'noreply@github.com'
+          if git diff --quiet ARCHITECTURE.md; then
+            echo "No ARCHITECTURE.md changes to commit."
+            exit 0
+          fi
+          git add ARCHITECTURE.md
+          git commit -m "docs: auto-update ARCHITECTURE.md [skip ci]"
+          git push
