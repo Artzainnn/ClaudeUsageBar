@@ -16,7 +16,7 @@ import SwiftUI
 import Combine
 
 @MainActor
-public final class ZooUsageStore: @preconcurrency UsageProvider {
+public final class ZooUsageStore: UsageProvider {
 
     public let id: String = "zoo"
     public let displayName: String = "Zoo Code"

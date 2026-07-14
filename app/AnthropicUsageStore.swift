@@ -25,7 +25,7 @@ import Combine
 // Under Swift 5 mode (current) this is a no-op; under Swift 6 it lets us
 // stage the migration one provider at a time.
 @MainActor
-final class AnthropicUsageStore: @preconcurrency UsageProvider {
+final class AnthropicUsageStore: UsageProvider {
 
     let id: String = "anthropic"
     let displayName: String = "Claude (Anthropic)"

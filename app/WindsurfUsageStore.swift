@@ -19,7 +19,7 @@ import SwiftUI
 import Combine
 
 @MainActor
-public final class WindsurfUsageStore: @preconcurrency UsageProvider {
+public final class WindsurfUsageStore: UsageProvider {
 
     public let id: String = "windsurf"
     public let displayName: String = "Windsurf"

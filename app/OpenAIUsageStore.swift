@@ -15,7 +15,7 @@ import SwiftUI
 import Combine
 
 @MainActor
-public final class OpenAIUsageStore: @preconcurrency UsageProvider, PasteKeyProvider {
+public final class OpenAIUsageStore: UsageProvider, PasteKeyProvider {
 
     public let id: String = "openai"
     public let displayName: String = "OpenAI Platform"

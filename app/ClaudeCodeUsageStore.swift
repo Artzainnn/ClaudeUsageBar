@@ -38,7 +38,7 @@ import SwiftUI
 import Combine
 
 @MainActor
-public final class ClaudeCodeUsageStore: @preconcurrency UsageProvider {
+public final class ClaudeCodeUsageStore: UsageProvider {
 
     public let id: String = "claudeCode"
     public let displayName: String = "Claude Code"

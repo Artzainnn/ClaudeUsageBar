@@ -722,12 +722,18 @@ public struct ClaudeCodeUsageFetcher: Sendable {
 
     // MARK: - Timestamp parsing
 
-    private static let isoFormatter: ISO8601DateFormatter = {
+    // PR 16 — `nonisolated(unsafe)`: `ISO8601DateFormatter` is not
+    // `Sendable`, but its instance methods `date(from:)` and
+    // `string(from:)` are documented thread-safe on Darwin (backed by
+    // Foundation's `CFDateFormatter`). We initialise once and read
+    // concurrently; formatOptions is set only inside the initialiser
+    // closure and is never mutated after. Audit re-verified 2026-07-15.
+    nonisolated(unsafe) private static let isoFormatter: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return f
     }()
-    private static let isoFormatterNoFractional: ISO8601DateFormatter = {
+    nonisolated(unsafe) private static let isoFormatterNoFractional: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime]
         return f

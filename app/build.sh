@@ -88,7 +88,8 @@ swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_arm64" \
     -framework SwiftUI \
     -framework AppKit \
     -framework WebKit \
-    -target arm64-apple-macos12.0
+    -target arm64-apple-macos12.0 \
+    -swift-version 6
 
 # Compile for x86_64 (Intel)
 swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_x86_64" \
@@ -140,7 +141,8 @@ swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_x86_64" \
     -framework SwiftUI \
     -framework AppKit \
     -framework WebKit \
-    -target x86_64-apple-macos12.0
+    -target x86_64-apple-macos12.0 \
+    -swift-version 6
 
 # Create universal binary
 lipo -create -output "$APP_PATH/Contents/MacOS/ClaudeUsageBar" \

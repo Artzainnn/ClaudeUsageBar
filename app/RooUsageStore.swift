@@ -24,7 +24,7 @@ import SwiftUI
 import Combine
 
 @MainActor
-public final class RooUsageStore: @preconcurrency UsageProvider {
+public final class RooUsageStore: UsageProvider {
 
     public let id: String = "roo"
     public let displayName: String = "Roo Code"

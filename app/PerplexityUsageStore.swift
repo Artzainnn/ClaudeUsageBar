@@ -21,7 +21,7 @@ import SwiftUI
 import Combine
 
 @MainActor
-public final class PerplexityUsageStore: @preconcurrency UsageProvider, PasteKeyProvider {
+public final class PerplexityUsageStore: UsageProvider, PasteKeyProvider {
 
     public let id: String = "perplexity"
     public let displayName: String = "Perplexity"

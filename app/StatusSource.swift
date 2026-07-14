@@ -158,12 +158,14 @@ internal enum StatuspageV2Parser {
         )
     }
 
-    private static let isoFormatter: ISO8601DateFormatter = {
+    // PR 16 — `nonisolated(unsafe)` documents the thread-safe read
+    // pattern (formatOptions set once in closure init, never mutated).
+    nonisolated(unsafe) private static let isoFormatter: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return f
     }()
-    private static let isoFormatterNoFractional: ISO8601DateFormatter = {
+    nonisolated(unsafe) private static let isoFormatterNoFractional: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime]
         return f
@@ -366,12 +368,13 @@ internal enum GoogleCloudStatusParser {
         }
     }
 
-    private static let iso: ISO8601DateFormatter = {
+    // PR 16 — same pattern as StatuspageV2Parser above.
+    nonisolated(unsafe) private static let iso: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return f
     }()
-    private static let isoNoFrac: ISO8601DateFormatter = {
+    nonisolated(unsafe) private static let isoNoFrac: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime]
         return f

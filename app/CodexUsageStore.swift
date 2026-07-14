@@ -32,7 +32,7 @@ import Combine
 // actor-isolation checking until PR 16 migrates the protocol to @MainActor —
 // identical staging to AnthropicUsageStore.
 @MainActor
-public final class CodexUsageStore: @preconcurrency UsageProvider {
+public final class CodexUsageStore: UsageProvider {
 
     public let id: String = "codex"
     public let displayName: String = "Codex (OpenAI)"

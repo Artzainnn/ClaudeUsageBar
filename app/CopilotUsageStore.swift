@@ -18,7 +18,7 @@ import SwiftUI
 import Combine
 
 @MainActor
-public final class CopilotUsageStore: @preconcurrency UsageProvider, PasteKeyProvider {
+public final class CopilotUsageStore: UsageProvider, PasteKeyProvider {
 
     public let id: String = "copilot"
     public let displayName: String = "GitHub Copilot"

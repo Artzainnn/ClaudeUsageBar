@@ -1,4 +1,4 @@
-// swift-tools-version:5.9
+// swift-tools-version:6.0
 //
 // SwiftPM manifest — additive scaffolding for testing, not a replacement for
 // the existing build path.
@@ -168,12 +168,22 @@ let package = Package(
                 // Parser tests would need duplicated struct
                 // definitions in the library, which is not worth the
                 // maintenance tax.
-            ]
+            ],
+            swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .executableTarget(
             name: "TestRunner",
             dependencies: ["ClaudeUsageBar"],
-            path: "Tests/TestRunner"
+            path: "Tests/TestRunner",
+            // PR 16: TestRunner stays in Swift 5 language mode. The
+            // 992-line assertion harness uses top-level mutable
+            // counters (`total`, `failed`) that Swift 6's strict
+            // concurrency would require wrapping in @MainActor boxes
+            // across every closure. The library target (which ships
+            // as the .app) is Swift 6 language mode; the test target
+            // is fine to stay on 5 because it's not distributed.
+            // Follow-up: refactor into a Swift-6-clean harness.
+            swiftSettings: [.swiftLanguageMode(.v5)]
         )
     ]
 )

@@ -20,7 +20,7 @@ import SwiftUI
 import Combine
 
 @MainActor
-public final class ContinueUsageStore: @preconcurrency UsageProvider {
+public final class ContinueUsageStore: UsageProvider {
 
     public let id: String = "continue"
     public let displayName: String = "Continue"

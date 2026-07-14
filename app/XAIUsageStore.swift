@@ -14,7 +14,7 @@ import SwiftUI
 import Combine
 
 @MainActor
-public final class XAIUsageStore: @preconcurrency UsageProvider, PasteKeyProvider, SecondaryKeyProvider {
+public final class XAIUsageStore: UsageProvider, PasteKeyProvider, SecondaryKeyProvider {
 
     public let id: String = "xai"
     public let displayName: String = "xAI (Grok)"

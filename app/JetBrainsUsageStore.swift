@@ -21,7 +21,7 @@ import SwiftUI
 import Combine
 
 @MainActor
-public final class JetBrainsUsageStore: @preconcurrency UsageProvider {
+public final class JetBrainsUsageStore: UsageProvider {
 
     public let id: String = "jetbrains"
     public let displayName: String = "JetBrains AI"

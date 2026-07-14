@@ -20,7 +20,7 @@ import SwiftUI
 import Combine
 
 @MainActor
-public final class DeepSeekUsageStore: @preconcurrency UsageProvider, PasteKeyProvider {
+public final class DeepSeekUsageStore: UsageProvider, PasteKeyProvider {
 
     public let id: String = "deepseek"
     public let displayName: String = "DeepSeek"

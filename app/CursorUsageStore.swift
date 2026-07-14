@@ -32,7 +32,7 @@ import SwiftUI
 import Combine
 
 @MainActor
-public final class CursorUsageStore: @preconcurrency UsageProvider {
+public final class CursorUsageStore: UsageProvider {
 
     public let id: String = "cursor"
     public let displayName: String = "Cursor"

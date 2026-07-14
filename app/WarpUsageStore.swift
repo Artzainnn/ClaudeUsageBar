@@ -21,7 +21,7 @@ import SwiftUI
 import Combine
 
 @MainActor
-public final class WarpUsageStore: @preconcurrency UsageProvider {
+public final class WarpUsageStore: UsageProvider {
 
     public let id: String = "warp"
     public let displayName: String = "Warp"

@@ -20,7 +20,7 @@ import SwiftUI
 import Combine
 
 @MainActor
-public final class ClineUsageStore: @preconcurrency UsageProvider {
+public final class ClineUsageStore: UsageProvider {
 
     public let id: String = "cline"
     public let displayName: String = "Cline"

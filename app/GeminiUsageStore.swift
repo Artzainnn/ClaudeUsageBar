@@ -13,7 +13,7 @@ import SwiftUI
 import Combine
 
 @MainActor
-public final class GeminiUsageStore: @preconcurrency UsageProvider {
+public final class GeminiUsageStore: UsageProvider {
 
     public let id: String = "gemini"
     public let displayName: String = "Gemini CLI"

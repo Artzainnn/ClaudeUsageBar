@@ -10,7 +10,8 @@ import Combine
 // app/build.sh into the final .app bundle.
 
 // Main entry point
-class AppDelegate: NSObject, NSApplicationDelegate {
+@MainActor
+class AppDelegate: NSObject, @preconcurrency NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var popover: NSPopover!
     var usageManager: UsageManager!
@@ -465,6 +466,7 @@ struct Main {
     }
 }
 
+@MainActor
 class UsageManager: ObservableObject {
     @Published var sessionUsage: Int = 0
     @Published var sessionLimit: Int = 100
@@ -877,6 +879,7 @@ private let defaultTrackedComponentIdSet: Set<String> = Set(
     defaultTrackedComponents.map { $0.id }.filter { $0 != "c-claude-gov" }
 )
 
+@MainActor
 class StatusManager: ObservableObject {
     @Published var indicator: String = "none"        // none | minor | major | critical (raw, global)
     @Published var statusDescription: String = "All systems operational"
@@ -1083,6 +1086,7 @@ struct Announcement: Equatable {
     let notifBody: String         // fully custom notification body
 }
 
+@MainActor
 class UpdateManager: ObservableObject {
     @Published var available: AvailableUpdate?
     @Published var announcement: Announcement?
@@ -1095,18 +1099,18 @@ class UpdateManager: ObservableObject {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
     }
 
-    private static let allowedHostSuffixes = [
+    nonisolated private static let allowedHostSuffixes = [
         "github.com",
         "claudeusagebar.com"
     ]
 
-    static func isSafeURL(_ url: URL) -> Bool {
+    nonisolated static func isSafeURL(_ url: URL) -> Bool {
         guard url.scheme == "https" else { return false }
         guard let host = url.host?.lowercased() else { return false }
         return allowedHostSuffixes.contains(where: { host == $0 || host.hasSuffix("." + $0) })
     }
 
-    private static func parseButtons(from json: [String: Any]) -> [BannerButton] {
+    nonisolated private static func parseButtons(from json: [String: Any]) -> [BannerButton] {
         // Explicit `buttons` array (new schema, supports any combination)
         if let raw = json["buttons"] as? [[String: Any]] {
             return raw.compactMap { dict -> BannerButton? in
@@ -1424,18 +1428,18 @@ final class ProvidersModel: ObservableObject {
     }
 
     /// The subset of generic providers the user has enabled via Settings.
-    /// Reads each provider's `isEnabled` through the `any UsageProvider`
-    /// existential, whose protocol is not @MainActor (the stores add it with
-    /// @preconcurrency), so this stays nonisolated.
-    nonisolated var enabledGenericProviders: [ProviderBox] {
+    /// PR 16 note: `UsageProvider` is now `@MainActor` on the protocol, so
+    /// reading `provider.isEnabled` (which forwards to `defaults.bool(...)`
+    /// via the main-actor-isolated conformance) requires main-actor
+    /// isolation here too.
+    var enabledGenericProviders: [ProviderBox] {
         genericProviders.filter { $0.provider.isEnabled }
     }
 
     /// Fetch every enabled non-Anthropic provider. Called on launch, on the
     /// 60s timer, when the popover opens, and from the Refresh button — all
-    /// on the main thread in practice. `nonisolated` so those synchronous
-    /// call sites do not need per-site actor hops.
-    nonisolated func fetchEnabled() {
+    /// on the main thread in practice.
+    func fetchEnabled() {
         for box in enabledGenericProviders {
             box.provider.fetch()
         }
@@ -1452,7 +1456,12 @@ final class ProvidersModel: ObservableObject {
 }
 
 private struct ContentHeightKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
+    // PR 16: PreferenceKey.defaultValue requires a static var by
+    // protocol contract, but SwiftUI never mutates it — it's read
+    // once as the identity element for reduction. `nonisolated(unsafe)`
+    // documents this: the value is a constant 0 that SwiftUI reads
+    // concurrently but never writes.
+    nonisolated(unsafe) static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = max(value, nextValue())
     }

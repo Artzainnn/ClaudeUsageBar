@@ -106,7 +106,14 @@ public struct UsageTile: Identifiable, Equatable, Sendable {
 /// Perplexity, Copilot, local-file readers) conforms to this protocol.
 /// Providers are held in `AppDelegate.providers` as a heterogeneous
 /// collection wrapped in `ProviderBox` for SwiftUI observation.
-public protocol UsageProvider: AnyObject, ObservableObject {
+/// PR 16 note: `@MainActor` on the protocol so every conformance
+/// site is main-actor-isolated by default (no need for
+/// `@preconcurrency`). `Sendable` added so `ProviderBox.provider`
+/// can be declared `nonisolated let`. Every conformer is a
+/// `@MainActor final class`, so mutable state is actor-confined
+/// and the Sendable contract is satisfied.
+@MainActor
+public protocol UsageProvider: AnyObject, ObservableObject, Sendable {
     /// Stable identifier used for feature flags, notification-threshold
     /// tracking, and log correlation. Examples: "anthropic", "codex",
     /// "deepseek".
