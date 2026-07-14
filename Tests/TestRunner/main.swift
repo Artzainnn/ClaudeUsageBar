@@ -9880,6 +9880,147 @@ run("ContinueUsageFetcher.parse: parses full file with malformed line + non-toke
     expect(byModel.count == 2)
 }
 
+// MARK: - ContinueUsageStore (PR 13-BE)
+
+MainActor.assumeIsolated {
+
+    @MainActor func makeContinueStore(
+        flagEnabled: Bool = true,
+        tccState: TCCState = .granted,
+        files: [URL] = [],
+        snapshot: ContinueUsageSnapshot = ContinueUsageSnapshot(records: []),
+        now: Date = Date()
+    ) -> ContinueUsageStore {
+        let defaults = UserDefaults(suiteName: "continue-test-\(UUID().uuidString)")!
+        defaults.set(flagEnabled, forKey: "features.continue.enabled")
+        let filesCopy = files
+        let snapshotCopy = snapshot
+        let nowCopy = now
+        return ContinueUsageStore(
+            defaults: defaults,
+            resolveScanRoots: { [ContinuePathResolver.ScanRoot(id: "Continue", jsonlPath: "/tmp/fake.jsonl")] },
+            tccProbe: { _ in tccState },
+            discoverFiles: { _ in filesCopy },
+            parseFiles: { _ in snapshotCopy },
+            clock: { nowCopy }
+        )
+    }
+
+    @MainActor func awaitContinueFetch() {
+        let deadline = Date().addingTimeInterval(2.0)
+        while Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
+    }
+
+    run("ContinueUsageStore: feature-flag off produces no tiles") {
+        let store = makeContinueStore(flagEnabled: false)
+        expectEqual(store.tiles.count, 0)
+        expect(!store.isEnabled)
+        expect(!store.isConfigured)
+        store.fetch()
+        expect(store.snapshot == nil)
+    }
+
+    run("ContinueUsageStore: TCC .denied renders needsAccess tile only") {
+        let store = makeContinueStore(flagEnabled: true, tccState: .denied)
+        store.fetch()
+        awaitContinueFetch()
+        let tiles = store.tiles
+        expectEqual(tiles.count, 1)
+        expectEqual(tiles.first?.id, "continue-needs-access")
+    }
+
+    run("ContinueUsageStore: TCC .pathMissing renders 'not installed' tile") {
+        let store = makeContinueStore(flagEnabled: true, tccState: .pathMissing)
+        store.fetch()
+        awaitContinueFetch()
+        let tiles = store.tiles
+        expectEqual(tiles.count, 1)
+        expectEqual(tiles.first?.id, "continue-not-installed")
+    }
+
+    run("ContinueUsageStore: granted + empty snapshot -> loading tile") {
+        let store = makeContinueStore(flagEnabled: true, tccState: .granted)
+        // Before fetch runs, tccState defaults to .granted and snapshot is nil.
+        let tiles = store.tiles
+        expectEqual(tiles.count, 1)
+        expectEqual(tiles.first?.id, "continue-loading")
+    }
+
+    run("ContinueUsageStore: fetch populates snapshot and emits usage tiles") {
+        let now = ClaudeCodeUsageFetcher.parseTimestamp("2026-07-15T14:00:00Z")!
+        let rec = ContinueUsageRecord(
+            model: "gpt-5", provider: "openai", timestamp: now,
+            promptTokens: 1000, generatedTokens: 500, sourceFile: "/tmp/fake.jsonl"
+        )
+        let snap = ContinueUsageSnapshot(records: [rec])
+        let store = makeContinueStore(
+            flagEnabled: true, tccState: .granted,
+            files: [URL(fileURLWithPath: "/tmp/fake.jsonl")],
+            snapshot: snap,
+            now: now
+        )
+        store.fetch()
+        awaitContinueFetch()
+
+        expect(store.snapshot != nil)
+        expect(store.lastUpdatedAt != nil)
+
+        let tiles = store.tiles
+        let ids = Set(tiles.map { $0.id })
+        expect(ids.contains("continue-tokens-today"))
+        expect(ids.contains("continue-tokens-mtd"))
+        expect(ids.contains("continue-by-model"))
+        expect(ids.contains("continue-by-provider"))
+    }
+
+    run("ContinueUsageStore: clear() drops snapshot and lastUpdated") {
+        let now = ClaudeCodeUsageFetcher.parseTimestamp("2026-07-15T14:00:00Z")!
+        let rec = ContinueUsageRecord(
+            model: "gpt-5", provider: "openai", timestamp: now,
+            promptTokens: 100, generatedTokens: 50, sourceFile: "/x"
+        )
+        let store = makeContinueStore(
+            flagEnabled: true, tccState: .granted,
+            files: [URL(fileURLWithPath: "/tmp/fake.jsonl")],
+            snapshot: ContinueUsageSnapshot(records: [rec]),
+            now: now
+        )
+        store.fetch()
+        awaitContinueFetch()
+        expect(store.snapshot != nil)
+        store.clear()
+        expect(store.snapshot == nil)
+        expect(store.lastUpdatedAt == nil)
+    }
+
+    run("ContinueUsageStore: diagnostic tile surfaces malformed / unreadable / overCap counts") {
+        let now = ClaudeCodeUsageFetcher.parseTimestamp("2026-07-15T14:00:00Z")!
+        let rec = ContinueUsageRecord(
+            model: "m", provider: "p", timestamp: now,
+            promptTokens: 1, generatedTokens: 1, sourceFile: "/x"
+        )
+        let snap = ContinueUsageSnapshot(
+            records: [rec],
+            malformedRecordCount: 3,
+            unreadableFileCount: 1,
+            overCapFileCount: 1
+        )
+        let store = makeContinueStore(
+            flagEnabled: true, tccState: .granted,
+            files: [URL(fileURLWithPath: "/tmp/fake.jsonl")],
+            snapshot: snap,
+            now: now
+        )
+        store.fetch()
+        awaitContinueFetch()
+        let tiles = store.tiles
+        expect(tiles.contains { $0.id == "continue-diagnostics" })
+    }
+
+}  // end MainActor.assumeIsolated for ContinueUsageStore
+
 // MARK: - Summary
 
 print("")
