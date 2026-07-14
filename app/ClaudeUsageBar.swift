@@ -197,6 +197,11 @@ class AppDelegate: NSObject, @preconcurrency NSApplicationDelegate {
         // Fetch initial data
         usageManager.fetchUsage()
         statusManager.fetch()
+        // PR 20 — also kick off the extra status-source fetches for
+        // any user-enabled providers (OpenAI / GitHub / xAI / Google
+        // Cloud). All feature-flag off by default so this is a no-op
+        // for the default user.
+        statusManager.fetchExtraSources()
         updateManager.fetch()
         // Fetch any enabled non-Anthropic providers (Codex, etc.) on launch.
         providersModel.fetchEnabled()
@@ -208,9 +213,13 @@ class AppDelegate: NSObject, @preconcurrency NSApplicationDelegate {
         }
 
         // Usage + Anthropic status are time-sensitive — poll every 5 min.
+        // PR 20 — extra status sources ride the same 5-minute
+        // cadence as Anthropic; they update infrequently, and there's
+        // no benefit to polling faster.
         Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { _ in
             self.usageManager.fetchUsage()
             self.statusManager.fetch()
+            self.statusManager.fetchExtraSources()
         }
 
         // App updates are infrequent (new release at most weekly) — poll every 3 hours.
@@ -895,6 +904,96 @@ class StatusManager: ObservableObject {
 
     // Canonical URL (status.anthropic.com 302-redirects here)
     private let endpoint = URL(string: "https://status.claude.com/api/v2/summary.json")!
+
+    // PR 20 — multi-status extension. Each additional source (OpenAI,
+    // GitHub, xAI, Google Cloud) polls independently when its
+    // feature flag is on. The Anthropic path above is unchanged.
+    //
+    // `extraSources` is the static list of enabled sources; the
+    // corresponding snapshots live in `extraSnapshots` keyed by
+    // source.id. A card renders for every source whose snapshot has
+    // been populated at least once (empty snapshots suppress the
+    // card so the popover doesn't show noise on cold start).
+    @Published var extraSnapshots: [String: StatusSnapshot] = [:]
+    // Last-notified per-source indicator, keyed by source.id. Used
+    // for the notification-on-transition path.
+    private var lastNotifiedIndicators: [String: String] = [:]
+
+    /// Registered non-Anthropic status sources. Order matters — cards
+    /// render in this order. Every source is behind a feature flag
+    /// (`features.status.<id>.enabled`).
+    static let extraSources: [any StatusSource] = [
+        StatuspageV2Source.openai,
+        StatuspageV2Source.github,
+        StatuspageV2Source.xai,
+        GoogleCloudStatusSource(),
+    ]
+
+    /// Subset of `extraSources` enabled by the user.
+    var enabledExtraSources: [any StatusSource] {
+        Self.extraSources.filter { source in
+            UserDefaults.standard.bool(forKey: source.featureFlagKey)
+        }
+    }
+
+    /// Rendered cards for every enabled source that has a
+    /// non-empty snapshot. Consumers get `(source, snapshot)` pairs
+    /// in the static extraSources order.
+    var extraStatusCards: [(source: any StatusSource, snapshot: StatusSnapshot)] {
+        enabledExtraSources.compactMap { source in
+            guard let snap = extraSnapshots[source.id],
+                  !snap.indicator.isEmpty else { return nil }
+            return (source, snap)
+        }
+    }
+
+    /// Kick off a fetch of every ENABLED extra source. Each source
+    /// completes on an arbitrary queue; results apply on the main
+    /// actor. Failed fetches deliver an empty snapshot which we
+    /// ignore (do not overwrite a good prior snapshot with an empty
+    /// one).
+    func fetchExtraSources() {
+        for source in enabledExtraSources {
+            let sourceId = source.id
+            let sourceLabel = source.displayName
+            source.fetch { [weak self] snap in
+                Task { @MainActor [weak self] in
+                    guard let self = self else { return }
+                    // An empty snapshot indicates the source's own
+                    // fetch failed. Keep the prior snapshot in place
+                    // rather than showing an empty card.
+                    guard !snap.indicator.isEmpty else { return }
+                    let previous = self.extraSnapshots[sourceId]?.indicator
+                    self.extraSnapshots[sourceId] = snap
+                    // Notification-on-transition, gated by
+                    // `status_notifications_enabled` (same key as
+                    // Anthropic).
+                    if let previous = previous, previous != snap.indicator,
+                       UserDefaults.standard.bool(forKey: "status_notifications_enabled") {
+                        let notification = NSUserNotification()
+                        if snap.indicator == "none" {
+                            notification.title = "\(sourceLabel) is back online"
+                            notification.informativeText = "All systems operational"
+                        } else {
+                            notification.title = "\(sourceLabel) status: \(snap.description)"
+                            notification.informativeText = "Visit the \(sourceLabel) status page for details"
+                        }
+                        notification.soundName = NSUserNotificationDefaultSoundName
+                        NSUserNotificationCenter.default.deliver(notification)
+                    }
+                    self.lastNotifiedIndicators[sourceId] = snap.indicator
+                }
+            }
+        }
+    }
+
+    /// Clear every extra-source snapshot. Called when the user
+    /// disables the multi-status flag OR when they clear a specific
+    /// source's feature flag.
+    func clearExtraSource(_ id: String) {
+        extraSnapshots.removeValue(forKey: id)
+        lastNotifiedIndicators.removeValue(forKey: id)
+    }
 
     init() {
         if let saved = UserDefaults.standard.array(forKey: "tracked_component_ids") as? [String] {
@@ -1845,6 +1944,65 @@ struct UsageView: View {
                 }
             }
 
+            // PR 20 — extra status source cards (OpenAI / GitHub /
+            // xAI / Google Cloud). Only renders cards for sources
+            // the user has enabled AND that have a non-empty
+            // snapshot. `statusManager.extraStatusCards` handles
+            // filtering.
+            ForEach(statusManager.extraStatusCards, id: \.source.id) { pair in
+                let source = pair.source
+                let snap = pair.snapshot
+                let colour: Color = {
+                    switch snap.indicator {
+                    case "minor":    return .yellow
+                    case "major":    return .orange
+                    case "critical": return .red
+                    default:         return .green
+                    }
+                }()
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(colour)
+                            .frame(width: 8, height: 8)
+                        Text(source.displayName)
+                            .font(.system(size: 12, weight: .semibold))
+                        Spacer()
+                        Text(snap.description)
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                    }
+                    if !snap.affectedComponents.isEmpty {
+                        VStack(alignment: .leading, spacing: 2) {
+                            ForEach(snap.affectedComponents.prefix(4), id: \.id) { c in
+                                Text("• \(c.name) — \(c.status.replacingOccurrences(of: "_", with: " "))")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+                            if snap.affectedComponents.count > 4 {
+                                Text("+ \(snap.affectedComponents.count - 4) more")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                    }
+                    HStack {
+                        Spacer()
+                        Button(action: {
+                            NSWorkspace.shared.open(source.webURL)
+                        }) {
+                            Text("Open status page →")
+                                .font(.caption2)
+                        }
+                        .buttonStyle(.borderless)
+                    }
+                }
+                .padding(10)
+                .background(colour.opacity(0.10))
+                .cornerRadius(6)
+            }
+
             if usageManager.hasFetchedData {
             Divider()
 
@@ -1856,6 +2014,7 @@ struct UsageView: View {
                 Button("Refresh") {
                     usageManager.fetchUsage()
                     statusManager.fetch()
+                    statusManager.fetchExtraSources()
                     updateManager.fetch()
                     providersModel.fetchEnabled()
                 }
@@ -2019,6 +2178,39 @@ struct UsageView: View {
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
+                    }
+
+                    Divider()
+
+                    // PR 20 — extra status sources. Each is off by
+                    // default; enabling one writes its feature flag
+                    // and triggers an immediate fetch.
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Additional status pages")
+                            .font(.caption)
+                            .fontWeight(.semibold)
+                        Text("Show status for other services alongside Claude. Each source polls independently every 5 minutes.")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        ForEach(StatusManager.extraSources, id: \.id) { source in
+                            Toggle(isOn: Binding(
+                                get: { UserDefaults.standard.bool(forKey: source.featureFlagKey) },
+                                set: { newValue in
+                                    UserDefaults.standard.set(newValue, forKey: source.featureFlagKey)
+                                    if newValue {
+                                        statusManager.fetchExtraSources()
+                                    } else {
+                                        statusManager.clearExtraSource(source.id)
+                                    }
+                                }
+                            )) {
+                                Text(source.displayName)
+                                    .font(.caption)
+                            }
+                            .toggleStyle(.checkbox)
+                        }
                     }
 
                     Divider()
