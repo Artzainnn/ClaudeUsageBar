@@ -759,13 +759,20 @@ public struct ClaudeCodeUsageFetcher: Sendable {
     /// cost line. Public so tests can exercise the clamp against
     /// hostile inputs (NaN, infinity, 1e300, negatives).
     public static func safeInt(_ value: Any?) -> Int {
-        // PR 13-BE 3cc R3 F8: reject Bool early. Bool bridges to
-        // NSNumber which as-casts to Int as 1, silently coercing a
-        // JSON `true` into a token count of 1. A numeric field must
-        // never accept a Bool. This must precede the `as? Int` cast
-        // because Bool → NSNumber → Int can accidentally succeed as
-        // 1 via bridging.
-        if value is Bool { return 0 }
+        // PR 13-BE 3cc R3 F8: reject Bool early. A JSON `true` bridges
+        // to `NSNumber` and as-casts to `Int` as 1, silently coercing
+        // a Bool into a token count of 1. A numeric field must never
+        // accept a Bool.
+        //
+        // NOTE: `value is Bool` returns true for ANY NSNumber whose
+        // integer value is 0 or 1 (CoreFoundation bridges CFNumber(0)
+        // and CFNumber(1) as compatible with Bool), so it would ALSO
+        // reject legitimate JSON `0` and `1`. Use `CFBooleanGetTypeID`
+        // — the only reliable way to distinguish a genuine JSON
+        // boolean from a numeric 0/1 after JSONSerialization.
+        if let n = value as? NSNumber, CFGetTypeID(n) == CFBooleanGetTypeID() {
+            return 0
+        }
         if let i = value as? Int { return max(0, i) }
         if let d = value as? Double, d.isFinite {
             let rounded = d.rounded()

@@ -134,7 +134,22 @@ let package = Package(
                 "JetBrainsUsageFetcher.swift",
                 "JetBrainsUsageStore.swift",
                 "WarpUsageFetcher.swift",
-                "WarpUsageStore.swift"
+                "WarpUsageStore.swift",
+                // PR 13-BE — Continue local dev-data JSONL reader.
+                // Reads ~/.continue/dev_data/0.2.0/tokensGenerated.jsonl.
+                // Reuses ClaudeCodeUsageFetcher.readJsonlLines + parseTimestamp +
+                // safeInt (the last hardened in the same PR to reject Bool).
+                "ContinueUsageFetcher.swift",
+                "ContinueUsageStore.swift",
+                // PR 13-BE — Roo Code + Zoo Code local reader.
+                // Both extensions share the Cline file layout under distinct
+                // publisher.name namespaces. Shared fetcher / path resolver;
+                // two stores so users can toggle Roo (archived) independently
+                // from Zoo (active fork).
+                "RooZooPathResolver.swift",
+                "RooZooUsageFetcher.swift",
+                "RooUsageStore.swift",
+                "ZooUsageStore.swift"
                 // AnthropicUsageStore.swift depends on UsageManager
                 // (defined in ClaudeUsageBar.swift), so it stays in the
                 // app-bundle compile only, not in the SwiftPM library

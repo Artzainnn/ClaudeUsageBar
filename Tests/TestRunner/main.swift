@@ -9727,6 +9727,159 @@ MainActor.assumeIsolated {
     defaults.removePersistentDomain(forName: suite)
 }
 
+// MARK: - Continue local dev-data JSONL (PR 13-BE)
+
+run("ContinueUsageFetcher.parseLine: happy path — full record parses") {
+    let line = #"{"timestamp":"2026-07-15T14:23:11.523Z","userId":"u1","userAgent":"vscode/1.0","selectedProfileId":"p1","eventName":"tokensGenerated","schema":"0.2.0","model":"gpt-5","provider":"openai","promptTokens":100,"generatedTokens":250}"#
+    var m = 0
+    let rec = ContinueUsageFetcher.parseLine(line, sourceFile: "/x", malformedCount: &m)
+    expect(rec != nil)
+    expect(rec?.model == "gpt-5")
+    expect(rec?.provider == "openai")
+    expect(rec?.promptTokens == 100)
+    expect(rec?.generatedTokens == 250)
+    expect(rec?.timestamp != nil)
+    expect(rec?.sourceFile == "/x")
+    expect(m == 0)
+}
+
+run("ContinueUsageFetcher.parseLine: hostile numerics via safeInt (Bool, big-string, negative, array, null)") {
+    var m = 0
+    // Bool → 0 (3cc R3 F8 guard in ClaudeCodeUsageFetcher.safeInt).
+    let boolPT = #"{"eventName":"tokensGenerated","model":"m","provider":"p","promptTokens":true,"generatedTokens":100,"timestamp":"2026-01-01T00:00:00Z"}"#
+    let boolRec = ContinueUsageFetcher.parseLine(boolPT, sourceFile: "/x", malformedCount: &m)
+    expect(boolRec?.promptTokens == 0)
+
+    // Overflow string → 0.
+    let bigStr = #"{"eventName":"tokensGenerated","model":"m","provider":"p","promptTokens":"9999999999999999999999999","generatedTokens":10,"timestamp":"2026-01-01T00:00:00Z"}"#
+    let bigRec = ContinueUsageFetcher.parseLine(bigStr, sourceFile: "/x", malformedCount: &m)
+    expect(bigRec?.promptTokens == 0)
+
+    // Negative → 0.
+    let negPT = #"{"eventName":"tokensGenerated","model":"m","provider":"p","promptTokens":-1,"generatedTokens":10,"timestamp":"2026-01-01T00:00:00Z"}"#
+    let negRec = ContinueUsageFetcher.parseLine(negPT, sourceFile: "/x", malformedCount: &m)
+    expect(negRec?.promptTokens == 0)
+
+    // Array → 0.
+    let arrPT = #"{"eventName":"tokensGenerated","model":"m","provider":"p","promptTokens":[1,2,3],"generatedTokens":10,"timestamp":"2026-01-01T00:00:00Z"}"#
+    let arrRec = ContinueUsageFetcher.parseLine(arrPT, sourceFile: "/x", malformedCount: &m)
+    expect(arrRec?.promptTokens == 0)
+
+    // Null → 0.
+    let nullPT = #"{"eventName":"tokensGenerated","model":"m","provider":"p","promptTokens":null,"generatedTokens":10,"timestamp":"2026-01-01T00:00:00Z"}"#
+    let nullRec = ContinueUsageFetcher.parseLine(nullPT, sourceFile: "/x", malformedCount: &m)
+    expect(nullRec?.promptTokens == 0)
+    // Malformed count stayed at 0 — every hostile input was VALID
+    // JSON with a value that decodes to 0 in the numeric field.
+    expect(m == 0)
+}
+
+run("ContinueUsageFetcher.parseLine: malformed JSON increments count and returns nil") {
+    var m = 0
+    let malformed = "{not valid json"
+    expect(ContinueUsageFetcher.parseLine(malformed, sourceFile: "/x", malformedCount: &m) == nil)
+    expect(m == 1)
+
+    // Empty line — no malformed increment (a blank line in an
+    // append log is normal).
+    m = 0
+    expect(ContinueUsageFetcher.parseLine("", sourceFile: "/x", malformedCount: &m) == nil)
+    expect(m == 0)
+
+    // Whitespace-only line — no malformed increment.
+    expect(ContinueUsageFetcher.parseLine("   \n\t   ", sourceFile: "/x", malformedCount: &m) == nil)
+    expect(m == 0)
+}
+
+run("ContinueUsageFetcher.parseLine: ISO-8601 variants + out-of-bounds year clamp") {
+    var m = 0
+
+    // With fractional seconds and Z.
+    let l1 = #"{"eventName":"tokensGenerated","model":"m","provider":"p","promptTokens":1,"generatedTokens":1,"timestamp":"2026-07-15T14:23:11.523Z"}"#
+    expect(ContinueUsageFetcher.parseLine(l1, sourceFile: "/x", malformedCount: &m)?.timestamp != nil)
+
+    // Without fractional seconds.
+    let l2 = #"{"eventName":"tokensGenerated","model":"m","provider":"p","promptTokens":1,"generatedTokens":1,"timestamp":"2026-07-15T14:23:11Z"}"#
+    expect(ContinueUsageFetcher.parseLine(l2, sourceFile: "/x", malformedCount: &m)?.timestamp != nil)
+
+    // With +00:00 offset.
+    let l3 = #"{"eventName":"tokensGenerated","model":"m","provider":"p","promptTokens":1,"generatedTokens":1,"timestamp":"2026-07-15T14:23:11+00:00"}"#
+    expect(ContinueUsageFetcher.parseLine(l3, sourceFile: "/x", malformedCount: &m)?.timestamp != nil)
+
+    // Out-of-bounds year → nil timestamp but record still parses
+    // (falls out of every today/MTD bucket).
+    let l4 = #"{"eventName":"tokensGenerated","model":"m","provider":"p","promptTokens":1,"generatedTokens":1,"timestamp":"1970-01-01T00:00:00Z"}"#
+    let rec4 = ContinueUsageFetcher.parseLine(l4, sourceFile: "/x", malformedCount: &m)
+    expect(rec4 != nil)
+    expect(rec4?.timestamp == nil)
+}
+
+run("ContinueUsageFetcher.parseLine: skips records with both tokens zero") {
+    var m = 0
+    let both = #"{"eventName":"tokensGenerated","model":"m","provider":"p","promptTokens":0,"generatedTokens":0,"timestamp":"2026-01-01T00:00:00Z"}"#
+    expect(ContinueUsageFetcher.parseLine(both, sourceFile: "/x", malformedCount: &m) == nil)
+    // Any nonzero survives.
+    let one = #"{"eventName":"tokensGenerated","model":"m","provider":"p","promptTokens":0,"generatedTokens":1,"timestamp":"2026-01-01T00:00:00Z"}"#
+    expect(ContinueUsageFetcher.parseLine(one, sourceFile: "/x", malformedCount: &m) != nil)
+}
+
+run("ContinueUsageFetcher.parseLine: rejects non-tokensGenerated events (defensive)") {
+    var m = 0
+    let ac = #"{"eventName":"autocomplete","model":"m","provider":"p","promptTokens":10,"generatedTokens":10,"timestamp":"2026-01-01T00:00:00Z"}"#
+    expect(ContinueUsageFetcher.parseLine(ac, sourceFile: "/x", malformedCount: &m) == nil)
+    expect(m == 0)  // rejection is not malformed
+}
+
+run("ContinuePathResolver.resolveScanRoots: single 0.2.0 root under home") {
+    let env = ContinuePathResolver.Environment(homeDirectoryPath: "/Users/testuser")
+    let roots = ContinuePathResolver.resolveScanRoots(env)
+    expect(roots.count == 1)
+    expect(roots.first?.id == "Continue")
+    expect(roots.first?.jsonlPath == "/Users/testuser/.continue/dev_data/0.2.0/tokensGenerated.jsonl")
+}
+
+run("ContinuePathResolver.resolveScanRoots: empty home yields no roots") {
+    let env = ContinuePathResolver.Environment(homeDirectoryPath: "")
+    let roots = ContinuePathResolver.resolveScanRoots(env)
+    expect(roots.isEmpty)
+}
+
+run("ContinueUsageFetcher.parse: parses full file with malformed line + non-tokensGenerated event") {
+    let tmp = FileManager.default.temporaryDirectory
+        .appendingPathComponent("continue-test-\(UUID().uuidString).jsonl")
+    defer { try? FileManager.default.removeItem(at: tmp) }
+    let content = """
+    {"eventName":"tokensGenerated","model":"gpt-5","provider":"openai","promptTokens":100,"generatedTokens":200,"timestamp":"2026-07-15T10:00:00Z"}
+    {"eventName":"tokensGenerated","model":"claude-opus-4-7","provider":"anthropic","promptTokens":50,"generatedTokens":150,"timestamp":"2026-07-15T11:00:00Z"}
+    {malformed line}
+    {"eventName":"autocomplete","model":"m","provider":"p","promptTokens":5,"generatedTokens":5,"timestamp":"2026-07-15T12:00:00Z"}
+    """
+    try! content.data(using: .utf8)!.write(to: tmp)
+    let snap = ContinueUsageFetcher.parse(files: [tmp])
+    expect(snap.records.count == 2)
+    expect(snap.malformedRecordCount == 1)
+    expect(snap.unreadableFileCount == 0)
+    expect(snap.overCapFileCount == 0)
+
+    // Bucket the full day 2026-07-15.
+    let cal = Calendar(identifier: .gregorian)
+    var comp = DateComponents()
+    comp.year = 2026; comp.month = 7; comp.day = 15
+    let start = cal.date(from: comp)!
+    let end = cal.date(byAdding: .day, value: 1, to: start)!
+    let range = start...end
+    let total = snap.tokens(in: range)
+    expect(total == 500)  // 100+200 + 50+150
+
+    let byProv = snap.breakdownByProvider(in: range)
+    expect(byProv.count == 2)
+    expect(byProv.contains { $0.provider == "openai" && $0.tokens == 300 })
+    expect(byProv.contains { $0.provider == "anthropic" && $0.tokens == 200 })
+
+    let byModel = snap.breakdownByModel(in: range)
+    expect(byModel.count == 2)
+}
+
 // MARK: - Summary
 
 print("")
