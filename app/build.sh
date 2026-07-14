@@ -76,6 +76,12 @@ swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_arm64" \
     JetBrainsUsageStore.swift \
     WarpUsageFetcher.swift \
     WarpUsageStore.swift \
+    ContinueUsageFetcher.swift \
+    ContinueUsageStore.swift \
+    RooZooPathResolver.swift \
+    RooZooUsageFetcher.swift \
+    RooUsageStore.swift \
+    ZooUsageStore.swift \
     -framework SwiftUI \
     -framework AppKit \
     -framework WebKit \
@@ -119,6 +125,12 @@ swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_x86_64" \
     JetBrainsUsageStore.swift \
     WarpUsageFetcher.swift \
     WarpUsageStore.swift \
+    ContinueUsageFetcher.swift \
+    ContinueUsageStore.swift \
+    RooZooPathResolver.swift \
+    RooZooUsageFetcher.swift \
+    RooUsageStore.swift \
+    ZooUsageStore.swift \
     -framework SwiftUI \
     -framework AppKit \
     -framework WebKit \

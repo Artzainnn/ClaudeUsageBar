@@ -137,6 +137,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // GraphQL path is deferred to a future PR). Backend from
         // PR #73.
         providers.append(ProviderBox(WarpUsageStore()))
+        // PR 13-BE: register Continue local JSONL reader. Opt-in
+        // (features.continue.enabled defaults false); reads
+        // `~/.continue/dev_data/0.2.0/tokensGenerated.jsonl` on-disk
+        // only — nothing leaves the machine. Continue's local logging
+        // is unconditionally ON, so if the user has ever used
+        // Continue, the file exists. Tokens-only (Continue's schema
+        // has no cost field). Backend from this PR.
+        providers.append(ProviderBox(ContinueUsageStore()))
+        // PR 13-BE: register Roo Code local reader. Opt-in
+        // (features.roo.enabled defaults false); reads Roo's
+        // `history_item.json` rollup per task (falling back to
+        // `ui_messages.json` via ClineUsageFetcher.parse when the
+        // rollup is absent). Enumerates 6 VS Code family hosts (Code
+        // / Insiders / VSCodium / Cursor / Cursor Nightly / Windsurf)
+        // plus a per-host `customStoragePath` if configured.
+        // Roo's GitHub repo is ARCHIVED (May 2026), extension frozen
+        // at v3.54.0 on the marketplace; kept as a separate provider
+        // so users can toggle it off independently from Zoo.
+        providers.append(ProviderBox(RooUsageStore()))
+        // PR 13-BE: register Zoo Code local reader. Opt-in
+        // (features.zoo.enabled defaults false); Zoo is the active
+        // fork of Roo (extension id ZooCodeOrganization.zoo-code).
+        // Same file layout as Roo; shared fetcher and path resolver,
+        // separate feature flag and store so users can enable one
+        // without the other. Backend from this PR.
+        providers.append(ProviderBox(ZooUsageStore()))
         // Model SwiftUI observes for the generic (non-Anthropic) provider
         // tiles. Anthropic continues to render through usageManager directly.
         providersModel = ProvidersModel(providers: providers)
