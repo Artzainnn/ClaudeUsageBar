@@ -10765,38 +10765,46 @@ run("ProviderCopy disclosure(for: 'continue') mentions the tokens-only limitatio
 run("ProviderCopy help(for: 'roo') mentions Roo's extension namespace AND every VS Code host") {
     let help = ProviderCopy.help(for: "roo")!
     expect(help.contains("RooVeterinaryInc.roo-cline"))
-    // All six host names appear.
-    expect(help.contains("VS Code"))
-    expect(help.contains("VS Code Insiders"))
+    // 3cc PR 13-UI P2: assert on the exact list-token form so
+    // "VS Code" isn't satisfied by "VS Code Insiders" alone, and
+    // "Cursor" isn't satisfied by "Cursor Nightly" alone. All six
+    // host names must appear in the exact comma-separated list.
+    expect(help.contains("VS Code, VS Code Insiders"))
     expect(help.contains("VSCodium"))
-    expect(help.contains("Cursor"))
-    expect(help.contains("Cursor Nightly"))
+    expect(help.contains("Cursor, Cursor Nightly"))
     expect(help.contains("Windsurf"))
-    expect(help.contains("customStoragePath"))
+    // 3cc PR 13-UI P3: assert on the FULL settings key so a copy
+    // edit that removes the "roo-cline." qualifier is caught.
+    expect(help.contains("roo-cline.customStoragePath"))
 }
 
-run("ProviderCopy disclosure(for: 'roo') calls out the archival status") {
+run("ProviderCopy disclosure(for: 'roo') calls out the archival status AND the 10 000-task cap") {
     let disc = ProviderCopy.disclosure(for: "roo")!
     // Users need to know Roo is archived so they can decide to migrate to Zoo.
     expect(disc.contains("ARCHIVED") || disc.contains("archived"))
     expect(disc.contains("v3.54.0") || disc.contains("frozen") || disc.contains("Zoo Code"))
+    // 3cc PR 13-UI P3: pin the "10 000" figure so it doesn't drift
+    // from RooZooUsageFetcher.taskCap silently.
+    expect(disc.contains("10 000"))
 }
 
 run("ProviderCopy help(for: 'zoo') mentions Zoo's extension namespace AND every VS Code host") {
     let help = ProviderCopy.help(for: "zoo")!
     expect(help.contains("ZooCodeOrganization.zoo-code"))
-    expect(help.contains("VS Code"))
-    expect(help.contains("VS Code Insiders"))
+    // 3cc PR 13-UI P2: exact-list-token assertions.
+    expect(help.contains("VS Code, VS Code Insiders"))
     expect(help.contains("VSCodium"))
-    expect(help.contains("Cursor"))
-    expect(help.contains("Cursor Nightly"))
+    expect(help.contains("Cursor, Cursor Nightly"))
     expect(help.contains("Windsurf"))
-    expect(help.contains("customStoragePath"))
+    // 3cc PR 13-UI P3: full settings key form.
+    expect(help.contains("zoo-code.customStoragePath"))
 }
 
-run("ProviderCopy disclosure(for: 'zoo') calls out that Zoo is the active fork of Roo") {
+run("ProviderCopy disclosure(for: 'zoo') calls out that Zoo is the active fork of Roo AND the 10 000-task cap") {
     let disc = ProviderCopy.disclosure(for: "zoo")!
     expect(disc.contains("fork") || disc.contains("Roo Code"))
+    // 3cc PR 13-UI P3: pin the cap figure.
+    expect(disc.contains("10 000"))
 }
 
 // MARK: - Summary
