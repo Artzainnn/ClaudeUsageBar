@@ -261,18 +261,27 @@ public enum GeminiPricing {
     /// low-tier rate; a "Pricing update available" tile surfaces
     /// when this app is behind Google's official rates.
     public static let table: [String: Rate] = [
-        "gemini-2.5-pro":     Rate(inputPerToken: 1.25 / 1_000_000,
-                                    outputPerToken: 10.00 / 1_000_000,
-                                    cachedPerToken: 0.31 / 1_000_000),
-        "gemini-2.5-flash":   Rate(inputPerToken: 0.30 / 1_000_000,
-                                    outputPerToken: 2.50 / 1_000_000,
-                                    cachedPerToken: 0.075 / 1_000_000),
-        "gemini-1.5-pro":     Rate(inputPerToken: 1.25 / 1_000_000,
-                                    outputPerToken: 5.00 / 1_000_000,
-                                    cachedPerToken: 0.3125 / 1_000_000),
-        "gemini-1.5-flash":   Rate(inputPerToken: 0.075 / 1_000_000,
-                                    outputPerToken: 0.30 / 1_000_000,
-                                    cachedPerToken: 0.01875 / 1_000_000),
+        "gemini-2.5-pro":         Rate(inputPerToken: 1.25 / 1_000_000,
+                                        outputPerToken: 10.00 / 1_000_000,
+                                        cachedPerToken: 0.31 / 1_000_000),
+        "gemini-2.5-flash":       Rate(inputPerToken: 0.30 / 1_000_000,
+                                        outputPerToken: 2.50 / 1_000_000,
+                                        cachedPerToken: 0.075 / 1_000_000),
+        // 3cc PR 15-BE F3 — Gemini 2.0 Flash rows added. Prefix-longest-
+        // first sort ensures `gemini-2.0-flash-lite` matches BEFORE
+        // `gemini-2.0-flash` (26 chars vs 20 chars — length DESC).
+        "gemini-2.0-flash-lite":  Rate(inputPerToken: 0.075 / 1_000_000,
+                                        outputPerToken: 0.30 / 1_000_000,
+                                        cachedPerToken: 0.01875 / 1_000_000),
+        "gemini-2.0-flash":       Rate(inputPerToken: 0.10 / 1_000_000,
+                                        outputPerToken: 0.40 / 1_000_000,
+                                        cachedPerToken: 0.025 / 1_000_000),
+        "gemini-1.5-pro":         Rate(inputPerToken: 1.25 / 1_000_000,
+                                        outputPerToken: 5.00 / 1_000_000,
+                                        cachedPerToken: 0.3125 / 1_000_000),
+        "gemini-1.5-flash":       Rate(inputPerToken: 0.075 / 1_000_000,
+                                        outputPerToken: 0.30 / 1_000_000,
+                                        cachedPerToken: 0.01875 / 1_000_000),
     ]
 
     /// Look up a rate by model id. Handles Gemini's `-latest`,
@@ -288,14 +297,22 @@ public enum GeminiPricing {
     }
 
     /// Compute cost from a Rate + record's token counts.
+    ///
+    /// - `input` billed at input rate.
+    /// - `output` billed at output rate.
+    /// - `cached` billed at cached rate.
+    /// - `thoughts` billed at output rate (Gemini 2.5's reasoning
+    ///   tokens are output-side).
+    /// - `tool` billed at input rate (Google's
+    ///   `toolUsePromptTokenCount` is prompt-side; billing on the
+    ///   input side would otherwise overcharge tool-heavy sessions
+    ///   by up to 8x on 2.5 Pro/Flash). 3cc PR 15-BE F1.
     public static func cost(for rate: Rate, record: GeminiUsageRecord) -> Double {
-        // thoughtsTokens and toolTokens are billed at the output
-        // rate per Google's public pricing FAQ.
         var c = Double(record.inputTokens) * rate.inputPerToken
         c += Double(record.outputTokens) * rate.outputPerToken
         c += Double(record.cachedTokens) * rate.cachedPerToken
         c += Double(record.thoughtsTokens) * rate.outputPerToken
-        c += Double(record.toolTokens) * rate.outputPerToken
+        c += Double(record.toolTokens) * rate.inputPerToken
         return c
     }
 }

@@ -163,6 +163,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // separate feature flag and store so users can enable one
         // without the other. Backend from this PR.
         providers.append(ProviderBox(ZooUsageStore()))
+        // PR 15-BE: register Gemini Developer local JSONL reader.
+        // Opt-in (features.gemini.enabled defaults false); reads
+        // `~/.gemini/tmp/<projectHash>/chats/session-*.jsonl` — the
+        // Gemini CLI's own on-disk session logs — via the shared
+        // JSONL streaming reader. Tokens + cost via a bundled
+        // per-model pricing snapshot (Gemini 2.5 Pro/Flash, 2.0
+        // Flash / Flash-Lite, 1.5 Pro/Flash). Unknown models
+        // surface a "Pricing update available" tile.
+        providers.append(ProviderBox(GeminiUsageStore()))
         // Model SwiftUI observes for the generic (non-Anthropic) provider
         // tiles. Anthropic continues to render through usageManager directly.
         providersModel = ProvidersModel(providers: providers)

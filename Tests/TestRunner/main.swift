@@ -10871,6 +10871,72 @@ run("GeminiUsageFetcher.parseLine: hostile Bool in token count rejected as 0") {
     expectEqual(rec?.outputTokens ?? -1, 500)
 }
 
+run("GeminiPricing.cost: input/output/cached/thoughts/tool billing rates (3cc PR 15-BE F1)") {
+    // Isolate each token category to verify the correct rate is
+    // applied. Use gemini-2.5-flash for its distinct input/output
+    // rates ($0.30 / $2.50 per 1M).
+    let rate = GeminiPricing.rate(for: "gemini-2.5-flash")!
+
+    // Input-only record: cost = 1_000_000 × 0.30/1M = 0.30
+    let inputOnly = GeminiUsageRecord(
+        model: "gemini-2.5-flash", timestamp: nil, inputTokens: 1_000_000,
+        outputTokens: 0, cachedTokens: 0, thoughtsTokens: 0, toolTokens: 0,
+        costUSD: 0, sourceFile: "/x"
+    )
+    let inputCost = GeminiPricing.cost(for: rate, record: inputOnly)
+    expect(abs(inputCost - 0.30) < 0.0001)
+
+    // Output-only: 1M × 2.50/1M = 2.50
+    let outputOnly = GeminiUsageRecord(
+        model: "gemini-2.5-flash", timestamp: nil, inputTokens: 0,
+        outputTokens: 1_000_000, cachedTokens: 0, thoughtsTokens: 0, toolTokens: 0,
+        costUSD: 0, sourceFile: "/x"
+    )
+    expect(abs(GeminiPricing.cost(for: rate, record: outputOnly) - 2.50) < 0.0001)
+
+    // Cached-only: 1M × 0.075/1M = 0.075
+    let cachedOnly = GeminiUsageRecord(
+        model: "gemini-2.5-flash", timestamp: nil, inputTokens: 0,
+        outputTokens: 0, cachedTokens: 1_000_000, thoughtsTokens: 0, toolTokens: 0,
+        costUSD: 0, sourceFile: "/x"
+    )
+    expect(abs(GeminiPricing.cost(for: rate, record: cachedOnly) - 0.075) < 0.0001)
+
+    // Thoughts billed at OUTPUT rate — 1M × 2.50/1M = 2.50.
+    let thoughtsOnly = GeminiUsageRecord(
+        model: "gemini-2.5-flash", timestamp: nil, inputTokens: 0,
+        outputTokens: 0, cachedTokens: 0, thoughtsTokens: 1_000_000, toolTokens: 0,
+        costUSD: 0, sourceFile: "/x"
+    )
+    expect(abs(GeminiPricing.cost(for: rate, record: thoughtsOnly) - 2.50) < 0.0001)
+
+    // Tool billed at INPUT rate — 1M × 0.30/1M = 0.30 (3cc F1 fix).
+    let toolOnly = GeminiUsageRecord(
+        model: "gemini-2.5-flash", timestamp: nil, inputTokens: 0,
+        outputTokens: 0, cachedTokens: 0, thoughtsTokens: 0, toolTokens: 1_000_000,
+        costUSD: 0, sourceFile: "/x"
+    )
+    expect(abs(GeminiPricing.cost(for: rate, record: toolOnly) - 0.30) < 0.0001)
+}
+
+run("GeminiPricing.rate: gemini-2.0-flash and gemini-2.0-flash-lite (3cc PR 15-BE F3)") {
+    // 3cc F3: prior pricing table omitted the 2.0 series. Confirm
+    // both are now present, and that suffix-longest-first matching
+    // correctly resolves `-lite` to the cheaper rate.
+    expect(GeminiPricing.rate(for: "gemini-2.0-flash") != nil)
+    expect(GeminiPricing.rate(for: "gemini-2.0-flash-lite") != nil)
+    expect(GeminiPricing.rate(for: "gemini-2.0-flash-lite-002") != nil)
+    // Lite rate < non-lite rate.
+    let lite = GeminiPricing.rate(for: "gemini-2.0-flash-lite")!
+    let full = GeminiPricing.rate(for: "gemini-2.0-flash")!
+    expect(lite.inputPerToken < full.inputPerToken)
+    expect(lite.outputPerToken < full.outputPerToken)
+    // Verify prefix-longest-first: bare `gemini-2.0-flash` matches
+    // the non-lite row, NOT the lite row.
+    let bare = GeminiPricing.rate(for: "gemini-2.0-flash-preview-05-24")!
+    expect(bare.outputPerToken == full.outputPerToken)
+}
+
 run("GeminiPricing.rate: known Gemini 2.5 Pro / Flash matches table") {
     expect(GeminiPricing.rate(for: "gemini-2.5-pro") != nil)
     expect(GeminiPricing.rate(for: "gemini-2.5-flash") != nil)
