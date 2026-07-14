@@ -10697,6 +10697,108 @@ MainActor.assumeIsolated {
 
 }  // end MainActor.assumeIsolated for RooUsageStore + ZooUsageStore
 
+// MARK: - ProviderCopy id regression guards (PR 13-UI)
+
+run("ProviderCopy id 'continue' matches ContinueUsageStore.id — exercises the real Settings path (PR 13-UI regression guard)") {
+    // Same regression guard as PRs 10b-UI/10c-UI: read the store's OWN
+    // id so drift on either side is caught. ProviderToggleRow calls
+    // `ProviderCopy.help(for: box.id)`; walk exactly that path.
+    MainActor.assumeIsolated {
+        let store = ContinueUsageStore()
+        expect(ProviderCopy.help(for: store.id) != nil)
+        expect(ProviderCopy.disclosure(for: store.id) != nil)
+        let box = ProviderBox(store)
+        expect(ProviderCopy.help(for: box.id) != nil)
+        expect(ProviderCopy.disclosure(for: box.id) != nil)
+    }
+    expect(ProviderCopy.help(for: "continue") != nil)
+    expect(ProviderCopy.disclosure(for: "continue") != nil)
+    // Near-miss casings return nil so a silent rename disaster is caught.
+    expect(ProviderCopy.help(for: "Continue") == nil)
+    expect(ProviderCopy.help(for: "CONTINUE") == nil)
+    expect(ProviderCopy.help(for: "continue-dev") == nil)
+}
+
+run("ProviderCopy id 'roo' matches RooUsageStore.id — exercises the real Settings path (PR 13-UI regression guard)") {
+    MainActor.assumeIsolated {
+        let store = RooUsageStore()
+        expect(ProviderCopy.help(for: store.id) != nil)
+        expect(ProviderCopy.disclosure(for: store.id) != nil)
+        let box = ProviderBox(store)
+        expect(ProviderCopy.help(for: box.id) != nil)
+        expect(ProviderCopy.disclosure(for: box.id) != nil)
+    }
+    expect(ProviderCopy.help(for: "roo") != nil)
+    expect(ProviderCopy.disclosure(for: "roo") != nil)
+    expect(ProviderCopy.help(for: "Roo") == nil)
+    expect(ProviderCopy.help(for: "roo-code") == nil)
+    expect(ProviderCopy.help(for: "rooveterinaryinc") == nil)
+}
+
+run("ProviderCopy id 'zoo' matches ZooUsageStore.id — exercises the real Settings path (PR 13-UI regression guard)") {
+    MainActor.assumeIsolated {
+        let store = ZooUsageStore()
+        expect(ProviderCopy.help(for: store.id) != nil)
+        expect(ProviderCopy.disclosure(for: store.id) != nil)
+        let box = ProviderBox(store)
+        expect(ProviderCopy.help(for: box.id) != nil)
+        expect(ProviderCopy.disclosure(for: box.id) != nil)
+    }
+    expect(ProviderCopy.help(for: "zoo") != nil)
+    expect(ProviderCopy.disclosure(for: "zoo") != nil)
+    expect(ProviderCopy.help(for: "Zoo") == nil)
+    expect(ProviderCopy.help(for: "zoo-code") == nil)
+    expect(ProviderCopy.help(for: "zoocodeorganization") == nil)
+}
+
+run("ProviderCopy help(for: 'continue') mentions the actual JSONL path AND the tokens-only posture") {
+    let help = ProviderCopy.help(for: "continue")!
+    expect(help.contains("~/.continue/dev_data/0.2.0/tokensGenerated.jsonl"))
+    expect(help.contains("no key") || help.contains("no sign-in") || help.contains("Nothing leaves"))
+}
+
+run("ProviderCopy disclosure(for: 'continue') mentions the tokens-only limitation") {
+    let disc = ProviderCopy.disclosure(for: "continue")!
+    expect(disc.contains("Tokens only") || disc.contains("does not record cost") || disc.contains("cost"))
+}
+
+run("ProviderCopy help(for: 'roo') mentions Roo's extension namespace AND every VS Code host") {
+    let help = ProviderCopy.help(for: "roo")!
+    expect(help.contains("RooVeterinaryInc.roo-cline"))
+    // All six host names appear.
+    expect(help.contains("VS Code"))
+    expect(help.contains("VS Code Insiders"))
+    expect(help.contains("VSCodium"))
+    expect(help.contains("Cursor"))
+    expect(help.contains("Cursor Nightly"))
+    expect(help.contains("Windsurf"))
+    expect(help.contains("customStoragePath"))
+}
+
+run("ProviderCopy disclosure(for: 'roo') calls out the archival status") {
+    let disc = ProviderCopy.disclosure(for: "roo")!
+    // Users need to know Roo is archived so they can decide to migrate to Zoo.
+    expect(disc.contains("ARCHIVED") || disc.contains("archived"))
+    expect(disc.contains("v3.54.0") || disc.contains("frozen") || disc.contains("Zoo Code"))
+}
+
+run("ProviderCopy help(for: 'zoo') mentions Zoo's extension namespace AND every VS Code host") {
+    let help = ProviderCopy.help(for: "zoo")!
+    expect(help.contains("ZooCodeOrganization.zoo-code"))
+    expect(help.contains("VS Code"))
+    expect(help.contains("VS Code Insiders"))
+    expect(help.contains("VSCodium"))
+    expect(help.contains("Cursor"))
+    expect(help.contains("Cursor Nightly"))
+    expect(help.contains("Windsurf"))
+    expect(help.contains("customStoragePath"))
+}
+
+run("ProviderCopy disclosure(for: 'zoo') calls out that Zoo is the active fork of Roo") {
+    let disc = ProviderCopy.disclosure(for: "zoo")!
+    expect(disc.contains("fork") || disc.contains("Roo Code"))
+}
+
 // MARK: - Summary
 
 print("")
