@@ -347,9 +347,26 @@ jobs:
           # the code-only extracted output. Expected: exactly one
           # `enum ProviderCopy` and exactly two `public static func`
           # (help + disclosure). Zero of everything else.
+          #
+          # chk1 audit Bug #1 (CRITICAL): under `set -euo pipefail`,
+          # `grep -oE` returns rc=1 on no matches. Under `pipefail`
+          # that non-zero propagates as the pipeline's rc even when
+          # `wc -l` succeeds — captured in `$(...)`, it aborts the
+          # entire step BEFORE the `if [ "$class_count" != "0" ]`
+          # check. Since EVERY count except `enum` and `func` is
+          # expected to be 0, this bug tripped on every valid
+          # ProviderCopy.swift.
+          #
+          # Fix: wrap the grep in a brace group with `|| true` so
+          # the group's rc is always 0. `wc -l` then always
+          # succeeds. Under `pipefail` both segments now have rc=0.
+          # This masks a hypothetical grep rc>=2 (real regex/IO
+          # error) too, but `$code_only` is already validated
+          # upstream, and the guaranteed-abort behaviour was worse
+          # than an unlikely silent-error one.
           count_of() {
             local pattern="$1"
-            grep -oE "$pattern" <<< "$code_only" | wc -l | tr -d ' '
+            { grep -oE "$pattern" <<< "$code_only" 2>/dev/null || true; } | wc -l | tr -d ' '
           }
           enum_count=$(count_of '\benum[[:space:]]+ProviderCopy\b')
           func_count=$(count_of '\bfunc[[:space:]]')
@@ -409,7 +426,10 @@ jobs:
           # identifier and `(` so a hostile edit cannot bypass with
           # `gethostbyname ("api.jetbrains.ai")` (Swift permits
           # whitespace before the argument list).
-          call_expr_count=$(grep -oE '[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]*\(' <<< "$code_no_defs" | wc -l | tr -d ' ')
+          # chk1 Bug #1: same `grep -oE | wc -l` pipefail trap as
+          # `count_of()`. Wrap in `{ grep || true; }` so rc=0 on
+          # no matches.
+          call_expr_count=$({ grep -oE '[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]*\(' <<< "$code_no_defs" 2>/dev/null || true; } | wc -l | tr -d ' ')
           # Expected: 0 function calls, since every legitimate
           # function body has NO function calls — just switch,
           # case, return.
@@ -427,7 +447,8 @@ jobs:
           # label pattern is `\(for\s+\w+\s*:`. Simplest fix:
           # strip argument-label `for` first.
           code_no_labels=$(sed -E 's/\(for[[:space:]]+[a-zA-Z_][a-zA-Z0-9_]*[[:space:]]*:/\(_LABEL:/g' <<< "$code_only")
-          extra_control_count=$(grep -oE '\b(if|for|while|guard|defer|repeat|do)\b' <<< "$code_no_labels" | wc -l | tr -d ' ')
+          # chk1 Bug #1: same pipefail-trap fix.
+          extra_control_count=$({ grep -oE '\b(if|for|while|guard|defer|repeat|do)\b' <<< "$code_no_labels" 2>/dev/null || true; } | wc -l | tr -d ' ')
           if [ "$extra_control_count" != "0" ]; then
             echo "::error file=$ALLOWLISTED_FILE::Copy-only shape guard: found $extra_control_count 'if'/'for'/'while'/'guard'/'defer'/'repeat'/'do' tokens in emitted code (excluding 'for' argument labels). A pure-copy function must use only 'switch'." >&2
             grep -nE '\b(if|for|while|guard|defer|repeat|do)\b' <<< "$code_no_labels" >&2 || true
@@ -438,7 +459,8 @@ jobs:
           # Match any `let\s+identifier` NOT already caught as a
           # global-let above. Since global_let_count is 0, ALL
           # `let` here are local. Zero expected.
-          local_let_count=$(grep -oE '\blet[[:space:]]+[a-zA-Z_]' <<< "$code_only" | wc -l | tr -d ' ')
+          # chk1 Bug #1: same pipefail-trap fix.
+          local_let_count=$({ grep -oE '\blet[[:space:]]+[a-zA-Z_]' <<< "$code_only" 2>/dev/null || true; } | wc -l | tr -d ' ')
           if [ "$local_let_count" != "0" ]; then
             echo "::error file=$ALLOWLISTED_FILE::Copy-only shape guard: found $local_let_count local 'let' declarations. A pure-copy function needs no locals." >&2
             grep -nE '\blet[[:space:]]+[a-zA-Z_]' <<< "$code_only" >&2 || true
@@ -447,7 +469,8 @@ jobs:
           # Count assignments (=). A pure-copy body has no
           # assignment. `==` for equality is not used because
           # the switch handles matching.
-          assignment_count=$(grep -oE '[^!=<>][=][^=]' <<< "$code_only" | wc -l | tr -d ' ')
+          # chk1 Bug #1: same pipefail-trap fix.
+          assignment_count=$({ grep -oE '[^!=<>][=][^=]' <<< "$code_only" 2>/dev/null || true; } | wc -l | tr -d ' ')
           if [ "$assignment_count" != "0" ]; then
             echo "::error file=$ALLOWLISTED_FILE::Copy-only shape guard: found $assignment_count assignment expressions ('='). A pure-copy body has no assignments." >&2
             grep -nE '[^!=<>][=][^=]' <<< "$code_only" >&2 || true
@@ -568,15 +591,46 @@ jobs:
             ['\bCFHost\b']='let h: CFHost = CFHostCreateWithName(nil, "h" as CFString).takeRetainedValue()'
             ['\bNetService\b']='let n = NetService(domain: "", type: "", name: "")'
           )
+          # chk1 audit Bug #2 (HIGH): the prior implementation used
+          # `grep -qE "$token_pattern" <<< "$FORBIDDEN_TOKENS"` to
+          # verify each table key appears in FORBIDDEN_TOKENS. That
+          # is a regex-vs-regex-source comparison: keys like
+          # `URL\(string:` contain regex metacharacters that grep
+          # interprets (backslash + paren → literal paren), so grep
+          # tries to match the LITERAL `URL(string:` against the
+          # haystack `URL\(string:` (which contains the actual
+          # backslash character) — no match. Every escaped entry
+          # false-negatived and the self-test's regression detection
+          # was silently broken.
+          #
+          # Fix: parse FORBIDDEN_TOKENS as a pipe-delimited LITERAL
+          # list, and use bash string equality (`=`) to check
+          # containment. This treats table keys and FORBIDDEN_TOKENS
+          # entries as opaque strings on both sides.
+          IFS='|' read -ra FORBIDDEN_ARR <<< "$FORBIDDEN_TOKENS"
           FAIL=0
           for token_pattern in "${!HOSTILE_TOKENS[@]}"; do
             snippet="${HOSTILE_TOKENS[$token_pattern]}"
+            # Sanity check on the snippet: it must match its own
+            # regex pattern (this half of the assertion is grep-vs-
+            # snippet, which is a legitimate regex match).
             if ! grep -qE "$token_pattern" <<< "$snippet"; then
               echo "::error::Self-test malformed: snippet for token '$token_pattern' does not match its own pattern. Snippet was: $snippet" >&2
               FAIL=1
               continue
             fi
-            if ! grep -qE "$token_pattern" <<< "$FORBIDDEN_TOKENS"; then
+            # Literal-string containment check against the parsed
+            # FORBIDDEN_ARR. Every table key MUST appear verbatim as
+            # one of the pipe-separated entries. This is the check
+            # that Bug #2 broke.
+            found=0
+            for entry in "${FORBIDDEN_ARR[@]}"; do
+              if [ "$entry" = "$token_pattern" ]; then
+                found=1
+                break
+              fi
+            done
+            if [ $found -eq 0 ]; then
               echo "::error::Copy-only shape guard self-test FAILED: token '$token_pattern' is in the hostile fixture table but MISSING from FORBIDDEN_TOKENS — a real DMCA/security-relevant token was dropped from the production list." >&2
               FAIL=1
             fi
@@ -748,6 +802,23 @@ jobs:
           #     not the interpolated value. Any static-grep guard
           #     shares this blind spot. A code review must catch
           #     this shape.
+          #  3. Split-string construction (chk1 audit Bug #6 / 3cc P2#3):
+          #     `let host = "api.jet" + "brains.ai"` and similar
+          #     concatenations avoid ever putting the bare hostname
+          #     in a single literal. The extractor emits `api.jet`
+          #     and `brains.ai` as separate strings; the strict
+          #     bare-hostname pattern matches neither. This is the
+          #     same class of blind spot as (2) — a static-grep
+          #     guard cannot see through operator-level composition
+          #     without a full Swift parser. A code review must
+          #     catch this shape. Note that even a hostile split
+          #     still needs a `URL(string:)` / `URLSession` /
+          #     `Stream.getStreamsToHost` / `Process` / etc. call
+          #     to actually contact the host; every one of those
+          #     is banned in `app/ProviderCopy.swift` by the copy-
+          #     only shape guard above, and would stand out in
+          #     any other file's review because forming a URL from
+          #     concatenated hostname fragments is uncommon.
           # PR 12-UI refinement (Codex R2 P1#1): the URL-context-only
           # pattern (`(://|//)host`) had a split-file bypass:
           #   fileA.swift: let host = "api.jetbrains.ai"     // bare

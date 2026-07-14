@@ -47,6 +47,128 @@ func run(_ name: String, _ body: () -> Void) {
     print("\(outcome)  \(name)")
 }
 
+// MARK: - Swift comment + string stripper (PR 12-UI Bug #4 wiring guard)
+//
+// Character-by-character extractor that mirrors the awk state
+// machine in .github/workflows/ci.yml's DMCA guard. Modes:
+//   code            — emit character as-is
+//   line_comment    — skip to newline
+//   block_comment   — skip until matching `*/` (tracks nesting)
+//   string          — skip body (handles escapes)
+//   multi_string    — skip body until `"""`
+//   raw_string      — skip body until matching `"##*#` with the
+//                     same delimiter count as the opener
+//
+// Only "code" bytes reach output; string bodies and all comment
+// forms are blanked (newlines preserved to keep line offsets sane).
+//
+// Codex fix-verify R3 hardened this against three edge cases:
+//   - P2#1: nested `/* /* */ */` block comments — now tracks depth.
+//   - P2#2: extended raw strings `##"..."##` where `"#` appears
+//     inside the body — now counts the leading `#`s and only closes
+//     on `"###...` with the same count.
+//   - P3#3: multi-line strings — Swift does NOT permit `\"""` to
+//     escape a triple-quote inside a multi-line string (the compiler
+//     rejects it), so no special handling needed; a real `"""` closer
+//     always ends the string. Verified against Swift 5 language spec.
+func stripSwiftCommentsAndStrings(_ input: String) -> String {
+    var out = ""
+    var mode = "code"
+    var blockDepth = 0  // For nested block comments (Codex R3 P2#1).
+    var rawDelim = 0    // Number of `#` in the raw-string opener (Codex R3 P2#2).
+    let chars = Array(input)
+    var i = 0
+    let n = chars.count
+    while i < n {
+        let c = chars[i]
+        let two: String = (i + 1 < n) ? String(chars[i]) + String(chars[i+1]) : String(c)
+        let three: String = (i + 2 < n) ? String(chars[i]) + String(chars[i+1]) + String(chars[i+2]) : two
+        switch mode {
+        case "code":
+            if two == "//" { mode = "line_comment"; i += 2; continue }
+            if two == "/*" { mode = "block_comment"; blockDepth = 1; i += 2; continue }
+            if three == "\"\"\"" { mode = "multi_string"; i += 3; continue }
+            // Raw string: count leading `#`s then require `"`.
+            if c == "#" {
+                var k = 0
+                while i + k < n && chars[i + k] == "#" { k += 1 }
+                if i + k < n && chars[i + k] == "\"" {
+                    mode = "raw_string"
+                    rawDelim = k
+                    i += k + 1  // Skip `#`s and opening `"`.
+                    continue
+                }
+                // Bare `#` — emit as code (Swift allows `#file`, etc.).
+                out.append(c); i += 1; continue
+            }
+            if c == "\"" { mode = "string"; i += 1; continue }
+            out.append(c); i += 1
+        case "line_comment":
+            if c == "\n" { mode = "code"; out.append(c); i += 1; continue }
+            i += 1
+        case "block_comment":
+            // Codex R3 P2#1: nested block comments.
+            if two == "/*" { blockDepth += 1; i += 2; continue }
+            if two == "*/" {
+                blockDepth -= 1
+                if blockDepth == 0 {
+                    mode = "code"
+                    // Codex R6 P2#1: emit a space when exiting a
+                    // block comment so `if/**/false` becomes
+                    // `if false` (preserving token boundaries),
+                    // not `iffalse` (which would slip past the
+                    // runtime-control-flow scan).
+                    out.append(" ")
+                }
+                i += 2
+                continue
+            }
+            if c == "\n" { out.append(c) }
+            i += 1
+        case "string":
+            if c == "\\" { i += 2; continue }  // Skip escape sequence.
+            if c == "\"" {
+                mode = "code"
+                out.append(" ")  // Codex R6 P2#1: preserve token boundary.
+                i += 1
+                continue
+            }
+            if c == "\n" { out.append(c) }
+            i += 1
+        case "multi_string":
+            // Multi-line strings do NOT permit `\"""` escape per Swift
+            // grammar — the only way to close is a literal `"""`.
+            if three == "\"\"\"" {
+                mode = "code"
+                out.append(" ")  // Preserve token boundary.
+                i += 3
+                continue
+            }
+            if c == "\n" { out.append(c) }
+            i += 1
+        case "raw_string":
+            // Codex R3 P2#2: close only on `"##...#` with matching
+            // `#` count. `"#` alone inside `##"..."##` is body text.
+            if c == "\"" {
+                var k = 0
+                while i + 1 + k < n && chars[i + 1 + k] == "#" { k += 1 }
+                if k >= rawDelim {
+                    mode = "code"
+                    out.append(" ")  // Preserve token boundary.
+                    i += 1 + rawDelim  // Skip closing `"` + matching `#`s.
+                    continue
+                }
+                // Fewer `#`s than opener — body text.
+            }
+            if c == "\n" { out.append(c) }
+            i += 1
+        default:
+            i += 1
+        }
+    }
+    return out
+}
+
 // MARK: - LogValue tests
 
 run("LogValue.public emits verbatim") {
@@ -1117,6 +1239,258 @@ run("ProviderCopy id 'warp' matches WarpUsageStore.id — exercises the real Set
     expect(ProviderCopy.disclosure(for: "warp.dev") == nil)
 }
 
+run("AppDelegate wiring source-extractor self-test (Codex fix-verify R2 + R3)") {
+    // Codex fix-verify R2/R3: the wiring test's Swift source
+    // extractor (defined at module scope as
+    // `stripSwiftCommentsAndStrings`) MUST correctly blank comments
+    // AND string literal bodies so a hostile edit cannot smuggle
+    // the sentinel `providers.append(ProviderBox(...))` past the
+    // guard. This self-test exercises the extractor against a
+    // suite of hostile fixtures. Both this test and the wiring
+    // test call the SAME `stripSwiftCommentsAndStrings` function
+    // — a drift in the extractor breaks both.
+
+    // Hostile fixture 1: line comment sentinel (R2 P2#1 fix).
+    let hostile1 = """
+    // providers.append(ProviderBox(JetBrainsUsageStore()))
+    someOtherCode()
+    """
+    let out1 = stripSwiftCommentsAndStrings(hostile1)
+    expect(!out1.contains("providers.append(ProviderBox(JetBrainsUsageStore()))"),
+           "extractor self-test: line-comment sentinel leaked into code_only: \(out1)")
+
+    // Hostile fixture 2: block comment sentinel (R2 P2#2 fix).
+    let hostile2 = """
+    /*
+    providers.append(ProviderBox(JetBrainsUsageStore()))
+    providers.append(ProviderBox(WarpUsageStore()))
+    */
+    providersModel = init
+    """
+    let out2 = stripSwiftCommentsAndStrings(hostile2)
+    expect(!out2.contains("providers.append(ProviderBox(JetBrainsUsageStore()))"),
+           "extractor self-test: block-comment sentinel (JetBrains) leaked: \(out2)")
+    expect(!out2.contains("providers.append(ProviderBox(WarpUsageStore()))"),
+           "extractor self-test: block-comment sentinel (Warp) leaked: \(out2)")
+
+    // Hostile fixture 3: string-literal sentinel (R2 P2#1 fix).
+    let hostile3 = """
+    let _ = "providers.append(ProviderBox(JetBrainsUsageStore()))"
+    """
+    let out3 = stripSwiftCommentsAndStrings(hostile3)
+    expect(!out3.contains("providers.append(ProviderBox(JetBrainsUsageStore()))"),
+           "extractor self-test: string-literal sentinel leaked: \(out3)")
+
+    // Hostile fixture 4: multi-line string sentinel (R2 P2#2/P3#3).
+    let hostile4 = "let _ = \"\"\"\nproviders.append(ProviderBox(WarpUsageStore()))\n\"\"\""
+    let out4 = stripSwiftCommentsAndStrings(hostile4)
+    expect(!out4.contains("providers.append(ProviderBox(WarpUsageStore()))"),
+           "extractor self-test: multi-line string sentinel leaked: \(out4)")
+
+    // Hostile fixture 5: raw-string sentinel (R2 P3#3 fix).
+    let hostile5 = "let _ = #\"providers.append(ProviderBox(JetBrainsUsageStore()))\"#"
+    let out5 = stripSwiftCommentsAndStrings(hostile5)
+    expect(!out5.contains("providers.append(ProviderBox(JetBrainsUsageStore()))"),
+           "extractor self-test: raw-string sentinel leaked: \(out5)")
+
+    // Codex R3 P2#1: hostile fixture 6 — NESTED block comment.
+    let hostile6 = """
+    /*
+      /*
+      */
+      providers.append(ProviderBox(JetBrainsUsageStore()))
+      providers.append(ProviderBox(WarpUsageStore()))
+    */
+    """
+    let out6 = stripSwiftCommentsAndStrings(hostile6)
+    expect(!out6.contains("providers.append(ProviderBox(JetBrainsUsageStore()))"),
+           "extractor self-test: nested block-comment (JetBrains) leaked: \(out6)")
+    expect(!out6.contains("providers.append(ProviderBox(WarpUsageStore()))"),
+           "extractor self-test: nested block-comment (Warp) leaked: \(out6)")
+
+    // Codex R3 P2#2: hostile fixture 7 — extended raw string
+    // where `"#` appears INSIDE the body (not as the closer).
+    // In `##"..."##`, the closer is `"##`; `"#` alone is body.
+    let hostile7 = "let _ = ##\"prefix \"# providers.append(ProviderBox(JetBrainsUsageStore())) \"##"
+    let out7 = stripSwiftCommentsAndStrings(hostile7)
+    expect(!out7.contains("providers.append(ProviderBox(JetBrainsUsageStore()))"),
+           "extractor self-test: extended raw-string (##...##) with internal \"# leaked: \(out7)")
+
+    // Positive fixture: real code IS preserved.
+    let real = "providers.append(ProviderBox(JetBrainsUsageStore()))\n"
+    let outReal = stripSwiftCommentsAndStrings(real)
+    expect(outReal.contains("providers.append(ProviderBox(JetBrainsUsageStore()))"),
+           "extractor self-test: real code was mistakenly stripped: \(outReal)")
+
+    // Positive fixture: `#file` and similar bare-hash usage is
+    // preserved as code, not misclassified as a raw-string opener.
+    let bareHash = "let f = #file\n"
+    let outBareHash = stripSwiftCommentsAndStrings(bareHash)
+    expect(outBareHash.contains("#file"),
+           "extractor self-test: bare `#file` was mistakenly stripped: \(outBareHash)")
+
+    // Codex R4 P2#1: conditional-compilation directive bypass.
+    // The extractor preserves `#if false` blocks as code (correctly
+    // — they ARE code, syntactically), so the wiring test's
+    // separate directive-scan branch is what catches this bypass.
+    // Verify the extractor preserves `#if` so the directive scan
+    // has something to catch.
+    let condCompilation = "#if false\nproviders.append(ProviderBox(WarpUsageStore()))\n#endif\n"
+    let outCond = stripSwiftCommentsAndStrings(condCompilation)
+    expect(outCond.contains("#if"),
+           "extractor self-test: `#if` directive was mistakenly stripped — the wiring test's directive-scan branch will have nothing to check: \(outCond)")
+    expect(outCond.contains("providers.append"),
+           "extractor self-test: preserved `#if false` body should keep the append text visible to the directive-scan branch: \(outCond)")
+
+    // Codex R6 P2#1: token-boundary preservation. Inline block
+    // comments used as token separators (`if/**/false`) must NOT
+    // collapse to `iffalse` after stripping — that would slip past
+    // the runtime-control-flow scan which looks for `if ` / `if\t`.
+    // The stripper now emits a space when exiting comments and
+    // strings.
+    let tokenBoundary = "if/**/false { let _ = 1 }"
+    let outTokenBoundary = stripSwiftCommentsAndStrings(tokenBoundary)
+    expect(outTokenBoundary.contains("if ") || outTokenBoundary.contains("if\t"),
+           "extractor self-test: token-boundary preservation failed — `if/**/false` collapsed to `iffalse` (would slip past runtime-control-flow scan): \(outTokenBoundary)")
+    // Also: string-adjacent token boundaries. `case"x":return"y"`
+    // should have spaces inserted so the runtime-control-flow scan
+    // still sees `case` and `return` cleanly.
+    let stringAdjacent = "let x = \"y\"; if true { return }"
+    let outStringAdjacent = stripSwiftCommentsAndStrings(stringAdjacent)
+    expect(outStringAdjacent.contains("if "),
+           "extractor self-test: string-adjacent token boundary broken: \(outStringAdjacent)")
+}
+
+run("AppDelegate wiring: providers.append registers JetBrains + Warp (chk1 audit Bug #4 regression guard)") {
+    // 3cc P2#4 + chk1 audit Bug #4: the ProviderCopy id-drift tests
+    // above exercise the copy-catalog path but do NOT verify that
+    // `app/ClaudeUsageBar.swift` actually calls
+    // `providers.append(ProviderBox(JetBrainsUsageStore()))` and
+    // `providers.append(ProviderBox(WarpUsageStore()))`. Deleting
+    // either line would remove the Settings toggle entirely while
+    // leaving all copy-drift tests green — a silent regression.
+    //
+    // The `AppDelegate` class is compiled into the .app bundle
+    // only (excluded from the SwiftPM library because it depends
+    // on the `@main` entry point). So the TestRunner cannot
+    // instantiate AppDelegate directly and probe its `providers`
+    // array at runtime. The pragmatic guard is a source-scan
+    // against `app/ClaudeUsageBar.swift` verifying the two
+    // required `providers.append` lines exist verbatim.
+    //
+    // This is a COMPILE-TIME guard (source presence, not runtime
+    // behaviour), but it detects the specific regression the 3cc
+    // pass flagged: a deletion of the registration lines.
+    let thisFile = URL(fileURLWithPath: #filePath)
+    // #filePath resolves to Tests/TestRunner/main.swift. Two
+    // parent directories up is the repo root.
+    let repoRoot = thisFile.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    let appDelegatePath = repoRoot.appendingPathComponent("app/ClaudeUsageBar.swift").path
+    guard let rawSource = try? String(contentsOfFile: appDelegatePath, encoding: .utf8) else {
+        expect(false, "AppDelegate wiring guard: could not read \(appDelegatePath) — did the file move?")
+        return
+    }
+    // Codex fix-verify P2#1 R1: strip Swift comments AND blank
+    // string literal bodies BEFORE scanning so NONE of the
+    // following false-satisfies the wiring guard:
+    //   `// providers.append(ProviderBox(JetBrainsUsageStore()))`
+    //   `/* providers.append(...) */`
+    //   `let _ = "providers.append(...)"`
+    //   `let _ = """\nproviders.append(...)\n"""`
+    //   `let _ = #"providers.append(...)"#`
+    //
+    // Character-by-character state machine mirroring the awk
+    // extractor in .github/workflows/ci.yml's DMCA guard. Modes:
+    //   code            — emit character as-is
+    //   line_comment    — skip to newline
+    //   block_comment   — skip until `*/`
+    //   string          — emit " but skip body (skip escapes)
+    //   multi_string    — skip body until `"""`
+    //   raw_string      — skip body until `"#`
+    //
+    // The scan then greps the "code_only" output (comments +
+    // string bodies BLANKED, code preserved), so a hostile edit
+    // hiding the sentinel in a string literal or a comment cannot
+    // false-satisfy the guard.
+    let source: String = stripSwiftCommentsAndStrings(rawSource)
+    // The exact `providers.append(ProviderBox(...))` line for each
+    // provider. Pinned VERBATIM so a rename would fail this test.
+    // Comments have been stripped above so `source.contains(...)`
+    // now matches only executable code.
+    expect(source.contains("providers.append(ProviderBox(JetBrainsUsageStore()))"),
+           "AppDelegate wiring: `providers.append(ProviderBox(JetBrainsUsageStore()))` is MISSING from app/ClaudeUsageBar.swift (executable code, not a comment) — the JetBrains Settings toggle will not appear.")
+    expect(source.contains("providers.append(ProviderBox(WarpUsageStore()))"),
+           "AppDelegate wiring: `providers.append(ProviderBox(WarpUsageStore()))` is MISSING from app/ClaudeUsageBar.swift (executable code, not a comment) — the Warp Settings toggle will not appear.")
+    // Verify the registration happens BEFORE `providersModel`
+    // init. If a maintainer accidentally moved the appends AFTER
+    // the model init, the stores would be registered but the model
+    // would already be constructed with the earlier list.
+    guard let jetbrainsIdx = source.range(of: "providers.append(ProviderBox(JetBrainsUsageStore()))")?.lowerBound,
+          let warpIdx = source.range(of: "providers.append(ProviderBox(WarpUsageStore()))")?.lowerBound,
+          let modelIdx = source.range(of: "providersModel = ProvidersModel(providers: providers)")?.lowerBound else {
+        expect(false, "AppDelegate wiring: expected registration + model-init lines not both present.")
+        return
+    }
+    expect(jetbrainsIdx < modelIdx, "AppDelegate wiring: JetBrains registered AFTER providersModel init — the model will not see JetBrains.")
+    expect(warpIdx < modelIdx, "AppDelegate wiring: Warp registered AFTER providersModel init — the model will not see Warp.")
+    // Order sanity: JetBrains before Warp (matches RESUME.md spec
+    // line 202: "JetBrains first (pure-local), Warp second (pure-
+    // local). Both alphabetical.").
+    expect(jetbrainsIdx < warpIdx, "AppDelegate wiring: Warp registered BEFORE JetBrains — order deviates from spec (RESUME.md line 202).")
+    // Order sanity: JetBrains + Warp come AFTER Cursor (last
+    // pre-PR-12 provider). If the earlier providers ever got
+    // deleted, this would flag the regression.
+    guard let cursorIdx = source.range(of: "providers.append(ProviderBox(CursorUsageStore()))")?.lowerBound else {
+        expect(false, "AppDelegate wiring: Cursor registration missing — the JetBrains-after-Cursor ordering cannot be verified.")
+        return
+    }
+    expect(cursorIdx < jetbrainsIdx, "AppDelegate wiring: JetBrains registered BEFORE Cursor — deviates from spec (RESUME.md line 202: after Cursor).")
+
+    // Codex fix-verify R4 P2#1: reject conditional-compilation
+    // directives in the provider-registration region. A hostile edit
+    // could wrap the appends in `#if false ... #endif` — the Swift
+    // compiler would drop them but the extractor would preserve
+    // them as code, satisfying the ordering checks above while
+    // the Settings toggles are silently missing at runtime.
+    //
+    // The registration region is bounded by the earlier Cursor
+    // append and the providersModel init. If ANY conditional-
+    // compilation directive (`#if`, `#elseif`, `#else`, `#endif`,
+    // `#available`) appears between them, flag it. The rest of
+    // AppDelegate (later in the file) is permitted to use `#if
+    // DEBUG` etc. — the ban is scoped to the registration region.
+    let regionStart = cursorIdx
+    let regionEnd = modelIdx
+    let region = source[regionStart..<regionEnd]
+    // Match `#if`, `#elseif`, `#else`, `#endif` as directives.
+    // `#available` is a separate concern (runtime OS check, not
+    // compile-time) but historically has been misused to gate
+    // registrations — flag it too for defensive posture.
+    let directivePatterns = ["#if ", "#if\t", "#elseif", "#else", "#endif", "#available"]
+    for pattern in directivePatterns {
+        expect(!region.contains(pattern),
+               "AppDelegate wiring: conditional-compilation directive `\(pattern)` found in the provider-registration region (between Cursor append and providersModel init). This would let the Swift compiler drop the JetBrains/Warp appends while the source-scan guard still passes.")
+    }
+    // Codex fix-verify R5 P2#1: runtime control flow bypass. An
+    // edit like:
+    //   if false {
+    //       providers.append(ProviderBox(JetBrainsUsageStore()))
+    //       providers.append(ProviderBox(WarpUsageStore()))
+    //   }
+    // ...satisfies the source-scan (the appends are present, in
+    // the right order, and no `#if` directives), but the appends
+    // never execute. Reject ordinary runtime control-flow tokens
+    // in the region too. The pre-PR-12 registration region is
+    // linear straight-line code — every append is a top-level
+    // statement without any surrounding condition — so ANY of
+    // these keywords in the region is a suspicious deviation.
+    let runtimeControlPatterns = ["if ", "if\t", "guard ", "guard\t", "for ", "for\t", "while ", "while\t", "switch ", "switch\t", "do ", "do\t", "do{", "defer ", "defer\t", "defer{", "func ", "func\t", "repeat ", "repeat\t", "repeat{"]
+    for pattern in runtimeControlPatterns {
+        expect(!region.contains(pattern),
+               "AppDelegate wiring: runtime control-flow keyword `\(pattern.trimmingCharacters(in: .whitespaces))` found in the provider-registration region. Every provider registration must be a top-level straight-line statement — control-flow wrapping (`if false { … }`, closures, guards) would silently drop the appends at runtime while satisfying the source-scan.")
+    }
+}
+
 run("ProviderCopy: JetBrains help names both vendor roots, the XML filename, pure-local posture (PR 12-UI)") {
     // The JetBrains help must (1) name BOTH vendor roots so a user
     // with Android Studio understands why AS is included even though
@@ -1223,12 +1597,16 @@ run("ProviderCopy: Warp help names both sqlite paths + Group Container fallback 
     // usage / balance tile. Warp's balance and rate limits live
     // server-side; those are the deferred wk-key path.
     expect(help?.contains("today") == true)
-    // Codex R2 P3#2: pin the balance + rate-limit exclusion facts
-    // INDEPENDENTLY so a rewrite that dropped one is caught. The
-    // prior single `||` chain permitted "history is not read here"
-    // to satisfy the asserion while dropping "credit balance" and
-    // "rate limits".
-    expect(help?.contains("credit balance") == true || help?.contains("balance") == true)
+    // Codex R2 P3#2 + chk1 audit Bug #3: pin the balance + rate-
+    // limit exclusion facts INDEPENDENTLY so a rewrite that dropped
+    // one is caught. The prior single `||` chain permitted "history
+    // is not read here" to satisfy the assertion while dropping
+    // "credit balance" and "rate limits". The `|| balance` fallback
+    // in the earlier revision was too permissive: any occurrence of
+    // "balance" (a substring of "credit balance") would satisfy it,
+    // so a drift from "credit balance" to just "balance" would
+    // silently pass. Pin the SPECIFIC phrase "credit balance".
+    expect(help?.contains("credit balance") == true)
     expect(help?.contains("rate limits") == true)
     expect(help?.contains("NOT read") == true || help?.contains("not read") == true)
 }
@@ -1276,8 +1654,11 @@ run("ProviderCopy: Warp disclosure covers schema drift + wk-key path deferred (P
     // allowed "wk-" alone would drop the "server-side" contrast.
     expect(disc?.contains("server-side") == true)
     // Credit balance is one of the two things NOT read locally —
-    // pin the specific word so a vague rewrite fails.
-    expect(disc?.contains("credit balance") == true || disc?.contains("balance") == true)
+    // pin the specific word so a vague rewrite fails. chk1 audit
+    // Bug #3: drop the `|| balance` fallback — "balance" alone
+    // is a substring of "credit balance" and would false-pass a
+    // drift from "credit balance" to just "balance".
+    expect(disc?.contains("credit balance") == true)
     // Rate limits are the OTHER thing NOT read locally — same
     // reasoning.
     expect(disc?.contains("rate limits") == true)
