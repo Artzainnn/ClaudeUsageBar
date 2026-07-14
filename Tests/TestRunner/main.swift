@@ -10496,7 +10496,10 @@ MainActor.assumeIsolated {
         let snapshotCopy = snapshot
         let nowCopy = now
         let overCapCopy = overCap
+        // PR 19: merged RooZooUsageStore; must pass ext: .zoo
+        // explicitly since the initialiser defaults to .roo.
         return ZooUsageStore(
+            ext: .zoo,
             defaults: defaults,
             resolveScanRoots: { [RooZooPathResolver.ScanRoot(id: "test", tasksDirectoryPath: "/tmp/fake/zoo-tasks", extensionId: .zoo)] },
             tccProbe: { _ in tccState },
@@ -10765,7 +10768,8 @@ run("ProviderCopy id 'roo' matches RooUsageStore.id — exercises the real Setti
 
 run("ProviderCopy id 'zoo' matches ZooUsageStore.id — exercises the real Settings path (PR 13-UI regression guard)") {
     MainActor.assumeIsolated {
-        let store = ZooUsageStore()
+        // PR 19: merged store; must pass ext: .zoo explicitly.
+        let store = ZooUsageStore(ext: .zoo)
         expect(ProviderCopy.help(for: store.id) != nil)
         expect(ProviderCopy.disclosure(for: store.id) != nil)
         let box = ProviderBox(store)

@@ -148,8 +148,12 @@ let package = Package(
                 // from Zoo (active fork).
                 "RooZooPathResolver.swift",
                 "RooZooUsageFetcher.swift",
+                // PR 19 — Roo + Zoo stores merged into one class
+                // parameterised by `RooZooExtension`. `RooUsageStore`
+                // and `ZooUsageStore` remain as typealiases in the
+                // same file for source-compatibility with the
+                // AppDelegate registration site.
                 "RooUsageStore.swift",
-                "ZooUsageStore.swift",
                 // PR 15-BE — Gemini Developer local JSONL reader.
                 // Reads Gemini CLI's `~/.gemini/tmp/<projectHash>/chats/
                 // session-*.jsonl`. Feature-flagged off. Tokens + cost

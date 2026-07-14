@@ -163,7 +163,10 @@ class AppDelegate: NSObject, @preconcurrency NSApplicationDelegate {
         // Same file layout as Roo; shared fetcher and path resolver,
         // separate feature flag and store so users can enable one
         // without the other. Backend from this PR.
-        providers.append(ProviderBox(ZooUsageStore()))
+        // PR 19 — Zoo instance of the merged RooZooUsageStore class.
+        // Must pass ext: .zoo explicitly; the zero-arg convenience
+        // initialiser defaults to .roo.
+        providers.append(ProviderBox(ZooUsageStore(ext: .zoo)))
         // PR 15-BE: register Gemini Developer local JSONL reader.
         // Opt-in (features.gemini.enabled defaults false); reads
         // `~/.gemini/tmp/<projectHash>/chats/session-*.jsonl` — the

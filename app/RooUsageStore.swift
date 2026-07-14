@@ -1,34 +1,57 @@
-// PR 13-BE — Roo Code UsageProvider store (feature-flag off).
+// PR 19 — merged Roo + Zoo UsageProvider store.
 //
-// Twin of ZooUsageStore, differing only in extensionId (.roo vs .zoo),
-// id, displayName, and feature-flag key. Both use the shared
-// RooZooPathResolver + RooZooUsageFetcher.
+// Before PR 19, `RooUsageStore` and `ZooUsageStore` were two ~360-
+// line stores that differed by exactly 9 substantive characters
+// (extension id enum case, display-name string, feature-flag key,
+// workQueue label, and log-line prefix — all derivable from a
+// single `RooZooExtension` value). The duplication was intentional
+// during Milestone 6 (PR 13-BE) so the two providers could remain
+// independent should they diverge; Roo's GitHub repo is archived
+// (May 2026) and Zoo Code is the active fork, so divergence is now
+// implausible.
 //
-// Concurrency model mirrors ClineUsageStore: parse work runs on a
-// serial background queue; results apply on the main actor via
-// `Task { @MainActor [weak self] in ... }`; `fetchGeneration`
-// invalidates any in-flight completion so a TCC transition, disable,
-// or `clear()` cannot repopulate stale state. Re-probe-on-completion
-// pattern inherited from ClineUsageStore (3cc R3 F5).
+// PR 19 merges them into a single parameterised
+// `RooZooUsageStore` class. Two instances are constructed at
+// registration time — `RooZooUsageStore(ext: .roo)` and
+// `RooZooUsageStore(ext: .zoo)` — so users still toggle each
+// provider independently via distinct feature flags.
 //
-// Roo's GitHub repo is archived (May 2026), extension frozen at
-// v3.54.0. This store is kept alongside ZooUsageStore so users who
-// still have Roo installed can toggle it independently.
+// Concurrency: same pattern as ClineUsageStore.fetch():
+// - generation counter invalidates stale completions.
+// - resolveScanRoots + TCC probe loop run OFF the main actor
+//   (3cc R3 F1 pattern from PR 13-BE).
+// - re-probe on completion (3cc R3 F5).
+// - non-granted branch clears lastUpdatedAt (3cc round-2 F2).
 //
-// Feature posture — `features.roo.enabled` defaults false. Nothing
-// registers a RooUsageStore into `AppDelegate.providers` yet; that
-// lands in PR 13-UI along with `ProviderCopy.help(for: "roo")`.
+// Public type kept as `RooUsageStore` for source-compatibility of
+// the AppDelegate registration site; ZooUsageStore is deleted.
 
 import Foundation
 import SwiftUI
 import Combine
 
-@MainActor
-public final class RooUsageStore: UsageProvider {
+/// Type-alias so `Roo` and `Zoo` remain distinct compile-time
+/// identifiers at the registration site, while sharing one
+/// implementation. `AppDelegate.applicationDidFinishLaunching`
+/// still writes `providers.append(ProviderBox(RooUsageStore()))`
+/// and `providers.append(ProviderBox(ZooUsageStore()))`; both
+/// forward to the merged class below.
+public typealias RooUsageStore = RooZooUsageStore
+public typealias ZooUsageStore = RooZooUsageStore
 
-    public let id: String = "roo"
-    public let displayName: String = "Roo Code"
-    public let featureFlagKey: String = "features.roo.enabled"
+@MainActor
+public final class RooZooUsageStore: UsageProvider {
+
+    public let ext: RooZooExtension
+
+    public var id: String {
+        switch ext {
+        case .roo: return "roo"
+        case .zoo: return "zoo"
+        }
+    }
+    public var displayName: String { ext.displayShortName }
+    public var featureFlagKey: String { "features.\(id).enabled" }
 
     @Published public private(set) var snapshot: RooZooUsageSnapshot?
     @Published public private(set) var lastUpdatedAt: Date?
@@ -49,10 +72,9 @@ public final class RooUsageStore: UsageProvider {
     private var lastAppliedGrantedRootsKey: String?
 
     public init(
+        ext: RooZooExtension = .roo,
         defaults: UserDefaults = .standard,
-        resolveScanRoots: @escaping @Sendable () -> [RooZooPathResolver.ScanRoot] = {
-            RooZooPathResolver.resolveScanRoots(.current(), for: .roo)
-        },
+        resolveScanRoots: (@Sendable () -> [RooZooPathResolver.ScanRoot])? = nil,
         tccProbe: @escaping @Sendable (String) -> TCCState = { TCCProbe.probe(path: $0) },
         discoverTasks: @escaping @Sendable ([RooZooPathResolver.ScanRoot]) -> (tasks: [RooZooDiscoveredTask], overCap: Int) = {
             RooZooUsageFetcher.discoverTasks(under: $0)
@@ -60,18 +82,25 @@ public final class RooUsageStore: UsageProvider {
         parseTasks: @escaping @Sendable ([RooZooDiscoveredTask]) -> RooZooUsageSnapshot = {
             RooZooUsageFetcher.parseTasks($0)
         },
-        workQueue: DispatchQueue = DispatchQueue(
-            label: "com.claude.usagebar.roo.parse",
-            qos: .utility
-        ),
+        workQueue: DispatchQueue? = nil,
         clock: @escaping @Sendable () -> Date = { Date() }
     ) {
+        self.ext = ext
         self.defaults = defaults
-        self.resolveScanRoots = resolveScanRoots
+        // Default resolveScanRoots binds the extension value so we
+        // don't need one closure per case in the type-alias.
+        self.resolveScanRoots = resolveScanRoots ?? {
+            RooZooPathResolver.resolveScanRoots(.current(), for: ext)
+        }
         self.tccProbe = tccProbe
         self.discoverTasks = discoverTasks
         self.parseTasks = parseTasks
-        self.workQueue = workQueue
+        // Distinct workQueue label per extension for
+        // Instruments-friendly stack traces.
+        self.workQueue = workQueue ?? DispatchQueue(
+            label: "com.claude.usagebar.\(ext.rawValue).parse",
+            qos: .utility
+        )
         self.clock = clock
     }
 
@@ -83,7 +112,7 @@ public final class RooUsageStore: UsageProvider {
     public var tiles: [UsageTile] {
         guard isEnabled else { return [] }
         return RooZooTileBuilder.build(
-            providerId: "roo",
+            providerId: id,
             displayName: displayName,
             snapshot: snapshot,
             tccState: tccState,
@@ -103,19 +132,15 @@ public final class RooUsageStore: UsageProvider {
             return
         }
         let launchGeneration = fetchGeneration
-        // 3cc R3 F1 fix: BOTH `resolveScanRoots()` (which reads
-        // per-host settings.json — synchronous file I/O that can
-        // block on offline NAS mounts) AND the TCC probe (which does
-        // fileExists + contentsOfDirectory syscalls) now run on
-        // `workQueue` rather than on the main actor. Previously the
-        // menubar UI would freeze for the SMB/NFS timeout (60-90s)
-        // if any settings.json lived on a dead mount. Only the state
-        // apply hop still runs on main.
         let resolve = self.resolveScanRoots
         let probe = self.tccProbe
         let discover = self.discoverTasks
         let parse = self.parseTasks
         let priorAppliedKey = self.lastAppliedGrantedRootsKey
+        // Capture the extension's display short name for the log
+        // line so the two instances produce distinguishable log
+        // output.
+        let logLabel = "\(ext.displayShortName) tasks parsed"
 
         workQueue.async { [weak self] in
             let scanRoots = resolve()
@@ -150,10 +175,6 @@ public final class RooUsageStore: UsageProvider {
                     self.lastAppliedGrantedRootsKey = nil
                     self.lastError = nil
                     self.overTaskCapCount = 0
-                    // 3cc round-2 F2: also clear lastUpdatedAt so the
-                    // popover doesn't show "Updated 3 mins ago" against
-                    // an empty needs-access tile after access is
-                    // revoked mid-session. Matches Warp's chk1 pattern.
                     self.lastUpdatedAt = nil
                 }
                 return
@@ -169,15 +190,8 @@ public final class RooUsageStore: UsageProvider {
                 self.tccState = .granted
                 self.deniedRootCount = deniedCount
                 if grantedKey != priorAppliedKey {
-                    // Root set changed; the stored snapshot may
-                    // include usage from a now-inaccessible root.
                     self.snapshot = nil
                 }
-                // Re-probe every root on completion (3cc R3 F5) so a
-                // TCC transition between fetch-start and apply is
-                // caught. A now-.denied root discards the parse
-                // result rather than writing a silently empty
-                // snapshot.
                 var stillAllGranted = true
                 var newDeniedCount = 0
                 for root in grantedRoots {
@@ -193,7 +207,6 @@ public final class RooUsageStore: UsageProvider {
                     self.snapshot = nil
                     self.lastAppliedGrantedRootsKey = nil
                     self.overTaskCapCount = 0
-                    // 3cc round-2 F2: also clear lastUpdatedAt.
                     self.lastUpdatedAt = nil
                     return
                 }
@@ -202,7 +215,7 @@ public final class RooUsageStore: UsageProvider {
                 self.lastAppliedGrantedRootsKey = grantedKey
                 self.lastUpdatedAt = self.clock()
                 self.lastError = nil
-                Log.info("Roo tasks parsed", .count(snap.records.count))
+                Log.info(logLabel, .count(snap.records.count))
             }
         }
     }
@@ -220,14 +233,11 @@ public final class RooUsageStore: UsageProvider {
 
 // MARK: - Shared tile builder
 
-/// Common tile-rendering logic between RooUsageStore and ZooUsageStore.
-/// Extracted so both stores render an identical set of tiles with only
-/// the provider id, display name, and per-extension host list changing.
+/// Common tile-rendering logic between the two Roo/Zoo instances.
+/// The `providerId` prefix scopes tile IDs (`roo-tokens-today` /
+/// `zoo-tokens-today`).
 public enum RooZooTileBuilder {
 
-    /// Build the tile list for a Roo or Zoo store's current state.
-    /// The `providerId` prefix scopes tile IDs
-    /// (`roo-tokens-today` / `zoo-tokens-today`).
     public static func build(
         providerId: String,
         displayName: String,
