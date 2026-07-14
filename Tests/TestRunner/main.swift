@@ -10370,6 +10370,189 @@ run("RooZooPathResolver.resolveScanRoots: customStoragePath adds a scan root lab
     expect(customRoots.first?.tasksDirectoryPath.hasSuffix("/tasks") == true)
 }
 
+// MARK: - RooUsageStore + ZooUsageStore (PR 13-BE)
+
+MainActor.assumeIsolated {
+
+    @MainActor func makeRooStore(
+        flagEnabled: Bool = true,
+        tccState: TCCState = .granted,
+        tasks: [RooZooDiscoveredTask] = [],
+        snapshot: RooZooUsageSnapshot = RooZooUsageSnapshot(records: []),
+        overCap: Int = 0,
+        now: Date = Date()
+    ) -> RooUsageStore {
+        let defaults = UserDefaults(suiteName: "roo-test-\(UUID().uuidString)")!
+        defaults.set(flagEnabled, forKey: "features.roo.enabled")
+        let tasksCopy = tasks
+        let snapshotCopy = snapshot
+        let nowCopy = now
+        let overCapCopy = overCap
+        return RooUsageStore(
+            defaults: defaults,
+            resolveScanRoots: { [RooZooPathResolver.ScanRoot(id: "test", tasksDirectoryPath: "/tmp/fake/roo-tasks", extensionId: .roo)] },
+            tccProbe: { _ in tccState },
+            discoverTasks: { _ in (tasksCopy, overCapCopy) },
+            parseTasks: { _ in snapshotCopy },
+            clock: { nowCopy }
+        )
+    }
+
+    @MainActor func makeZooStore(
+        flagEnabled: Bool = true,
+        tccState: TCCState = .granted,
+        tasks: [RooZooDiscoveredTask] = [],
+        snapshot: RooZooUsageSnapshot = RooZooUsageSnapshot(records: []),
+        overCap: Int = 0,
+        now: Date = Date()
+    ) -> ZooUsageStore {
+        let defaults = UserDefaults(suiteName: "zoo-test-\(UUID().uuidString)")!
+        defaults.set(flagEnabled, forKey: "features.zoo.enabled")
+        let tasksCopy = tasks
+        let snapshotCopy = snapshot
+        let nowCopy = now
+        let overCapCopy = overCap
+        return ZooUsageStore(
+            defaults: defaults,
+            resolveScanRoots: { [RooZooPathResolver.ScanRoot(id: "test", tasksDirectoryPath: "/tmp/fake/zoo-tasks", extensionId: .zoo)] },
+            tccProbe: { _ in tccState },
+            discoverTasks: { _ in (tasksCopy, overCapCopy) },
+            parseTasks: { _ in snapshotCopy },
+            clock: { nowCopy }
+        )
+    }
+
+    @MainActor func awaitRooZooFetch() {
+        let deadline = Date().addingTimeInterval(2.0)
+        while Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
+    }
+
+    run("RooUsageStore: feature-flag off produces no tiles") {
+        let store = makeRooStore(flagEnabled: false)
+        expectEqual(store.tiles.count, 0)
+        expect(!store.isEnabled)
+    }
+
+    run("RooUsageStore: TCC .denied renders needsAccess tile only") {
+        let store = makeRooStore(flagEnabled: true, tccState: .denied)
+        store.fetch()
+        awaitRooZooFetch()
+        let tiles = store.tiles
+        expectEqual(tiles.count, 1)
+        expectEqual(tiles.first?.id, "roo-needs-access")
+    }
+
+    run("RooUsageStore: TCC .pathMissing renders 'not installed' tile") {
+        let store = makeRooStore(flagEnabled: true, tccState: .pathMissing)
+        store.fetch()
+        awaitRooZooFetch()
+        let tiles = store.tiles
+        expectEqual(tiles.count, 1)
+        expectEqual(tiles.first?.id, "roo-not-installed")
+    }
+
+    run("RooUsageStore: fetch populates snapshot and emits usage tiles") {
+        let now = ClaudeCodeUsageFetcher.parseTimestamp("2026-07-15T14:00:00Z")!
+        let rec = RooZooTaskRecord(
+            taskId: "t1", model: "claude-opus-4-7", timestamp: now,
+            tokensIn: 100, tokensOut: 50, cacheWrites: 0, cacheReads: 0,
+            costUSD: 0.02, extensionId: .roo, sourcePath: "/x",
+            source: .historyItem
+        )
+        let snap = RooZooUsageSnapshot(records: [rec])
+        let task = RooZooDiscoveredTask(taskId: "t1", taskDir: "/tmp/x", extensionId: .roo)
+        let store = makeRooStore(
+            flagEnabled: true, tccState: .granted,
+            tasks: [task], snapshot: snap, now: now
+        )
+        store.fetch()
+        awaitRooZooFetch()
+        expect(store.snapshot != nil)
+        expect(store.lastUpdatedAt != nil)
+        let ids = Set(store.tiles.map { $0.id })
+        expect(ids.contains("roo-tokens-today"))
+        expect(ids.contains("roo-cost-today"))
+        expect(ids.contains("roo-cost-mtd"))
+        expect(ids.contains("roo-by-model"))
+    }
+
+    run("RooUsageStore: overTaskCap emits diagnostic tile") {
+        let now = ClaudeCodeUsageFetcher.parseTimestamp("2026-07-15T14:00:00Z")!
+        let store = makeRooStore(
+            flagEnabled: true, tccState: .granted,
+            tasks: [], snapshot: RooZooUsageSnapshot(records: []),
+            overCap: 42, now: now
+        )
+        store.fetch()
+        awaitRooZooFetch()
+        let ids = Set(store.tiles.map { $0.id })
+        expect(ids.contains("roo-cap"))
+    }
+
+    run("RooUsageStore: clear() drops snapshot + state") {
+        let now = ClaudeCodeUsageFetcher.parseTimestamp("2026-07-15T14:00:00Z")!
+        let rec = RooZooTaskRecord(
+            taskId: "t1", model: "m", timestamp: now,
+            tokensIn: 1, tokensOut: 1, cacheWrites: 0, cacheReads: 0,
+            costUSD: 0.01, extensionId: .roo, sourcePath: "/x",
+            source: .historyItem
+        )
+        let store = makeRooStore(
+            flagEnabled: true, tccState: .granted,
+            tasks: [RooZooDiscoveredTask(taskId: "t1", taskDir: "/x", extensionId: .roo)],
+            snapshot: RooZooUsageSnapshot(records: [rec]),
+            now: now
+        )
+        store.fetch()
+        awaitRooZooFetch()
+        expect(store.snapshot != nil)
+        store.clear()
+        expect(store.snapshot == nil)
+        expect(store.lastUpdatedAt == nil)
+    }
+
+    run("ZooUsageStore: id and displayName distinct from Roo") {
+        let store = makeZooStore(flagEnabled: false)
+        expectEqual(store.id, "zoo")
+        expectEqual(store.displayName, "Zoo Code")
+        expectEqual(store.featureFlagKey, "features.zoo.enabled")
+    }
+
+    run("ZooUsageStore: TCC .denied renders needsAccess tile with zoo-prefixed id") {
+        let store = makeZooStore(flagEnabled: true, tccState: .denied)
+        store.fetch()
+        awaitRooZooFetch()
+        let tiles = store.tiles
+        expectEqual(tiles.count, 1)
+        expectEqual(tiles.first?.id, "zoo-needs-access")
+    }
+
+    run("ZooUsageStore: fetch populates snapshot and emits zoo-prefixed tiles") {
+        let now = ClaudeCodeUsageFetcher.parseTimestamp("2026-07-15T14:00:00Z")!
+        let rec = RooZooTaskRecord(
+            taskId: "t2", model: "gpt-5", timestamp: now,
+            tokensIn: 200, tokensOut: 100, cacheWrites: 0, cacheReads: 0,
+            costUSD: 0.04, extensionId: .zoo, sourcePath: "/x",
+            source: .historyItem
+        )
+        let snap = RooZooUsageSnapshot(records: [rec])
+        let task = RooZooDiscoveredTask(taskId: "t2", taskDir: "/tmp/x", extensionId: .zoo)
+        let store = makeZooStore(
+            flagEnabled: true, tccState: .granted,
+            tasks: [task], snapshot: snap, now: now
+        )
+        store.fetch()
+        awaitRooZooFetch()
+        expect(store.snapshot != nil)
+        let ids = Set(store.tiles.map { $0.id })
+        expect(ids.contains("zoo-tokens-today"))
+        expect(ids.contains("zoo-cost-today"))
+    }
+
+}  // end MainActor.assumeIsolated for RooUsageStore + ZooUsageStore
+
 // MARK: - Summary
 
 print("")
