@@ -10807,6 +10807,129 @@ run("ProviderCopy disclosure(for: 'zoo') calls out that Zoo is the active fork o
     expect(disc.contains("10 000"))
 }
 
+// MARK: - GeminiUsageFetcher (PR 15-BE)
+
+run("GeminiUsageFetcher.parseLine: happy path — gemini message with tokens block") {
+    let line = #"{"id":"m1","type":"gemini","timestamp":"2026-07-15T14:00:00Z","model":"gemini-2.5-pro","tokens":{"input":1000,"output":500,"cached":100,"total":1600}}"#
+    var m = 0, u = 0
+    let rec = GeminiUsageFetcher.parseLine(line, sourceFile: "/x", malformedCount: &m, unknownModelCount: &u)
+    expect(rec != nil)
+    expectEqual(rec?.model, "gemini-2.5-pro")
+    expectEqual(rec?.inputTokens ?? -1, 1000)
+    expectEqual(rec?.outputTokens ?? -1, 500)
+    expectEqual(rec?.cachedTokens ?? -1, 100)
+    expect(rec?.timestamp != nil)
+    expect((rec?.costUSD ?? 0) > 0)  // priced via bundled table
+    expectEqual(m, 0)
+    expectEqual(u, 0)
+}
+
+run("GeminiUsageFetcher.parseLine: ignores user messages") {
+    let line = #"{"id":"u1","type":"user","timestamp":"2026-07-15T14:00:00Z","content":"hello"}"#
+    var m = 0, u = 0
+    let rec = GeminiUsageFetcher.parseLine(line, sourceFile: "/x", malformedCount: &m, unknownModelCount: &u)
+    expect(rec == nil)
+    expectEqual(m, 0)  // rejection is not malformed
+}
+
+run("GeminiUsageFetcher.parseLine: ignores rewind + metadata records") {
+    var m = 0, u = 0
+    let rewind = #"{"$rewindTo":"m5"}"#
+    expect(GeminiUsageFetcher.parseLine(rewind, sourceFile: "/x", malformedCount: &m, unknownModelCount: &u) == nil)
+    let meta = #"{"$set":{"model":"gemini-2.5-pro"}}"#
+    expect(GeminiUsageFetcher.parseLine(meta, sourceFile: "/x", malformedCount: &m, unknownModelCount: &u) == nil)
+    expectEqual(m, 0)
+}
+
+run("GeminiUsageFetcher.parseLine: unknown model produces record with zero cost + increments count") {
+    let line = #"{"id":"m1","type":"gemini","timestamp":"2026-07-15T14:00:00Z","model":"gemini-3.0-ultra","tokens":{"input":100,"output":50,"total":150}}"#
+    var m = 0, u = 0
+    let rec = GeminiUsageFetcher.parseLine(line, sourceFile: "/x", malformedCount: &m, unknownModelCount: &u)
+    expect(rec != nil)
+    expectEqual(rec?.costUSD ?? -1, 0.0)
+    expectEqual(u, 1)
+}
+
+run("GeminiUsageFetcher.parseLine: skips gemini message with all-zero tokens") {
+    let line = #"{"id":"m1","type":"gemini","timestamp":"2026-07-15T14:00:00Z","model":"gemini-2.5-pro","tokens":{"input":0,"output":0,"total":0}}"#
+    var m = 0, u = 0
+    expect(GeminiUsageFetcher.parseLine(line, sourceFile: "/x", malformedCount: &m, unknownModelCount: &u) == nil)
+}
+
+run("GeminiUsageFetcher.parseLine: malformed JSON increments count") {
+    var m = 0, u = 0
+    expect(GeminiUsageFetcher.parseLine("{not valid", sourceFile: "/x", malformedCount: &m, unknownModelCount: &u) == nil)
+    expectEqual(m, 1)
+}
+
+run("GeminiUsageFetcher.parseLine: hostile Bool in token count rejected as 0") {
+    let line = #"{"id":"m1","type":"gemini","timestamp":"2026-07-15T14:00:00Z","model":"gemini-2.5-pro","tokens":{"input":true,"output":500,"total":500}}"#
+    var m = 0, u = 0
+    let rec = GeminiUsageFetcher.parseLine(line, sourceFile: "/x", malformedCount: &m, unknownModelCount: &u)
+    expect(rec != nil)
+    expectEqual(rec?.inputTokens ?? -1, 0)   // Bool → 0 via safeInt guard
+    expectEqual(rec?.outputTokens ?? -1, 500)
+}
+
+run("GeminiPricing.rate: known Gemini 2.5 Pro / Flash matches table") {
+    expect(GeminiPricing.rate(for: "gemini-2.5-pro") != nil)
+    expect(GeminiPricing.rate(for: "gemini-2.5-flash") != nil)
+    expect(GeminiPricing.rate(for: "gemini-1.5-pro") != nil)
+    expect(GeminiPricing.rate(for: "gemini-1.5-flash") != nil)
+    // Suffix-stripping — `-latest` and `-002` variants should match.
+    expect(GeminiPricing.rate(for: "gemini-2.5-pro-latest") != nil)
+    expect(GeminiPricing.rate(for: "gemini-2.5-flash-002") != nil)
+    expect(GeminiPricing.rate(for: "gemini-2.5-flash-preview-06-17") != nil)
+    // Unknown returns nil.
+    expect(GeminiPricing.rate(for: "gemini-3.0-ultra") == nil)
+    expect(GeminiPricing.rate(for: "totally-not-gemini") == nil)
+}
+
+run("GeminiPathResolver.resolveScanRoots: env var overrides default") {
+    let env = GeminiPathResolver.Environment(
+        geminiCliHome: "/custom/gemini",
+        homeDirectoryPath: "/Users/x"
+    )
+    let roots = GeminiPathResolver.resolveScanRoots(env)
+    expectEqual(roots.count, 1)
+    expectEqual(roots.first?.tmpDirectoryPath, "/custom/gemini/tmp")
+    expect(roots.first?.id.contains("GEMINI_CLI_HOME") == true)
+}
+
+run("GeminiPathResolver.resolveScanRoots: default is ~/.gemini/tmp under home") {
+    let env = GeminiPathResolver.Environment(
+        geminiCliHome: nil,
+        homeDirectoryPath: "/Users/x"
+    )
+    let roots = GeminiPathResolver.resolveScanRoots(env)
+    expectEqual(roots.count, 1)
+    expectEqual(roots.first?.tmpDirectoryPath, "/Users/x/.gemini/tmp")
+}
+
+run("GeminiUsageFetcher.parse: end-to-end file → snapshot") {
+    let tmp = FileManager.default.temporaryDirectory
+        .appendingPathComponent("gemini-test-\(UUID().uuidString).jsonl")
+    defer { try? FileManager.default.removeItem(at: tmp) }
+    let content = """
+    {"id":"u1","type":"user","timestamp":"2026-07-15T10:00:00Z","content":"hi"}
+    {"id":"m1","type":"gemini","timestamp":"2026-07-15T10:00:01Z","model":"gemini-2.5-pro","tokens":{"input":1000,"output":500,"cached":0,"total":1500}}
+    {"$rewindTo":"m1"}
+    {"id":"m2","type":"gemini","timestamp":"2026-07-15T10:01:00Z","model":"gemini-2.5-flash","tokens":{"input":300,"output":200,"total":500}}
+    """
+    try! content.data(using: .utf8)!.write(to: tmp)
+    let snap = GeminiUsageFetcher.parse(files: [tmp])
+    expectEqual(snap.records.count, 2)  // user + rewind ignored
+    expectEqual(snap.malformedRecordCount, 0)
+    expectEqual(snap.unknownModelRecordCount, 0)
+    let cal = Calendar(identifier: .gregorian)
+    var comp = DateComponents()
+    comp.year = 2026; comp.month = 7; comp.day = 15
+    let start = cal.date(from: comp)!
+    let end = cal.date(byAdding: .day, value: 1, to: start)!
+    let total = snap.tokens(in: start...end)
+    expectEqual(total, 2000)  // 1000+500 + 300+200
+}
+
 // MARK: - Summary
 
 print("")

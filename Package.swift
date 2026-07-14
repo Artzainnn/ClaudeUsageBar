@@ -149,7 +149,13 @@ let package = Package(
                 "RooZooPathResolver.swift",
                 "RooZooUsageFetcher.swift",
                 "RooUsageStore.swift",
-                "ZooUsageStore.swift"
+                "ZooUsageStore.swift",
+                // PR 15-BE — Gemini Developer local JSONL reader.
+                // Reads Gemini CLI's `~/.gemini/tmp/<projectHash>/chats/
+                // session-*.jsonl`. Feature-flagged off. Tokens + cost
+                // via a bundled per-token rate table.
+                "GeminiUsageFetcher.swift",
+                "GeminiUsageStore.swift"
                 // AnthropicUsageStore.swift depends on UsageManager
                 // (defined in ClaudeUsageBar.swift), so it stays in the
                 // app-bundle compile only, not in the SwiftPM library
