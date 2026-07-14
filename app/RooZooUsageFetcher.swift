@@ -83,24 +83,25 @@ public struct RooZooTaskRecord: Equatable, Sendable {
 
 public struct RooZooUsageSnapshot: Equatable, Sendable {
     public var records: [RooZooTaskRecord]
-    public var recordsPerRoot: [String: Int]
     public var unreadableFileCount: Int
     public var malformedRecordCount: Int
     public var overCapFileCount: Int
-    public var overTaskCapCount: Int
+
+    // NOTE: `recordsPerRoot` and `overTaskCapCount` used to live here
+    // but were never consumed (3cc R2 F2 / F3 impl review). Stores
+    // track the over-task-cap count via their own store-level field
+    // and read it from the discoverTasks result; a per-root record
+    // count is computed but never rendered. Dropped to keep the
+    // snapshot surface honest.
 
     public init(records: [RooZooTaskRecord],
-                recordsPerRoot: [String: Int] = [:],
                 unreadableFileCount: Int = 0,
                 malformedRecordCount: Int = 0,
-                overCapFileCount: Int = 0,
-                overTaskCapCount: Int = 0) {
+                overCapFileCount: Int = 0) {
         self.records = records
-        self.recordsPerRoot = recordsPerRoot
         self.unreadableFileCount = unreadableFileCount
         self.malformedRecordCount = malformedRecordCount
         self.overCapFileCount = overCapFileCount
-        self.overTaskCapCount = overTaskCapCount
     }
 
     public func tokens(in range: ClosedRange<Date>) -> Int {
@@ -178,11 +179,28 @@ public struct RooZooUsageFetcher: Sendable {
     /// an empty rollup during some error paths.
     ///
     /// Field name is `totalCost` (NOT `cost`) — 3cc R1 F1.
+    /// Hard cap on `history_item.json` file size. A real rollup is a few
+    /// hundred bytes; a legitimate value over 1 MB does not exist.
+    /// 3cc R3 F3: without this, a rogue VS Code extension (any extension
+    /// with write access to the globalStorage folder) could deposit a
+    /// multi-gigabyte file and OOM the fetch worker via
+    /// `Data(contentsOf:)`. Roo's repo is archived so any pre-existing
+    /// bug that causes runaway file growth cannot be patched upstream.
+    public static let historyItemSizeCap: Int64 = 16 * 1024 * 1024
+
     public static func parseHistoryItem(
         atPath path: String,
         taskId: String,
         extensionId: RooZooExtension
     ) -> RooZooTaskRecord? {
+        // 3cc R3 F3: refuse to allocate over cap. Real history_item.json
+        // is <10 KB; 16 MB is generous headroom against a corrupt-file
+        // growth pattern.
+        let attrs = try? FileManager.default.attributesOfItem(atPath: path)
+        if let size = (attrs?[.size] as? NSNumber)?.int64Value,
+           size > historyItemSizeCap {
+            return nil
+        }
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return nil }
         guard !data.isEmpty else { return nil }
         guard let obj = try? JSONSerialization.jsonObject(with: data),
@@ -256,7 +274,6 @@ public struct RooZooUsageFetcher: Sendable {
         _ tasks: [RooZooDiscoveredTask]
     ) -> RooZooUsageSnapshot {
         var records: [RooZooTaskRecord] = []
-        var perRoot: [String: Int] = [:]
         var unreadable = 0
         var malformed = 0
         var overCap = 0
@@ -269,7 +286,6 @@ public struct RooZooUsageFetcher: Sendable {
             if let rec = parseHistoryItem(atPath: historyPath, taskId: task.taskId, extensionId: task.extensionId) {
                 seenTaskIds.insert(task.taskId)
                 records.append(rec)
-                perRoot[task.taskDir, default: 0] += 1
                 continue
             }
 
@@ -286,7 +302,14 @@ public struct RooZooUsageFetcher: Sendable {
                 overCap += 1
                 continue
             }
-            guard let text = ClineUsageFetcher.readClineUiMessagesText(from: URL(fileURLWithPath: uiPath)) else {
+            guard let text = ClineUsageFetcher.readClineUiMessagesText(
+                from: URL(fileURLWithPath: uiPath),
+                sizeCap: uiMessagesSizeCap
+            ) else {
+                // 3cc R1 F1 / R3 F2: we already pre-checked size at the
+                // outer 128 MB gate above; a nil here means the read
+                // itself failed (open error, mid-read chunk read
+                // failure). Truly unreadable.
                 unreadable += 1
                 continue
             }
@@ -333,7 +356,6 @@ public struct RooZooUsageFetcher: Sendable {
                 sourcePath: uiPath,
                 source: .uiMessagesFallback
             ))
-            perRoot[task.taskDir, default: 0] += 1
         }
         records.sort { lhs, rhs in
             switch (lhs.timestamp, rhs.timestamp) {
@@ -345,11 +367,9 @@ public struct RooZooUsageFetcher: Sendable {
         }
         return RooZooUsageSnapshot(
             records: records,
-            recordsPerRoot: perRoot,
             unreadableFileCount: unreadable,
             malformedRecordCount: malformed,
-            overCapFileCount: overCap,
-            overTaskCapCount: 0
+            overCapFileCount: overCap
         )
     }
 

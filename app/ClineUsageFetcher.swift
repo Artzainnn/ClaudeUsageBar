@@ -535,14 +535,22 @@ public struct ClineUsageFetcher: Sendable {
 
     /// Read a Cline `ui_messages.json` file into a decoded string.
     /// Streams via FileHandle in 1 MiB chunks, aborting once the
-    /// cumulative buffer exceeds a 64 MB cap (well above any real
-    /// Cline session; matches ccusage's own cap for the same file).
+    /// cumulative buffer exceeds `sizeCap` bytes (defaults to 64 MB,
+    /// which matches ccusage's own cap and covers any real Cline
+    /// session). Roo/Zoo callers pass 128 MB — Roo/Zoo sessions are
+    /// longer than typical Cline sessions.
     /// UTF-8 decoding is tolerant — invalid bytes become U+FFFD, so a
     /// torn write near end-of-file surfaces as invalid JSON rather
     /// than a nil return that discards the whole file. Returns nil
-    /// only when the file cannot be opened.
-    static func readClineUiMessagesText(from url: URL) -> String? {
-        let sizeCap: Int64 = 64 * 1024 * 1024
+    /// only when the file cannot be opened OR exceeds `sizeCap`.
+    ///
+    /// PR 13-BE 3cc R1 F1 / R3 F2: BEFORE the sizeCap parameter, the
+    /// inner 64 MB cap was hardcoded and Roo/Zoo's outer 128 MB
+    /// pre-check was dead code — files 64-128 MB were mis-classified
+    /// as `unreadable` even though the user-visible tile promised
+    /// "128 MB cap". Parameterising fixes both the classification and
+    /// the tile copy.
+    public static func readClineUiMessagesText(from url: URL, sizeCap: Int64 = 64 * 1024 * 1024) -> String? {
         let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
         if let size = (attrs?[.size] as? NSNumber)?.int64Value, size > sizeCap {
             return nil

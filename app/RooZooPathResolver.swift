@@ -68,8 +68,23 @@ public protocol SettingsReader: Sendable {
 }
 
 public struct FileSettingsReader: SettingsReader, Sendable {
+    /// Hard cap on the settings.json file size. Real VS Code
+    /// settings.json is well under 50 KB; 10 MB is generous.
+    /// 3cc R3 F4: without this, a rogue VS Code extension could
+    /// deposit a multi-gigabyte settings.json and both freeze the
+    /// main actor (via `String(contentsOfFile:)`) AND explode memory
+    /// (JSONCKeyExtractor calls `Array(scan.utf8)` on the whole
+    /// string). Cap short-circuits both.
+    public static let sizeCap: Int64 = 10 * 1024 * 1024
+
     public init() {}
     public func read(atPath: String) -> String? {
+        // Size pre-check so we don't materialise a hostile 4 GB file.
+        let attrs = try? FileManager.default.attributesOfItem(atPath: atPath)
+        if let size = (attrs?[.size] as? NSNumber)?.int64Value,
+           size > FileSettingsReader.sizeCap {
+            return nil
+        }
         // Try UTF-8 first (VS Code writes UTF-8). Fall back to
         // encoding auto-detect for pathological hand-edited files
         // (Latin-1 / UTF-16 with BOM).
@@ -171,40 +186,51 @@ public enum RooZooPathResolver {
         guard !trimmed.isEmpty else { return nil }
         // Reject variable substitutions — VS Code does NOT expand
         // shell variables in settings.json path values (per its own
-        // docs), and neither should we. `$`, `${`, `%` all indicate
-        // a variable-substitution attempt.
-        if trimmed.contains("$") || trimmed.contains("${") || trimmed.contains("%") {
+        // docs), and neither should we. `$` (covers both `$VAR` and
+        // `${VAR}`) and `%` (covers Windows-style `%VAR%`) are the
+        // two indicators. (`${` is subsumed by `$` — 3cc R2 F4.)
+        if trimmed.contains("$") || trimmed.contains("%") {
             return nil
         }
         // Expand `~/` if the value starts with it.
         let expanded = (trimmed as NSString).expandingTildeInPath
         let standardized = (expanded as NSString).standardizingPath
-        // Realpath resolution (follows symlinks). Falls back to the
-        // standardised path when the leaf does not exist yet (fresh
-        // customStoragePath configured but no data written).
-        let resolved: String
-        if let p = realpath(standardized, nil) {
-            defer { free(p) }
-            resolved = String(cString: p)
-        } else {
-            resolved = standardized
+
+        // 3cc R3 F5: require the path to EXIST via realpath (which
+        // fully resolves symlinks). A non-existent leaf whose
+        // parent is a symlink to `/tmp/attacker` would previously
+        // fall through to the standardised (unresolved) string,
+        // pass the home-prefix check, and later be scanned via
+        // FileManager which resolves the symlink at read time —
+        // outside `$HOME`. Refusing non-existent customStoragePath
+        // closes that escape without changing the honest case
+        // (Roo/Zoo require the directory to exist before writing).
+        guard let p = realpath(standardized, nil) else {
+            return nil
         }
-        // Must be under home after realpath.
+        defer { free(p) }
+        let resolved = String(cString: p)
+
+        // Must be under home after realpath. Both sides resolved
+        // via realpath so a symlinked home is honoured
+        // consistently.
         let homeResolved: String
-        if let p = realpath(homeDirectoryPath, nil) {
-            defer { free(p) }
-            homeResolved = String(cString: p)
+        if let hp = realpath(homeDirectoryPath, nil) {
+            defer { free(hp) }
+            homeResolved = String(cString: hp)
         } else {
             homeResolved = homeDirectoryPath
         }
         guard resolved == homeResolved || resolved.hasPrefix(homeResolved + "/") else {
             return nil
         }
-        // Verify is-directory when it exists. Non-existent leaf is
-        // acceptable (see resolved-fallback above).
+        // Verify is-directory (redundant with realpath-required-to-
+        // exist, but cheap and defensive).
         var isDir: ObjCBool = false
         if FileManager.default.fileExists(atPath: resolved, isDirectory: &isDir) {
             if !isDir.boolValue { return nil }
+        } else {
+            return nil
         }
         return resolved
     }

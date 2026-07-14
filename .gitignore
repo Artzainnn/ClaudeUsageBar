@@ -10,6 +10,7 @@
 .Trashes
 
 # Build artifacts
+build/
 app/build/
 App/build/
 *.dmg

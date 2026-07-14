@@ -10106,10 +10106,25 @@ run("RooZooPathResolver.validateCustomStoragePath: rejects variable substitution
     expect(RooZooPathResolver.validateCustomStoragePath("%HOME%/roo", homeDirectoryPath: "/Users/testuser") == nil)
 }
 
-run("RooZooPathResolver.validateCustomStoragePath: expands ~/") {
-    let out = RooZooPathResolver.validateCustomStoragePath("~/roo-validate-\(UUID().uuidString)", homeDirectoryPath: NSHomeDirectory())
+run("RooZooPathResolver.validateCustomStoragePath: expands ~/ AND requires directory to exist (3cc R3 F5)") {
+    // Create a real directory under home so realpath resolves it.
+    let dirName = "roo-validate-\(UUID().uuidString)"
+    let realDir = "\(NSHomeDirectory())/\(dirName)"
+    try! FileManager.default.createDirectory(atPath: realDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(atPath: realDir) }
+    let out = RooZooPathResolver.validateCustomStoragePath("~/\(dirName)", homeDirectoryPath: NSHomeDirectory())
     expect(out != nil)
     expect(out?.hasPrefix(NSHomeDirectory()) == true)
+}
+
+run("RooZooPathResolver.validateCustomStoragePath: rejects non-existent path (3cc R3 F5 — symlink-escape defence)") {
+    // A path whose leaf does not exist is rejected outright — this
+    // closes the symlink-parent-points-to-attacker-tmp escape.
+    let out = RooZooPathResolver.validateCustomStoragePath(
+        "~/roo-validate-nonexistent-\(UUID().uuidString)",
+        homeDirectoryPath: NSHomeDirectory()
+    )
+    expect(out == nil)
 }
 
 run("RooZooPathResolver.validateCustomStoragePath: rejects when path is a file (not a directory)") {
@@ -10233,6 +10248,47 @@ run("RooZooUsageFetcher.parseHistoryItem: hostile numerics via safeInt (Bool→0
     expectEqual(rec?.tokensIn ?? -1, 0)
     expectEqual(rec?.tokensOut ?? -1, 0)
     expect(rec?.costUSD == 1_000_000)
+}
+
+run("RooZooUsageFetcher.parseHistoryItem: rejects file over 16 MB cap (3cc R3 F3 — OOM defence)") {
+    let tmp = FileManager.default.temporaryDirectory
+        .appendingPathComponent("rz-hist-big-\(UUID().uuidString).json")
+    defer { try? FileManager.default.removeItem(at: tmp) }
+    // Write a file just over the 16 MB cap.
+    let size = Int(RooZooUsageFetcher.historyItemSizeCap) + 1024
+    let junk = Data(repeating: 0x7B, count: size)  // '{' bytes
+    try! junk.write(to: tmp)
+    let rec = RooZooUsageFetcher.parseHistoryItem(atPath: tmp.path, taskId: "task-big", extensionId: .roo)
+    // The cap is enforced BEFORE the JSON parse, so a giant file is
+    // silently skipped rather than allocating 16 MB+ of memory.
+    expect(rec == nil)
+}
+
+run("FileSettingsReader: rejects file over 10 MB cap (3cc R3 F4 — freeze/OOM defence)") {
+    let tmp = FileManager.default.temporaryDirectory
+        .appendingPathComponent("rz-settings-big-\(UUID().uuidString).json")
+    defer { try? FileManager.default.removeItem(at: tmp) }
+    let size = Int(FileSettingsReader.sizeCap) + 1024
+    let junk = String(repeating: "{", count: size)
+    try! junk.write(to: tmp, atomically: true, encoding: .utf8)
+    let reader = FileSettingsReader()
+    expect(reader.read(atPath: tmp.path) == nil)
+}
+
+run("ClineUsageFetcher.readClineUiMessagesText: honours caller-supplied sizeCap (3cc R1 F1 / R3 F2)") {
+    let tmp = FileManager.default.temporaryDirectory
+        .appendingPathComponent("rz-ui-\(UUID().uuidString).json")
+    defer { try? FileManager.default.removeItem(at: tmp) }
+    // Write a 2 MB file. Default 64 MB cap accepts it; a 1 MB cap
+    // rejects it.
+    let junk = Data(repeating: 0x5B, count: 2 * 1024 * 1024)  // '[' bytes
+    try! junk.write(to: tmp)
+    // Default: reads OK.
+    let ok = ClineUsageFetcher.readClineUiMessagesText(from: tmp)
+    expect(ok != nil)
+    // Tighter cap: rejects.
+    let rejected = ClineUsageFetcher.readClineUiMessagesText(from: tmp, sizeCap: 1 * 1024 * 1024)
+    expect(rejected == nil)
 }
 
 run("RooZooUsageFetcher.parseHistoryItem: totalCost as JSON true (hostile Bool) yields 0 (safeCost Bool guard)") {

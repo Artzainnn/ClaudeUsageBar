@@ -103,58 +103,80 @@ public final class RooUsageStore: @preconcurrency UsageProvider {
             return
         }
         let launchGeneration = fetchGeneration
-        let scanRoots = resolveScanRoots()
-
-        var grantedRoots: [RooZooPathResolver.ScanRoot] = []
-        var deniedRoots: [RooZooPathResolver.ScanRoot] = []
-        for root in scanRoots {
-            switch tccProbe(root.tasksDirectoryPath) {
-            case .granted:     grantedRoots.append(root)
-            case .denied:      deniedRoots.append(root)
-            case .pathMissing: break
-            }
-        }
-        let aggregated: TCCState
-        if !grantedRoots.isEmpty {
-            aggregated = .granted
-        } else if !deniedRoots.isEmpty {
-            aggregated = .denied
-        } else {
-            aggregated = .pathMissing
-        }
-        self.tccState = aggregated
-        self.deniedRootCount = deniedRoots.count
-
-        if aggregated != .granted {
-            self.snapshot = nil
-            self.lastAppliedGrantedRootsKey = nil
-            self.lastError = nil
-            self.overTaskCapCount = 0
-            return
-        }
-
-        let grantedKey = grantedRoots.map(\.tasksDirectoryPath).sorted().joined(separator: "\n")
-        if grantedKey != lastAppliedGrantedRootsKey {
-            self.snapshot = nil
-        }
-
-        let rootsCopy = grantedRoots
+        // 3cc R3 F1 fix: BOTH `resolveScanRoots()` (which reads
+        // per-host settings.json — synchronous file I/O that can
+        // block on offline NAS mounts) AND the TCC probe (which does
+        // fileExists + contentsOfDirectory syscalls) now run on
+        // `workQueue` rather than on the main actor. Previously the
+        // menubar UI would freeze for the SMB/NFS timeout (60-90s)
+        // if any settings.json lived on a dead mount. Only the state
+        // apply hop still runs on main.
+        let resolve = self.resolveScanRoots
+        let probe = self.tccProbe
         let discover = self.discoverTasks
         let parse = self.parseTasks
-        let tccProbeCopy = self.tccProbe
-        let grantedKeyCopy = grantedKey
+        let priorAppliedKey = self.lastAppliedGrantedRootsKey
 
         workQueue.async { [weak self] in
-            let (tasks, overCap) = discover(rootsCopy)
+            let scanRoots = resolve()
+            var grantedRoots: [RooZooPathResolver.ScanRoot] = []
+            var deniedRoots: [RooZooPathResolver.ScanRoot] = []
+            for root in scanRoots {
+                switch probe(root.tasksDirectoryPath) {
+                case .granted:     grantedRoots.append(root)
+                case .denied:      deniedRoots.append(root)
+                case .pathMissing: break
+                }
+            }
+            let aggregated: TCCState
+            if !grantedRoots.isEmpty {
+                aggregated = .granted
+            } else if !deniedRoots.isEmpty {
+                aggregated = .denied
+            } else {
+                aggregated = .pathMissing
+            }
+            let deniedCount = deniedRoots.count
+            let grantedKey = grantedRoots.map(\.tasksDirectoryPath).sorted().joined(separator: "\n")
+
+            if aggregated != .granted {
+                Task { @MainActor [weak self] in
+                    guard let self = self else { return }
+                    guard self.isEnabled else { return }
+                    guard launchGeneration == self.fetchGeneration else { return }
+                    self.tccState = aggregated
+                    self.deniedRootCount = deniedCount
+                    self.snapshot = nil
+                    self.lastAppliedGrantedRootsKey = nil
+                    self.lastError = nil
+                    self.overTaskCapCount = 0
+                }
+                return
+            }
+
+            let (tasks, overCap) = discover(grantedRoots)
             let snap = parse(tasks)
+
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
                 guard self.isEnabled else { return }
                 guard launchGeneration == self.fetchGeneration else { return }
+                self.tccState = .granted
+                self.deniedRootCount = deniedCount
+                if grantedKey != priorAppliedKey {
+                    // Root set changed; the stored snapshot may
+                    // include usage from a now-inaccessible root.
+                    self.snapshot = nil
+                }
+                // Re-probe every root on completion (3cc R3 F5) so a
+                // TCC transition between fetch-start and apply is
+                // caught. A now-.denied root discards the parse
+                // result rather than writing a silently empty
+                // snapshot.
                 var stillAllGranted = true
                 var newDeniedCount = 0
-                for root in rootsCopy {
-                    switch tccProbeCopy(root.tasksDirectoryPath) {
+                for root in grantedRoots {
+                    switch probe(root.tasksDirectoryPath) {
                     case .granted:     break
                     case .denied:      stillAllGranted = false; newDeniedCount += 1
                     case .pathMissing: break
@@ -162,7 +184,7 @@ public final class RooUsageStore: @preconcurrency UsageProvider {
                 }
                 if !stillAllGranted {
                     self.tccState = .denied
-                    self.deniedRootCount = self.deniedRootCount + newDeniedCount
+                    self.deniedRootCount = deniedCount + newDeniedCount
                     self.snapshot = nil
                     self.lastAppliedGrantedRootsKey = nil
                     self.overTaskCapCount = 0
@@ -170,7 +192,7 @@ public final class RooUsageStore: @preconcurrency UsageProvider {
                 }
                 self.snapshot = snap
                 self.overTaskCapCount = overCap
-                self.lastAppliedGrantedRootsKey = grantedKeyCopy
+                self.lastAppliedGrantedRootsKey = grantedKey
                 self.lastUpdatedAt = self.clock()
                 self.lastError = nil
                 Log.info("Roo tasks parsed", .count(snap.records.count))

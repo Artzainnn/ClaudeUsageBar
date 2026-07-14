@@ -230,41 +230,51 @@ public final class ContinueUsageStore: @preconcurrency UsageProvider {
             return
         }
         let launchGeneration = fetchGeneration
-        let scanRoots = resolveScanRoots()
-
-        var grantedRoots: [ContinuePathResolver.ScanRoot] = []
-        var deniedRoots: [ContinuePathResolver.ScanRoot] = []
-        for root in scanRoots {
-            switch tccProbe(root.jsonlPath) {
-            case .granted:     grantedRoots.append(root)
-            case .denied:      deniedRoots.append(root)
-            case .pathMissing: break
-            }
-        }
-        let aggregated: TCCState
-        if !grantedRoots.isEmpty {
-            aggregated = .granted
-        } else if !deniedRoots.isEmpty {
-            aggregated = .denied
-        } else {
-            aggregated = .pathMissing
-        }
-        self.tccState = aggregated
-
-        if aggregated != .granted {
-            self.snapshot = nil
-            self.lastError = nil
-            return
-        }
-
-        let rootsCopy = grantedRoots
+        // 3cc R3 F1 fix: `resolveScanRoots()` and the TCC probe both
+        // do synchronous file I/O (Continue's scan-root path check is
+        // cheap because it's just one file, but the pattern-matches
+        // Roo/Zoo for consistency and defence against a future
+        // resolver that adds discovery logic).
+        let resolve = self.resolveScanRoots
+        let probe = self.tccProbe
         let discover = self.discoverFiles
         let parse = self.parseFiles
-        let tccProbeCopy = self.tccProbe
 
         workQueue.async { [weak self] in
-            let urls = discover(rootsCopy)
+            let scanRoots = resolve()
+            var grantedRoots: [ContinuePathResolver.ScanRoot] = []
+            var deniedRoots: [ContinuePathResolver.ScanRoot] = []
+            for root in scanRoots {
+                switch probe(root.jsonlPath) {
+                case .granted:     grantedRoots.append(root)
+                case .denied:      deniedRoots.append(root)
+                case .pathMissing: break
+                }
+            }
+            let aggregated: TCCState
+            if !grantedRoots.isEmpty {
+                aggregated = .granted
+            } else if !deniedRoots.isEmpty {
+                aggregated = .denied
+            } else {
+                aggregated = .pathMissing
+            }
+
+            if aggregated != .granted {
+                Task { @MainActor [weak self] in
+                    guard let self = self else { return }
+                    guard self.isEnabled else { return }
+                    guard launchGeneration == self.fetchGeneration else { return }
+                    self.tccState = aggregated
+                    self.snapshot = nil
+                    self.lastError = nil
+                }
+                return
+            }
+
+            let urls = discover(grantedRoots)
             let snap = parse(urls)
+
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
                 guard self.isEnabled else { return }
@@ -275,8 +285,8 @@ public final class ContinueUsageStore: @preconcurrency UsageProvider {
                 // mid-parse writes an empty snapshot as if the user
                 // had no usage.
                 var stillGranted = true
-                for root in rootsCopy {
-                    switch tccProbeCopy(root.jsonlPath) {
+                for root in grantedRoots {
+                    switch probe(root.jsonlPath) {
                     case .granted:     break
                     case .denied:      stillGranted = false
                     case .pathMissing: break // was granted; now missing — treat as no data
@@ -287,6 +297,7 @@ public final class ContinueUsageStore: @preconcurrency UsageProvider {
                     self.snapshot = nil
                     return
                 }
+                self.tccState = .granted
                 self.snapshot = snap
                 self.lastUpdatedAt = self.clock()
                 self.lastError = nil
