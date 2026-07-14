@@ -83,7 +83,13 @@ public enum FileWatcherBackend: Sendable {
 
 /// A directory-tree watcher. `paths` is the set of directories to
 /// observe; the callback fires whenever files under any of them change.
-public final class FileWatcher {
+// PR 18: `@unchecked Sendable` because every mutable field (stream,
+// onChange, pollSource, mtimeSnapshot) is only mutated inside the
+// serial `queue` — see the `queue.sync`/`queue.async` calls in
+// start/stop/tick. FSEvents callback + DispatchSourceTimer callback
+// both hop back to `queue` before touching state. Callers get a
+// Sendable reference they can safely share across actor boundaries.
+public final class FileWatcher: @unchecked Sendable {
 
     /// Directory paths to watch. Each is a directory root; FSEvents
     /// watches recursively, and the poll fallback enumerates recursively.

@@ -14,16 +14,40 @@ import ClaudeUsageBar
 import SQLite3
 
 // MARK: - Minimal assertion API
+//
+// PR 18 note: Under Swift 6 strict concurrency, top-level `var`s
+// are main-actor-isolated and cannot be mutated from non-Sendable
+// closures. Wrapping the counters in a `@MainActor` class keeps the
+// existing call sites untouched (the `expect` / `expectEqual` /
+// `run` free functions stay free functions, just annotated).
+//
+// Every test file executes on the main thread — `swift run TestRunner`
+// runs main.swift synchronously top-to-bottom. Nothing here has ever
+// been called from a background thread except the FileWatcher /
+// SQLiteReader tests which explicitly hop back to main via
+// `RunLoop.main.run(until:)`. `@MainActor` on the assertion functions
+// documents that guarantee explicitly.
 
-var failed = 0
-var total = 0
+// Reference type used as a shared mutable counter box. `@unchecked
+// Sendable` is defensible here because every mutation goes through
+// the `@MainActor` assertion helpers — the box is only touched from
+// the main thread. Top-level `@MainActor let` is illegal in Swift 6
+// (`top-level code variables cannot have a global actor`), so we
+// let the type carry the safety promise via `@unchecked` and let
+// callers stay `@MainActor`.
+final class Counters: @unchecked Sendable {
+    var failed = 0
+    var total = 0
+}
+let counters = Counters()
 
+@MainActor
 func expect(_ condition: @autoclosure () -> Bool,
             _ message: String = "",
             file: StaticString = #file, line: UInt = #line) {
-    total += 1
+    counters.total += 1
     if !condition() {
-        failed += 1
+        counters.failed += 1
         let where_ = "\(file):\(line)"
         if message.isEmpty {
             print("  FAIL  \(where_)")
@@ -33,6 +57,7 @@ func expect(_ condition: @autoclosure () -> Bool,
     }
 }
 
+@MainActor
 func expectEqual<T: Equatable>(_ actual: T, _ expected: T,
                                 file: StaticString = #file, line: UInt = #line) {
     expect(actual == expected,
@@ -40,10 +65,11 @@ func expectEqual<T: Equatable>(_ actual: T, _ expected: T,
            file: file, line: line)
 }
 
+@MainActor
 func run(_ name: String, _ body: () -> Void) {
-    let before = failed
+    let before = counters.failed
     body()
-    let outcome = failed == before ? "PASS" : "FAIL"
+    let outcome = counters.failed == before ? "PASS" : "FAIL"
     print("\(outcome)  \(name)")
 }
 
@@ -7523,14 +7549,16 @@ MainActor.assumeIsolated {
         // store's dependencies, verify via direct construction.
         let defaults = UserDefaults(suiteName: "windsurf-busy-\(UUID().uuidString)")!
         defaults.set(true, forKey: "features.windsurf.enabled")
-        var callCount = 0
+        // PR 18: box-wrap for Swift 6 strict-concurrency capture.
+        final class CallBox: @unchecked Sendable { var callCount: Int = 0 }
+        let cb = CallBox()
         let store2 = WindsurfUsageStore(
             defaults: defaults,
             resolvePath: { "/tmp/fake" },
             tccProbe: { _ in .granted },
             readUsage: { _ in
-                callCount += 1
-                if callCount == 1 { return .success(goodUsage) }
+                cb.callCount += 1
+                if cb.callCount == 1 { return .success(goodUsage) }
                 throw SQLiteReaderError.busy
             }
         )
@@ -11042,8 +11070,8 @@ run("GeminiUsageFetcher.parse: end-to-end file → snapshot") {
 // MARK: - Summary
 
 print("")
-print("\(total - failed)/\(total) checks passed")
-if failed > 0 {
-    print("\(failed) FAILED")
+print("\(counters.total - counters.failed)/\(counters.total) checks passed")
+if counters.failed > 0 {
+    print("\(counters.failed) FAILED")
     exit(1)
 }

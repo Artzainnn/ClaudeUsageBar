@@ -175,15 +175,14 @@ let package = Package(
             name: "TestRunner",
             dependencies: ["ClaudeUsageBar"],
             path: "Tests/TestRunner",
-            // PR 16: TestRunner stays in Swift 5 language mode. The
-            // 992-line assertion harness uses top-level mutable
-            // counters (`total`, `failed`) that Swift 6's strict
-            // concurrency would require wrapping in @MainActor boxes
-            // across every closure. The library target (which ships
-            // as the .app) is Swift 6 language mode; the test target
-            // is fine to stay on 5 because it's not distributed.
-            // Follow-up: refactor into a Swift-6-clean harness.
-            swiftSettings: [.swiftLanguageMode(.v5)]
+            // PR 18: TestRunner now compiles under Swift 6 language
+            // mode. The 992-line assertion harness's top-level
+            // counters were wrapped in a `@MainActor Counters` class,
+            // and `expect` / `expectEqual` / `run` marked
+            // `@MainActor`. Every test call site already ran on the
+            // main thread — the annotation makes that explicit and
+            // Swift-6-strict-concurrency-clean.
+            swiftSettings: [.swiftLanguageMode(.v6)]
         )
     ]
 )
