@@ -10161,6 +10161,188 @@ run("RooZooPathResolver.resolveScanRoots: Zoo namespace uses ZooCodeOrganization
     }
 }
 
+run("RooZooUsageFetcher.parseHistoryItem: happy path — totalCost field parses (NOT `cost`)") {
+    let json = #"{"tokensIn": 1234, "tokensOut": 5678, "cacheWrites": 100, "cacheReads": 200, "totalCost": 0.0456, "size": 512, "ts": 1735920000000, "model": "claude-opus-4-7"}"#
+    let tmp = FileManager.default.temporaryDirectory
+        .appendingPathComponent("rz-hist-\(UUID().uuidString).json")
+    try! json.data(using: .utf8)!.write(to: tmp)
+    defer { try? FileManager.default.removeItem(at: tmp) }
+    let rec = RooZooUsageFetcher.parseHistoryItem(atPath: tmp.path, taskId: "task-1", extensionId: .roo)
+    expect(rec != nil)
+    expectEqual(rec?.tokensIn ?? -1, 1234)
+    expectEqual(rec?.tokensOut ?? -1, 5678)
+    expectEqual(rec?.cacheWrites ?? -1, 100)
+    expectEqual(rec?.cacheReads ?? -1, 200)
+    expect(rec?.costUSD == 0.0456)
+    expectEqual(rec?.taskId, "task-1")
+    expect(rec?.extensionId == .roo)
+    expect(rec?.source == .historyItem)
+    expectEqual(rec?.model, "claude-opus-4-7")
+    expect(rec?.timestamp != nil)
+}
+
+run("RooZooUsageFetcher.parseHistoryItem: totalCost missing but 'cost' present -> costUSD is 0 (NOT `cost`)") {
+    // Cline field name is `cost`; we must NOT accept it. This test
+    // pins the 3cc R1 F1 finding — if we regressed to `cost`, every
+    // Roo/Zoo cost tile would silently drop to zero.
+    let json = #"{"tokensIn": 1000, "tokensOut": 500, "cost": 0.99, "model": "x", "ts": 1735920000000}"#
+    let tmp = FileManager.default.temporaryDirectory
+        .appendingPathComponent("rz-hist-\(UUID().uuidString).json")
+    try! json.data(using: .utf8)!.write(to: tmp)
+    defer { try? FileManager.default.removeItem(at: tmp) }
+    let rec = RooZooUsageFetcher.parseHistoryItem(atPath: tmp.path, taskId: "task-x", extensionId: .zoo)
+    expect(rec != nil)
+    expectEqual(rec?.costUSD ?? -1, 0.0)
+}
+
+run("RooZooUsageFetcher.parseHistoryItem: empty file -> nil") {
+    let tmp = FileManager.default.temporaryDirectory
+        .appendingPathComponent("rz-hist-\(UUID().uuidString).json")
+    try! Data().write(to: tmp)
+    defer { try? FileManager.default.removeItem(at: tmp) }
+    let rec = RooZooUsageFetcher.parseHistoryItem(atPath: tmp.path, taskId: "task-e", extensionId: .roo)
+    expect(rec == nil)
+}
+
+run("RooZooUsageFetcher.parseHistoryItem: all-zero fields -> nil (empty rollup)") {
+    let json = #"{"tokensIn": 0, "tokensOut": 0, "totalCost": 0, "ts": 1735920000000}"#
+    let tmp = FileManager.default.temporaryDirectory
+        .appendingPathComponent("rz-hist-\(UUID().uuidString).json")
+    try! json.data(using: .utf8)!.write(to: tmp)
+    defer { try? FileManager.default.removeItem(at: tmp) }
+    let rec = RooZooUsageFetcher.parseHistoryItem(atPath: tmp.path, taskId: "task-z", extensionId: .roo)
+    expect(rec == nil)
+}
+
+run("RooZooUsageFetcher.parseHistoryItem: missing file -> nil") {
+    let rec = RooZooUsageFetcher.parseHistoryItem(atPath: "/tmp/definitely-not-a-file-\(UUID().uuidString).json", taskId: "task-nf", extensionId: .roo)
+    expect(rec == nil)
+}
+
+run("RooZooUsageFetcher.parseHistoryItem: hostile numerics via safeInt (Bool→0, negative→0, big-cost clamped to $1M)") {
+    let json = #"{"tokensIn": true, "tokensOut": -5, "totalCost": 1e300, "ts": 1735920000000}"#
+    let tmp = FileManager.default.temporaryDirectory
+        .appendingPathComponent("rz-hist-\(UUID().uuidString).json")
+    try! json.data(using: .utf8)!.write(to: tmp)
+    defer { try? FileManager.default.removeItem(at: tmp) }
+    // Bool → 0, negative → 0. 1e300 clamps to $1M (matches Cline's
+    // `safeCost` policy — hostile finite maximum surfaces as an
+    // obvious $1M line rather than silently ignoring the record).
+    let rec = RooZooUsageFetcher.parseHistoryItem(atPath: tmp.path, taskId: "task-h", extensionId: .roo)
+    expect(rec != nil)
+    expectEqual(rec?.tokensIn ?? -1, 0)
+    expectEqual(rec?.tokensOut ?? -1, 0)
+    expect(rec?.costUSD == 1_000_000)
+}
+
+run("RooZooUsageFetcher.parseHistoryItem: totalCost as JSON true (hostile Bool) yields 0 (safeCost Bool guard)") {
+    let json = #"{"tokensIn": 100, "tokensOut": 50, "totalCost": true, "ts": 1735920000000}"#
+    let tmp = FileManager.default.temporaryDirectory
+        .appendingPathComponent("rz-hist-\(UUID().uuidString).json")
+    try! json.data(using: .utf8)!.write(to: tmp)
+    defer { try? FileManager.default.removeItem(at: tmp) }
+    let rec = RooZooUsageFetcher.parseHistoryItem(atPath: tmp.path, taskId: "task-hb", extensionId: .roo)
+    expect(rec != nil)
+    expect(rec?.costUSD == 0.0)
+}
+
+run("RooZooUsageFetcher.parseTasks: history_item.json takes precedence when both files present") {
+    // Setup: temp dir with a task subdir containing BOTH files.
+    let baseDir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("rz-parse-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: baseDir) }
+    let taskDir = baseDir.appendingPathComponent("task-both")
+    try! FileManager.default.createDirectory(at: taskDir, withIntermediateDirectories: true)
+    let histJSON = #"{"tokensIn": 1000, "tokensOut": 500, "totalCost": 0.01, "model": "m", "ts": 1735920000000}"#
+    try! histJSON.data(using: .utf8)!.write(to: taskDir.appendingPathComponent("history_item.json"))
+    // ui_messages.json with a Cline-style say=api_req_started record
+    // containing MUCH larger numbers — if precedence is wrong, the
+    // record would reflect these.
+    let uiJSON = """
+    [{"ts":1735920000000,"type":"say","say":"api_req_started","text":"{\\"tokensIn\\":9999,\\"tokensOut\\":9999,\\"cost\\":9.99}","modelInfo":{"modelId":"m"}}]
+    """
+    try! uiJSON.data(using: .utf8)!.write(to: taskDir.appendingPathComponent("ui_messages.json"))
+
+    let task = RooZooDiscoveredTask(taskId: "task-both", taskDir: taskDir.path, extensionId: .roo)
+    let snap = RooZooUsageFetcher.parseTasks([task])
+    expectEqual(snap.records.count, 1)
+    expectEqual(snap.records.first?.tokensIn ?? -1, 1000)
+    expect(snap.records.first?.source == .historyItem)
+}
+
+run("RooZooUsageFetcher.parseTasks: falls back to ui_messages.json when history_item.json absent") {
+    let baseDir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("rz-fallback-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: baseDir) }
+    let taskDir = baseDir.appendingPathComponent("task-fb")
+    try! FileManager.default.createDirectory(at: taskDir, withIntermediateDirectories: true)
+    let uiJSON = """
+    [{"ts":1735920000000,"type":"say","say":"api_req_started","text":"{\\"tokensIn\\":100,\\"tokensOut\\":50,\\"cost\\":0.02}","modelInfo":{"modelId":"gpt-5"}}]
+    """
+    try! uiJSON.data(using: .utf8)!.write(to: taskDir.appendingPathComponent("ui_messages.json"))
+    let task = RooZooDiscoveredTask(taskId: "task-fb", taskDir: taskDir.path, extensionId: .zoo)
+    let snap = RooZooUsageFetcher.parseTasks([task])
+    expectEqual(snap.records.count, 1)
+    expect(snap.records.first?.source == .uiMessagesFallback)
+    expectEqual(snap.records.first?.tokensIn ?? -1, 100)
+    expectEqual(snap.records.first?.tokensOut ?? -1, 50)
+    expectEqual(snap.records.first?.model, "gpt-5")
+}
+
+run("RooZooUsageFetcher.parseTasks: task-id dedupe across Roo ∩ Zoo (first-seen wins)") {
+    let baseDir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("rz-dedupe-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: baseDir) }
+    let rooDir = baseDir.appendingPathComponent("roo/task-dup")
+    let zooDir = baseDir.appendingPathComponent("zoo/task-dup")
+    try! FileManager.default.createDirectory(at: rooDir, withIntermediateDirectories: true)
+    try! FileManager.default.createDirectory(at: zooDir, withIntermediateDirectories: true)
+    let histJSON = #"{"tokensIn": 100, "tokensOut": 50, "totalCost": 0.01, "model": "m", "ts": 1735920000000}"#
+    try! histJSON.data(using: .utf8)!.write(to: rooDir.appendingPathComponent("history_item.json"))
+    try! histJSON.data(using: .utf8)!.write(to: zooDir.appendingPathComponent("history_item.json"))
+    let roo = RooZooDiscoveredTask(taskId: "task-dup", taskDir: rooDir.path, extensionId: .roo)
+    let zoo = RooZooDiscoveredTask(taskId: "task-dup", taskDir: zooDir.path, extensionId: .zoo)
+    // Roo listed first — should win.
+    let snap = RooZooUsageFetcher.parseTasks([roo, zoo])
+    expectEqual(snap.records.count, 1)
+    expect(snap.records.first?.extensionId == .roo)
+}
+
+run("RooZooUsageFetcher.parseTasks: neither file present -> silently skips task (in-flight case)") {
+    let baseDir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("rz-empty-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: baseDir) }
+    let taskDir = baseDir.appendingPathComponent("task-empty")
+    try! FileManager.default.createDirectory(at: taskDir, withIntermediateDirectories: true)
+    let task = RooZooDiscoveredTask(taskId: "task-empty", taskDir: taskDir.path, extensionId: .roo)
+    let snap = RooZooUsageFetcher.parseTasks([task])
+    expectEqual(snap.records.count, 0)
+    // Neither malformed nor unreadable — this is expected for
+    // in-flight tasks with neither file yet written.
+    expectEqual(snap.unreadableFileCount, 0)
+    expectEqual(snap.malformedRecordCount, 0)
+}
+
+run("RooZooUsageFetcher.discoverTasks: 10k cap surfaces overCap when exceeded") {
+    // Building 10,010 real directories is prohibitively slow — inject
+    // a smaller cap to verify the mechanism instead.
+    let baseDir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("rz-cap-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: baseDir) }
+    let tasksDir = baseDir.appendingPathComponent("tasks")
+    try! FileManager.default.createDirectory(at: tasksDir, withIntermediateDirectories: true)
+    for i in 0..<20 {
+        try! FileManager.default.createDirectory(
+            at: tasksDir.appendingPathComponent("task-\(i)"),
+            withIntermediateDirectories: true
+        )
+    }
+    let root = RooZooPathResolver.ScanRoot(id: "test", tasksDirectoryPath: tasksDir.path, extensionId: .roo)
+    let out = RooZooUsageFetcher.discoverTasks(under: [root], cap: 10)
+    expectEqual(out.tasks.count, 10)
+    expectEqual(out.overCap, 10)
+}
+
 run("RooZooPathResolver.resolveScanRoots: customStoragePath adds a scan root labelled 'custom storage'") {
     // Use the real home so validation passes.
     let home = NSHomeDirectory()
