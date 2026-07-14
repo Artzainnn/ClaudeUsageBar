@@ -268,6 +268,10 @@ public final class ContinueUsageStore: @preconcurrency UsageProvider {
                     self.tccState = aggregated
                     self.snapshot = nil
                     self.lastError = nil
+                    // 3cc round-2 F2: also clear lastUpdatedAt on
+                    // non-granted transitions so the popover doesn't
+                    // show a stale "Updated N mins ago" caption.
+                    self.lastUpdatedAt = nil
                 }
                 return
             }
@@ -295,6 +299,9 @@ public final class ContinueUsageStore: @preconcurrency UsageProvider {
                 if !stillGranted {
                     self.tccState = .denied
                     self.snapshot = nil
+                    // 3cc round-2 F2: also clear lastUpdatedAt on
+                    // re-probe fail.
+                    self.lastUpdatedAt = nil
                     return
                 }
                 self.tccState = .granted

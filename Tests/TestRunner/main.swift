@@ -10585,6 +10585,94 @@ MainActor.assumeIsolated {
         expectEqual(tiles.first?.id, "zoo-needs-access")
     }
 
+    run("RooUsageStore: TCC transition granted -> denied mid-parse invalidates snapshot (3cc R3 F5 re-probe)") {
+        // First probe returns granted; second probe returns denied.
+        // The re-probe on the completion hop should catch it, discard
+        // the parse result, and set tccState to .denied.
+        let defaults = UserDefaults(suiteName: "roo-race-\(UUID().uuidString)")!
+        defaults.set(true, forKey: "features.roo.enabled")
+        final class ProbeBox: @unchecked Sendable { var call = 0 }
+        let box = ProbeBox()
+        let now = Date()
+        let store = RooUsageStore(
+            defaults: defaults,
+            resolveScanRoots: { [RooZooPathResolver.ScanRoot(id: "t", tasksDirectoryPath: "/tmp/fake", extensionId: .roo)] },
+            tccProbe: { _ in
+                box.call += 1
+                return box.call == 1 ? .granted : .denied
+            },
+            discoverTasks: { _ in ([], 0) },
+            parseTasks: { _ in RooZooUsageSnapshot(records: []) },
+            clock: { now }
+        )
+        store.fetch()
+        awaitRooZooFetch()
+        expectEqual(store.tccState, .denied)
+        expect(store.snapshot == nil)
+        expect(store.lastUpdatedAt == nil)  // 3cc round-2 F2 — no stale timestamp
+    }
+
+    run("RooUsageStore: non-granted branch clears lastUpdatedAt (3cc round-2 F2)") {
+        // Store starts with a snapshot + timestamp; toggle TCC to
+        // denied and verify lastUpdatedAt clears.
+        let now = ClaudeCodeUsageFetcher.parseTimestamp("2026-07-15T14:00:00Z")!
+        let rec = RooZooTaskRecord(
+            taskId: "t", model: "m", timestamp: now,
+            tokensIn: 1, tokensOut: 1, cacheWrites: 0, cacheReads: 0,
+            costUSD: 0.01, extensionId: .roo, sourcePath: "/x",
+            source: .historyItem
+        )
+        let defaults = UserDefaults(suiteName: "roo-lu-\(UUID().uuidString)")!
+        defaults.set(true, forKey: "features.roo.enabled")
+        final class TccBox: @unchecked Sendable { var next: TCCState = .granted }
+        let tccBox = TccBox()
+        let store = RooUsageStore(
+            defaults: defaults,
+            resolveScanRoots: { [RooZooPathResolver.ScanRoot(id: "t", tasksDirectoryPath: "/tmp/fake", extensionId: .roo)] },
+            tccProbe: { _ in tccBox.next },
+            discoverTasks: { _ in ([RooZooDiscoveredTask(taskId: "t", taskDir: "/tmp/fake/t", extensionId: .roo)], 0) },
+            parseTasks: { _ in RooZooUsageSnapshot(records: [rec]) },
+            clock: { now }
+        )
+        // First fetch — granted, populates snapshot and lastUpdatedAt.
+        store.fetch()
+        awaitRooZooFetch()
+        expect(store.snapshot != nil)
+        expect(store.lastUpdatedAt != nil)
+        // Second fetch — TCC now denied.
+        tccBox.next = .denied
+        store.fetch()
+        awaitRooZooFetch()
+        expectEqual(store.tccState, .denied)
+        expect(store.snapshot == nil)
+        expect(store.lastUpdatedAt == nil)
+    }
+
+    run("RooUsageStore: partial-access — some granted, some denied — deniedRootCount > 0 tile") {
+        let now = ClaudeCodeUsageFetcher.parseTimestamp("2026-07-15T14:00:00Z")!
+        let defaults = UserDefaults(suiteName: "roo-partial-\(UUID().uuidString)")!
+        defaults.set(true, forKey: "features.roo.enabled")
+        // Two scan roots: first granted, second denied. Store's
+        // granted-branch fires and deniedRootCount surfaces as
+        // partial-access tile.
+        let rootA = RooZooPathResolver.ScanRoot(id: "a", tasksDirectoryPath: "/tmp/a", extensionId: .roo)
+        let rootB = RooZooPathResolver.ScanRoot(id: "b", tasksDirectoryPath: "/tmp/b", extensionId: .roo)
+        let store = RooUsageStore(
+            defaults: defaults,
+            resolveScanRoots: { [rootA, rootB] },
+            tccProbe: { path in path == "/tmp/a" ? .granted : .denied },
+            discoverTasks: { _ in ([], 0) },
+            parseTasks: { _ in RooZooUsageSnapshot(records: []) },
+            clock: { now }
+        )
+        store.fetch()
+        awaitRooZooFetch()
+        expectEqual(store.tccState, .granted)  // aggregate .granted because ≥1 root readable
+        expectEqual(store.deniedRootCount, 1)
+        let ids = Set(store.tiles.map { $0.id })
+        expect(ids.contains("roo-partial-access"))
+    }
+
     run("ZooUsageStore: fetch populates snapshot and emits zoo-prefixed tiles") {
         let now = ClaudeCodeUsageFetcher.parseTimestamp("2026-07-15T14:00:00Z")!
         let rec = RooZooTaskRecord(

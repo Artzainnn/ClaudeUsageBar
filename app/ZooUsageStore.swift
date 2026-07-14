@@ -137,6 +137,8 @@ public final class ZooUsageStore: @preconcurrency UsageProvider {
                     self.lastAppliedGrantedRootsKey = nil
                     self.lastError = nil
                     self.overTaskCapCount = 0
+                    // 3cc round-2 F2: also clear lastUpdatedAt.
+                    self.lastUpdatedAt = nil
                 }
                 return
             }
@@ -168,6 +170,8 @@ public final class ZooUsageStore: @preconcurrency UsageProvider {
                     self.snapshot = nil
                     self.lastAppliedGrantedRootsKey = nil
                     self.overTaskCapCount = 0
+                    // 3cc round-2 F2: also clear lastUpdatedAt.
+                    self.lastUpdatedAt = nil
                     return
                 }
                 self.snapshot = snap

@@ -150,6 +150,11 @@ public final class RooUsageStore: @preconcurrency UsageProvider {
                     self.lastAppliedGrantedRootsKey = nil
                     self.lastError = nil
                     self.overTaskCapCount = 0
+                    // 3cc round-2 F2: also clear lastUpdatedAt so the
+                    // popover doesn't show "Updated 3 mins ago" against
+                    // an empty needs-access tile after access is
+                    // revoked mid-session. Matches Warp's chk1 pattern.
+                    self.lastUpdatedAt = nil
                 }
                 return
             }
@@ -188,6 +193,8 @@ public final class RooUsageStore: @preconcurrency UsageProvider {
                     self.snapshot = nil
                     self.lastAppliedGrantedRootsKey = nil
                     self.overTaskCapCount = 0
+                    // 3cc round-2 F2: also clear lastUpdatedAt.
+                    self.lastUpdatedAt = nil
                     return
                 }
                 self.snapshot = snap
