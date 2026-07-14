@@ -155,6 +155,13 @@ let package = Package(
                 // app-bundle compile only, not in the SwiftPM library
                 // target. Tests for AnthropicUsageStore live in the
                 // full-app integration tier, not this unit-test layer.
+                //
+                // PR 14 — StatusSource.swift depends on StatusIncident /
+                // StatusComponent / AffectedComponent, which live in
+                // ClaudeUsageBar.swift. Same rationale — app-only.
+                // Parser tests would need duplicated struct
+                // definitions in the library, which is not worth the
+                // maintenance tax.
             ]
         ),
         .executableTarget(
