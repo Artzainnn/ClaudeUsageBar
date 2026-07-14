@@ -10021,6 +10021,173 @@ MainActor.assumeIsolated {
 
 }  // end MainActor.assumeIsolated for ContinueUsageStore
 
+// MARK: - RooZooPathResolver + JSONCKeyExtractor (PR 13-BE)
+
+run("JSONCKeyExtractor: simple key extraction") {
+    let text = """
+    {
+        "roo-cline.customStoragePath": "/Users/me/roo-data",
+        "other.setting": true
+    }
+    """
+    expectEqual(JSONCKeyExtractor.extract(key: "roo-cline.customStoragePath", fromJSONC: text), "/Users/me/roo-data")
+}
+
+run("JSONCKeyExtractor: ignores comments inside strings (3cc R3 F1 — the classic footgun)") {
+    let text = """
+    {
+        "docs.url": "https://example.com/help // still a URL",
+        "roo-cline.customStoragePath": "/Users/me/roo-data"
+    }
+    """
+    expectEqual(JSONCKeyExtractor.extract(key: "roo-cline.customStoragePath", fromJSONC: text), "/Users/me/roo-data")
+}
+
+run("JSONCKeyExtractor: handles // line comments") {
+    let text = """
+    {
+        // top-level comment
+        "roo-cline.customStoragePath": "/Users/me/roo-data" // trailing comment
+    }
+    """
+    expectEqual(JSONCKeyExtractor.extract(key: "roo-cline.customStoragePath", fromJSONC: text), "/Users/me/roo-data")
+}
+
+run("JSONCKeyExtractor: handles /* */ block comments") {
+    let text = """
+    {
+        /* comment
+           spanning lines */
+        "roo-cline.customStoragePath": "/Users/me/roo-data"
+    }
+    """
+    expectEqual(JSONCKeyExtractor.extract(key: "roo-cline.customStoragePath", fromJSONC: text), "/Users/me/roo-data")
+}
+
+run("JSONCKeyExtractor: block comment containing the target key is ignored") {
+    let text = """
+    {
+        /* "roo-cline.customStoragePath": "/should/be/ignored" */
+        "roo-cline.customStoragePath": "/Users/me/real-data"
+    }
+    """
+    expectEqual(JSONCKeyExtractor.extract(key: "roo-cline.customStoragePath", fromJSONC: text), "/Users/me/real-data")
+}
+
+run("JSONCKeyExtractor: strips UTF-8 BOM") {
+    let text = "\u{FEFF}{\"roo-cline.customStoragePath\":\"/Users/me/roo-data\"}"
+    expectEqual(JSONCKeyExtractor.extract(key: "roo-cline.customStoragePath", fromJSONC: text), "/Users/me/roo-data")
+}
+
+run("JSONCKeyExtractor: missing key returns nil") {
+    let text = #"{"other":1}"#
+    expect(JSONCKeyExtractor.extract(key: "roo-cline.customStoragePath", fromJSONC: text) == nil)
+}
+
+run("JSONCKeyExtractor: escaped quotes inside value are preserved") {
+    let text = #"{"roo-cline.customStoragePath": "/Users/me/some \"quoted\" folder/roo"}"#
+    expectEqual(JSONCKeyExtractor.extract(key: "roo-cline.customStoragePath", fromJSONC: text), "/Users/me/some \"quoted\" folder/roo")
+}
+
+run("JSONCKeyExtractor: CRLF line endings") {
+    let text = "{\r\n// comment\r\n  \"roo-cline.customStoragePath\": \"/Users/me/roo-data\"\r\n}\r\n"
+    expectEqual(JSONCKeyExtractor.extract(key: "roo-cline.customStoragePath", fromJSONC: text), "/Users/me/roo-data")
+}
+
+run("RooZooPathResolver.validateCustomStoragePath: rejects paths outside home") {
+    expect(RooZooPathResolver.validateCustomStoragePath("/System/Library", homeDirectoryPath: "/Users/testuser") == nil)
+    expect(RooZooPathResolver.validateCustomStoragePath("/private/etc", homeDirectoryPath: "/Users/testuser") == nil)
+    expect(RooZooPathResolver.validateCustomStoragePath("/Applications/Safari.app", homeDirectoryPath: "/Users/testuser") == nil)
+}
+
+run("RooZooPathResolver.validateCustomStoragePath: rejects variable substitutions") {
+    expect(RooZooPathResolver.validateCustomStoragePath("$HOME/roo", homeDirectoryPath: "/Users/testuser") == nil)
+    expect(RooZooPathResolver.validateCustomStoragePath("${env:HOME}/roo", homeDirectoryPath: "/Users/testuser") == nil)
+    expect(RooZooPathResolver.validateCustomStoragePath("%HOME%/roo", homeDirectoryPath: "/Users/testuser") == nil)
+}
+
+run("RooZooPathResolver.validateCustomStoragePath: expands ~/") {
+    let out = RooZooPathResolver.validateCustomStoragePath("~/roo-validate-\(UUID().uuidString)", homeDirectoryPath: NSHomeDirectory())
+    expect(out != nil)
+    expect(out?.hasPrefix(NSHomeDirectory()) == true)
+}
+
+run("RooZooPathResolver.validateCustomStoragePath: rejects when path is a file (not a directory)") {
+    // Create a temp file under home (skip if the tmp dir resolves
+    // outside home — TMPDIR often points at /var/folders on macOS,
+    // which realpath resolves to /private/var/folders; that's
+    // outside $HOME so our validator rejects it early, defeating
+    // the "path is a file" branch we want to exercise here).
+    let tmp = URL(fileURLWithPath: NSHomeDirectory())
+        .appendingPathComponent(".rz-validate-test-\(UUID().uuidString).txt")
+    try! Data().write(to: tmp)
+    defer { try? FileManager.default.removeItem(at: tmp) }
+    let out = RooZooPathResolver.validateCustomStoragePath(tmp.path, homeDirectoryPath: NSHomeDirectory())
+    expect(out == nil)
+}
+
+run("RooZooPathResolver.resolveScanRoots: 6 baseline hosts × Roo namespace") {
+    let env = RooZooPathResolver.Environment(
+        homeDirectoryPath: "/Users/testuser",
+        applicationSupportPath: "/Users/testuser/Library/Application Support"
+    )
+    struct NoopReader: SettingsReader { func read(atPath: String) -> String? { nil } }
+    let roots = RooZooPathResolver.resolveScanRoots(env, for: .roo, settingsReader: NoopReader())
+    expectEqual(roots.count, 6)
+    let ids = Set(roots.map { $0.id })
+    expect(ids.contains("VS Code"))
+    expect(ids.contains("VS Code Insiders"))
+    expect(ids.contains("VSCodium"))
+    expect(ids.contains("Cursor"))
+    expect(ids.contains("Cursor Nightly"))
+    expect(ids.contains("Windsurf"))
+    for r in roots {
+        expect(r.tasksDirectoryPath.contains("RooVeterinaryInc.roo-cline"))
+        expect(r.extensionId == .roo)
+    }
+}
+
+run("RooZooPathResolver.resolveScanRoots: Zoo namespace uses ZooCodeOrganization.zoo-code") {
+    let env = RooZooPathResolver.Environment(
+        homeDirectoryPath: "/Users/testuser",
+        applicationSupportPath: "/Users/testuser/Library/Application Support"
+    )
+    struct NoopReader: SettingsReader { func read(atPath: String) -> String? { nil } }
+    let roots = RooZooPathResolver.resolveScanRoots(env, for: .zoo, settingsReader: NoopReader())
+    expectEqual(roots.count, 6)
+    for r in roots {
+        expect(r.tasksDirectoryPath.contains("ZooCodeOrganization.zoo-code"))
+        expect(r.extensionId == .zoo)
+    }
+}
+
+run("RooZooPathResolver.resolveScanRoots: customStoragePath adds a scan root labelled 'custom storage'") {
+    // Use the real home so validation passes.
+    let home = NSHomeDirectory()
+    let env = RooZooPathResolver.Environment(
+        homeDirectoryPath: home,
+        applicationSupportPath: "\(home)/Library/Application Support"
+    )
+    let customPath = "\(home)/rz-custom-test-\(UUID().uuidString)"
+    try! FileManager.default.createDirectory(atPath: customPath, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(atPath: customPath) }
+
+    struct FakeReader: SettingsReader {
+        let target: String
+        let value: String
+        func read(atPath: String) -> String? {
+            guard atPath.hasSuffix("Code/User/settings.json") else { return nil }
+            return "{ \"roo-cline.customStoragePath\": \"\(value)\" }"
+        }
+    }
+    let reader = FakeReader(target: "roo-cline.customStoragePath", value: customPath)
+    let roots = RooZooPathResolver.resolveScanRoots(env, for: .roo, settingsReader: reader)
+    let customRoots = roots.filter { $0.id.contains("custom storage") }
+    expectEqual(customRoots.count, 1)
+    // The tasks path derives from customStoragePath + /tasks.
+    expect(customRoots.first?.tasksDirectoryPath.hasSuffix("/tasks") == true)
+}
+
 // MARK: - Summary
 
 print("")
