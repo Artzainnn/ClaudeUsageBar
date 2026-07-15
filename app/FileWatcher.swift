@@ -263,10 +263,14 @@ public final class FileWatcher: @unchecked Sendable {
     /// Assumes it is called on the private queue.
     private func startFSEvents(generation: UInt64) -> Bool {
         // PR 22 — runtime enforcement of the "@unchecked Sendable"
-        // invariant. In DEBUG builds a violation aborts the process;
-        // in RELEASE builds the precondition is compiled out. Cheap
-        // defence-in-depth for a class whose Sendable conformance
-        // depends on queue serialisation.
+        // invariant. `dispatchPrecondition(.onQueue:)` uses Swift's
+        // `precondition()` semantics (NOT `assert()`): it fires in
+        // BOTH DEBUG and RELEASE builds, aborting the process on
+        // violation. That is stronger than the "compiled out in
+        // release" claim the PR body originally made — corrected
+        // in the follow-up audit (PR 26). Cheap defence-in-depth
+        // for a class whose Sendable conformance depends on queue
+        // serialisation.
         dispatchPrecondition(condition: .onQueue(queue))
         guard !paths.isEmpty else { return false }
         let cfPaths = paths as CFArray
