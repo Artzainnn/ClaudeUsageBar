@@ -217,13 +217,21 @@ public final class FileWatcher: @unchecked Sendable {
             // above.
             let paths = self.paths
             queue.async { [weak self] in
-                guard let self = self else { return }
-                // Same generation check — a stop+start race between the
-                // enqueue and the fire drops this event.
-                guard self.running && self.generation == launchGeneration else { return }
-                self.onChange?(FileWatcherEvent(paths: paths, isInitial: true))
+                self?.fireInitialEvent(paths: paths, generation: launchGeneration)
             }
         }
+    }
+
+    /// Fire the synthetic initial event on the private queue. Extracted
+    /// from the `queue.async` closure inside `start()` for symmetry with
+    /// `fireIfCurrent` — both fire onChange under identical guards and
+    /// both now assert on-queue at entry (PR 22 3cc consistency fix).
+    private func fireInitialEvent(paths: [String], generation: UInt64) {
+        dispatchPrecondition(condition: .onQueue(queue))
+        // Same generation check — a stop+start race between the enqueue
+        // and the fire drops this event.
+        guard running && self.generation == generation else { return }
+        onChange?(FileWatcherEvent(paths: paths, isInitial: true))
     }
 
     /// Stop watching. Idempotent and safe from any queue.
@@ -254,6 +262,12 @@ public final class FileWatcher: @unchecked Sendable {
     /// if FSEventStreamStart refused (a signal we should fall back).
     /// Assumes it is called on the private queue.
     private func startFSEvents(generation: UInt64) -> Bool {
+        // PR 22 — runtime enforcement of the "@unchecked Sendable"
+        // invariant. In DEBUG builds a violation aborts the process;
+        // in RELEASE builds the precondition is compiled out. Cheap
+        // defence-in-depth for a class whose Sendable conformance
+        // depends on queue serialisation.
+        dispatchPrecondition(condition: .onQueue(queue))
         guard !paths.isEmpty else { return false }
         let cfPaths = paths as CFArray
 
@@ -340,6 +354,12 @@ public final class FileWatcher: @unchecked Sendable {
     /// Called from the FSEvents callback (via a queue.async hop) and
     /// from the poll tick. Serialised on the private queue.
     fileprivate func fireIfCurrent(paths: [String], generation: UInt64) {
+        // PR 22 — runtime enforcement of the "@unchecked Sendable"
+        // invariant (see startFSEvents for rationale). Both callers
+        // (FSEvents callback via queue.async, poll timer via
+        // DispatchSource) already run on `queue`; a future
+        // refactor that added an off-queue caller would trip here.
+        dispatchPrecondition(condition: .onQueue(queue))
         // Generation guard — stop+start could have advanced generation
         // while this event was in flight.
         guard running && self.generation == generation else { return }
@@ -350,6 +370,9 @@ public final class FileWatcher: @unchecked Sendable {
 
     /// Assumes it is called on the private queue.
     private func startPoll(interval: TimeInterval, generation: UInt64) {
+        // PR 22 — runtime enforcement of the queue-serialised
+        // invariant. See startFSEvents for the design note.
+        dispatchPrecondition(condition: .onQueue(queue))
         let safeInterval = max(1.0, interval)
         // Codex round-1 finding #3: capture baseline SYNCHRONOUSLY, on
         // the queue, right now. We are already on the queue (see caller
@@ -371,6 +394,9 @@ public final class FileWatcher: @unchecked Sendable {
     /// private queue. Generation check drops stale ticks from a prior
     /// start().
     private func pollTick(generation: UInt64) {
+        // PR 22 — runtime enforcement of the queue-serialised
+        // invariant. See startFSEvents for the design note.
+        dispatchPrecondition(condition: .onQueue(queue))
         guard running && self.generation == generation else { return }
         let current = snapshotMtimes()
         guard let last = lastMtimes else {
@@ -395,6 +421,9 @@ public final class FileWatcher: @unchecked Sendable {
     /// Walk every watched directory recursively and record mtimes.
     /// Assumes it is called on the private queue.
     private func snapshotMtimes() -> [String: Date] {
+        // PR 22 — runtime enforcement of the queue-serialised
+        // invariant. See startFSEvents for the design note.
+        dispatchPrecondition(condition: .onQueue(queue))
         var out: [String: Date] = [:]
         let fm = FileManager.default
         for root in paths {
