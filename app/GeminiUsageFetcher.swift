@@ -242,11 +242,13 @@ public enum GeminiPricing {
     }
 
     /// Snapshot date 2026-07-15 — Gemini public per-million-token
-    /// pricing on `ai.google.dev/pricing`. Divided by 1e6 to yield
-    /// per-token rates.
+    /// pricing on `ai.google.dev/gemini-api/docs/pricing` (verified
+    /// live at PR 24 time via primary-source fetch).
     ///
-    /// Gemini 2.5 Pro <=200k context:
-    ///   input $1.25 / 1M, output $10.00 / 1M, cached $0.31 / 1M.
+    /// Gemini 2.5 Pro <=200k input tokens per request:
+    ///   input $1.25 / 1M, output $10.00 / 1M, cached $0.125 / 1M.
+    /// Gemini 2.5 Pro > 200k input tokens per request:
+    ///   input $2.50 / 1M, output $15.00 / 1M, cached $0.25 / 1M.
     /// Gemini 2.5 Flash:
     ///   input $0.30 / 1M, output $2.50 / 1M, cached $0.075 / 1M.
     /// Gemini 1.5 Pro:
@@ -254,16 +256,26 @@ public enum GeminiPricing {
     /// Gemini 1.5 Flash:
     ///   input $0.075 / 1M, output $0.30 / 1M, cached $0.01875 / 1M.
     ///
-    /// Tiered pricing (2.5 Pro > 200k) is NOT applied per-request
-    /// — Gemini bills per-request against the request's own context
-    /// length, but the on-disk log does not carry cumulative context
-    /// length as a first-class field. Cost estimates use the
-    /// low-tier rate; a "Pricing update available" tile surfaces
-    /// when this app is behind Google's official rates.
+    /// PR 24 — 2.5 Pro tiered pricing now applied per-record via
+    /// `rate(for: model, inputTokens: record.inputTokens)`. Every
+    /// record's `inputTokens` corresponds to Google's
+    /// `usageMetadata.promptTokenCount`, which is the per-request
+    /// prompt count Google itself uses to pick the tier. When
+    /// `inputTokens > 200_000` for a 2.5 Pro model, the high-tier
+    /// rates apply. Other models are single-tier; the high-tier
+    /// table only carries an entry for 2.5 Pro.
+    ///
+    /// PR 24 3cc correctness fix — the pre-existing `gemini-2.5-pro`
+    /// low-tier `cachedPerToken` was $0.31/1M (introduced by PR 15-BE
+    /// / PR #79); Google's live page has always listed $0.125/1M.
+    /// Corrected here alongside the new high-tier row so both tiers
+    /// use Google's actual published rates. Impact for existing
+    /// users: cached-token cost estimates on 2.5 Pro records will
+    /// drop by ~60% (previously over-billed by ~2.48x).
     public static let table: [String: Rate] = [
         "gemini-2.5-pro":         Rate(inputPerToken: 1.25 / 1_000_000,
                                         outputPerToken: 10.00 / 1_000_000,
-                                        cachedPerToken: 0.31 / 1_000_000),
+                                        cachedPerToken: 0.125 / 1_000_000),
         "gemini-2.5-flash":       Rate(inputPerToken: 0.30 / 1_000_000,
                                         outputPerToken: 2.50 / 1_000_000,
                                         cachedPerToken: 0.075 / 1_000_000),
@@ -284,14 +296,66 @@ public enum GeminiPricing {
                                         cachedPerToken: 0.01875 / 1_000_000),
     ]
 
+    /// PR 24 — high-tier rate table for models with per-request
+    /// context-length tiered pricing. Currently only Gemini 2.5 Pro
+    /// has such a tier (`> 200_000` input tokens/request).
+    ///
+    /// High-tier rates verified against Google's live pricing page
+    /// `ai.google.dev/gemini-api/docs/pricing` on 2026-07-15:
+    /// input $2.50/1M, output $15.00/1M (including thinking tokens),
+    /// context caching $0.25/1M. All three roughly 2x the low-tier
+    /// figures.
+    public static let highTierTable: [String: (threshold: Int, rate: Rate)] = [
+        "gemini-2.5-pro": (
+            threshold: 200_000,
+            rate: Rate(inputPerToken: 2.50 / 1_000_000,
+                        outputPerToken: 15.00 / 1_000_000,
+                        cachedPerToken: 0.25 / 1_000_000)
+        )
+    ]
+
     /// Look up a rate by model id. Handles Gemini's `-latest`,
     /// `-002`, `-preview-*` suffixes by stripping and re-matching.
+    /// Returns the low-tier rate for source-compat with existing tests
+    /// that don't have a per-record view.
     public static func rate(for model: String) -> Rate? {
         if let exact = table[model] { return exact }
         // Strip common suffixes and try again.
         let lower = model.lowercased()
         for prefix in table.keys.sorted(by: { $0.count > $1.count }) {
             if lower.hasPrefix(prefix) { return table[prefix] }
+        }
+        return nil
+    }
+
+    /// PR 24 — tier-aware rate lookup. Returns the high-tier rate for
+    /// models with tiered pricing (2.5 Pro) when `inputTokens` exceeds
+    /// the model's threshold; otherwise returns the low-tier rate.
+    ///
+    /// Suffix-stripping matches `rate(for:)` — a model id like
+    /// `gemini-2.5-pro-002` correctly resolves to the 2.5 Pro tiered
+    /// entry via longest-prefix match.
+    ///
+    /// Falls back to low-tier rate for any model with no high-tier
+    /// entry — the vast majority of models are single-tier.
+    public static func rate(for model: String, inputTokens: Int) -> Rate? {
+        // Resolve to the low-tier canonical key first (via longest-
+        // prefix match), then check for a high-tier upgrade.
+        let canonicalKey = canonicalTableKey(for: model)
+        guard let low = canonicalKey.flatMap({ table[$0] }) else { return nil }
+        if let key = canonicalKey, let tier = highTierTable[key], inputTokens > tier.threshold {
+            return tier.rate
+        }
+        return low
+    }
+
+    /// Return the `table` key that a model id matches under the
+    /// longest-prefix rule, or nil if no match.
+    private static func canonicalTableKey(for model: String) -> String? {
+        if table[model] != nil { return model }
+        let lower = model.lowercased()
+        for prefix in table.keys.sorted(by: { $0.count > $1.count }) {
+            if lower.hasPrefix(prefix) { return prefix }
         }
         return nil
     }
@@ -376,7 +440,14 @@ public struct GeminiUsageFetcher: Sendable {
             costUSD: 0.0,
             sourceFile: sourceFile
         )
-        if let rate = GeminiPricing.rate(for: model) {
+        // PR 24 — use the tier-aware rate lookup. For 2.5 Pro
+        // requests where `inputTokens > 200_000`, this returns the
+        // high-tier rate; for every other model / smaller request,
+        // this returns the same low-tier rate the old `rate(for:
+        // model)` returned. Source-compat with the older signature is
+        // preserved (the older function still exists and still
+        // returns low-tier).
+        if let rate = GeminiPricing.rate(for: model, inputTokens: record.inputTokens) {
             record.costUSD = GeminiPricing.cost(for: rate, record: record)
         } else if model != "unknown" {
             unknownModelCount += 1

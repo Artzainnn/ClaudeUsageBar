@@ -10870,14 +10870,17 @@ run("ProviderCopy help(for: 'gemini') mentions the actual JSONL path AND the env
     expect(help.contains("Nothing leaves"))
 }
 
-run("ProviderCopy disclosure(for: 'gemini') mentions the pricing-estimate posture AND the 200k-tier limitation") {
+run("ProviderCopy disclosure(for: 'gemini') mentions the pricing-estimate posture AND the 200k-tier application (PR 24 flipped from 'not applied' to 'applied')") {
     let disc = ProviderCopy.disclosure(for: "gemini")!
     expect(disc.contains("estimates") || disc.contains("Estimates"))
     expect(disc.contains("not a receipt") || disc.contains("actual bill"))
     // 3cc R2 F1 verification — pricing snapshot may drift.
     expect(disc.contains("Pricing update available"))
-    // 200k tier limitation is a load-bearing accuracy disclosure.
-    expect(disc.contains("200k") || disc.contains("Tiered"))
+    // 200k tier IS applied per-record (as of PR 24). The disclosure
+    // must call it out so users understand the high-tier surcharge is
+    // factored in.
+    expect(disc.contains("200") && disc.contains("Tiered"))
+    expect(disc.contains("IS applied") || disc.contains("applied per-record"))
     // Explicit "server-side quota NOT read" so users don't expect it.
     expect(disc.contains("serviceusage") || disc.contains("Server-side quota") || disc.contains("server-side quota"))
 }
@@ -11024,6 +11027,218 @@ run("GeminiPricing.rate: known Gemini 2.5 Pro / Flash matches table") {
     // Unknown returns nil.
     expect(GeminiPricing.rate(for: "gemini-3.0-ultra") == nil)
     expect(GeminiPricing.rate(for: "totally-not-gemini") == nil)
+}
+
+// MARK: - PR 24 — Gemini 2.5 Pro tiered pricing (>200k input tokens)
+
+run("GeminiPricing.rate(for:inputTokens:): 2.5 Pro at 200_000 (boundary) stays low-tier") {
+    let low = GeminiPricing.rate(for: "gemini-2.5-pro")!
+    let atThreshold = GeminiPricing.rate(for: "gemini-2.5-pro", inputTokens: 200_000)!
+    // Threshold is >200_000, so exactly 200_000 is still low-tier.
+    expectEqual(atThreshold.inputPerToken, low.inputPerToken)
+    expectEqual(atThreshold.outputPerToken, low.outputPerToken)
+    expectEqual(atThreshold.cachedPerToken, low.cachedPerToken)
+}
+
+run("GeminiPricing.rate(for:inputTokens:): 2.5 Pro at 200_001 flips to high-tier (all three rates 2x low tier per Google's live pricing page)") {
+    let low = GeminiPricing.rate(for: "gemini-2.5-pro")!
+    let high = GeminiPricing.rate(for: "gemini-2.5-pro", inputTokens: 200_001)!
+    // High-tier input/output/cached are all 2x low tier per Google's
+    // `ai.google.dev/gemini-api/docs/pricing` (verified 2026-07-15).
+    expect(high.inputPerToken > low.inputPerToken)
+    expect(high.outputPerToken > low.outputPerToken)
+    expect(high.cachedPerToken > low.cachedPerToken)
+    // Concrete values match the pricing-table snapshot 2026-07-15.
+    // PR 24 3cc fix: cached is $0.25/1M high-tier (was $0.625/1M in
+    // the first draft, corrected to match Google's actual page which
+    // lists cached at 10% of input rate, not 25%).
+    expect(abs(high.inputPerToken  - 2.50 / 1_000_000)  < 1e-12)
+    expect(abs(high.outputPerToken - 15.00 / 1_000_000) < 1e-12)
+    expect(abs(high.cachedPerToken - 0.25 / 1_000_000)  < 1e-12)
+}
+
+run("GeminiPricing.rate(for:inputTokens:): suffix-stripping resolves to 2.5 Pro tiered entry") {
+    // A suffixed 2.5 Pro id (`-002`, `-latest`, `-preview-...`) must
+    // resolve to the tiered entry too — otherwise a big request on a
+    // dated variant would silently underbill.
+    let highSuffixed = GeminiPricing.rate(for: "gemini-2.5-pro-002", inputTokens: 500_000)!
+    let highBare = GeminiPricing.rate(for: "gemini-2.5-pro", inputTokens: 500_000)!
+    expectEqual(highSuffixed.inputPerToken, highBare.inputPerToken)
+    expectEqual(highSuffixed.outputPerToken, highBare.outputPerToken)
+    expectEqual(highSuffixed.cachedPerToken, highBare.cachedPerToken)
+}
+
+run("GeminiPricing.rate(for:inputTokens:): 2.5 Flash has no tier — same rate regardless of inputTokens") {
+    let small = GeminiPricing.rate(for: "gemini-2.5-flash", inputTokens: 10_000)!
+    let big = GeminiPricing.rate(for: "gemini-2.5-flash", inputTokens: 500_000)!
+    expectEqual(small.inputPerToken, big.inputPerToken)
+    expectEqual(small.outputPerToken, big.outputPerToken)
+    expectEqual(small.cachedPerToken, big.cachedPerToken)
+}
+
+run("GeminiPricing.rate(for:inputTokens:): 1.5 Pro has no tier — same rate regardless of inputTokens") {
+    let small = GeminiPricing.rate(for: "gemini-1.5-pro", inputTokens: 100)!
+    let big = GeminiPricing.rate(for: "gemini-1.5-pro", inputTokens: 1_000_000)!
+    expectEqual(small.inputPerToken, big.inputPerToken)
+    expectEqual(small.outputPerToken, big.outputPerToken)
+    expectEqual(small.cachedPerToken, big.cachedPerToken)
+}
+
+run("GeminiPricing.rate(for:inputTokens:): unknown model returns nil regardless of inputTokens") {
+    expect(GeminiPricing.rate(for: "gemini-9.9-quantum", inputTokens: 5_000_000) == nil)
+    expect(GeminiPricing.rate(for: "totally-not-gemini", inputTokens: 100) == nil)
+}
+
+run("GeminiPricing.rate(for:inputTokens:): source-compat — low-tier lookup identical to rate(for:)") {
+    // Every model in the table returns the same rate under the new
+    // overload as the old one, provided inputTokens is at or below
+    // any threshold (using 0 as a safe universal below-threshold).
+    for model in ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash",
+                  "gemini-2.0-flash-lite", "gemini-1.5-pro", "gemini-1.5-flash"] {
+        let oldRate = GeminiPricing.rate(for: model)!
+        let newRateLow = GeminiPricing.rate(for: model, inputTokens: 0)!
+        expectEqual(oldRate.inputPerToken, newRateLow.inputPerToken)
+        expectEqual(oldRate.outputPerToken, newRateLow.outputPerToken)
+        expectEqual(oldRate.cachedPerToken, newRateLow.cachedPerToken)
+    }
+}
+
+run("GeminiUsageFetcher.parseLine: 2.5 Pro with >200k input tokens costed at high-tier per-record") {
+    // Synthetic Gemini record — 300k input, 10k output, cost must
+    // reflect the high-tier rates ($2.50/M input, $15.00/M output).
+    // Expected cost: 300_000 * $2.50/1e6 + 10_000 * $15.00/1e6
+    //              = 0.75 + 0.15 = 0.90 USD.
+    let line: [String: Any] = [
+        "id": "m1",
+        "type": "gemini",
+        "timestamp": "2026-07-15T12:00:00Z",
+        "model": "gemini-2.5-pro",
+        "tokens": ["input": 300_000, "output": 10_000, "cached": 0, "total": 310_000]
+    ]
+    let data = try! JSONSerialization.data(withJSONObject: line)
+    let lineStr = String(data: data, encoding: .utf8)!
+    var malformed = 0
+    var unknown = 0
+    let record = GeminiUsageFetcher.parseLine(
+        lineStr,
+        sourceFile: "/tmp/session.jsonl",
+        malformedCount: &malformed,
+        unknownModelCount: &unknown
+    )
+    expect(record != nil)
+    expect(malformed == 0)
+    expect(unknown == 0)
+    expect(record?.inputTokens == 300_000)
+    expect(record?.outputTokens == 10_000)
+    expect(abs((record?.costUSD ?? 0) - 0.90) < 0.0001)
+}
+
+run("GeminiUsageFetcher.parseLine: 2.5 Pro with exactly 200_000 input tokens costed at LOW-tier") {
+    // Boundary — 200_000 is at-threshold, must stay low-tier.
+    // Expected cost: 200_000 * $1.25/1e6 + 10_000 * $10.00/1e6
+    //              = 0.25 + 0.10 = 0.35 USD.
+    let line: [String: Any] = [
+        "id": "m2",
+        "type": "gemini",
+        "timestamp": "2026-07-15T12:00:00Z",
+        "model": "gemini-2.5-pro",
+        "tokens": ["input": 200_000, "output": 10_000, "cached": 0, "total": 210_000]
+    ]
+    let data = try! JSONSerialization.data(withJSONObject: line)
+    let lineStr = String(data: data, encoding: .utf8)!
+    var malformed = 0
+    var unknown = 0
+    let record = GeminiUsageFetcher.parseLine(
+        lineStr,
+        sourceFile: "/tmp/session.jsonl",
+        malformedCount: &malformed,
+        unknownModelCount: &unknown
+    )
+    expect(record != nil)
+    expect(abs((record?.costUSD ?? 0) - 0.35) < 0.0001)
+}
+
+run("GeminiUsageFetcher.parseLine: 2.5 Pro >200k with cachedTokens costed at high-tier cached rate (PR 24 3cc R2 end-to-end coverage)") {
+    // 300k input + 50k cached + 10k output on 2.5 Pro. Cached must
+    // apply the high-tier $0.25/1M rate (not the old buggy $0.625/1M
+    // and not the low-tier $0.125/1M).
+    // Expected: 300_000 * $2.50/1e6 + 10_000 * $15.00/1e6 + 50_000 * $0.25/1e6
+    //         = 0.75 + 0.15 + 0.0125
+    //         = 0.9125 USD.
+    let line: [String: Any] = [
+        "id": "m4",
+        "type": "gemini",
+        "timestamp": "2026-07-15T12:00:00Z",
+        "model": "gemini-2.5-pro",
+        "tokens": ["input": 300_000, "output": 10_000, "cached": 50_000, "total": 360_000]
+    ]
+    let data = try! JSONSerialization.data(withJSONObject: line)
+    let lineStr = String(data: data, encoding: .utf8)!
+    var malformed = 0
+    var unknown = 0
+    let record = GeminiUsageFetcher.parseLine(
+        lineStr,
+        sourceFile: "/tmp/session.jsonl",
+        malformedCount: &malformed,
+        unknownModelCount: &unknown
+    )
+    expect(record != nil)
+    expect(record?.cachedTokens == 50_000)
+    expect(abs((record?.costUSD ?? 0) - 0.9125) < 0.0001)
+}
+
+run("GeminiUsageFetcher.parseLine: 2.5 Pro <=200k with cachedTokens costed at low-tier cached rate (PR 24 3cc R2 low-tier correction verification)") {
+    // 100k input + 50k cached + 10k output on 2.5 Pro. Cached must
+    // apply the low-tier $0.125/1M rate (the pre-existing $0.31/1M
+    // bug was fixed as part of PR 24's 3cc round-1 correction).
+    // Expected: 100_000 * $1.25/1e6 + 10_000 * $10.00/1e6 + 50_000 * $0.125/1e6
+    //         = 0.125 + 0.10 + 0.00625
+    //         = 0.23125 USD.
+    let line: [String: Any] = [
+        "id": "m5",
+        "type": "gemini",
+        "timestamp": "2026-07-15T12:00:00Z",
+        "model": "gemini-2.5-pro",
+        "tokens": ["input": 100_000, "output": 10_000, "cached": 50_000, "total": 160_000]
+    ]
+    let data = try! JSONSerialization.data(withJSONObject: line)
+    let lineStr = String(data: data, encoding: .utf8)!
+    var malformed = 0
+    var unknown = 0
+    let record = GeminiUsageFetcher.parseLine(
+        lineStr,
+        sourceFile: "/tmp/session.jsonl",
+        malformedCount: &malformed,
+        unknownModelCount: &unknown
+    )
+    expect(record != nil)
+    expect(record?.cachedTokens == 50_000)
+    expect(abs((record?.costUSD ?? 0) - 0.23125) < 0.0001)
+}
+
+run("GeminiUsageFetcher.parseLine: 2.5 Flash big request stays flat (no tier)") {
+    // 500k tokens on 2.5 Flash: no tier, so low-tier rates apply.
+    // Expected cost: 500_000 * $0.30/1e6 + 10_000 * $2.50/1e6
+    //              = 0.15 + 0.025 = 0.175 USD.
+    let line: [String: Any] = [
+        "id": "m3",
+        "type": "gemini",
+        "timestamp": "2026-07-15T12:00:00Z",
+        "model": "gemini-2.5-flash",
+        "tokens": ["input": 500_000, "output": 10_000, "cached": 0, "total": 510_000]
+    ]
+    let data = try! JSONSerialization.data(withJSONObject: line)
+    let lineStr = String(data: data, encoding: .utf8)!
+    var malformed = 0
+    var unknown = 0
+    let record = GeminiUsageFetcher.parseLine(
+        lineStr,
+        sourceFile: "/tmp/session.jsonl",
+        malformedCount: &malformed,
+        unknownModelCount: &unknown
+    )
+    expect(record != nil)
+    expect(abs((record?.costUSD ?? 0) - 0.175) < 0.0001)
 }
 
 run("GeminiPathResolver.resolveScanRoots: env var overrides default") {
