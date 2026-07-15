@@ -125,6 +125,131 @@ jobs:
             exit 1
           fi
 
+      - name: Reject post-init mutation of a nonisolated(unsafe) let field
+        run: |
+          # PR 23: `nonisolated(unsafe) let <field>: <ReferenceType>`
+          # tells the Swift 6 compiler "this reference-typed static is
+          # safe to read from any actor". The safety promise is that
+          # the underlying object is CONFIGURED ONCE inside the
+          # initialiser closure (via a LOCAL variable) and NEVER
+          # mutated afterwards via the static's own name. A future
+          # edit that writes `Self.<field>.<prop> =` OR
+          # `<Type>.<field>.<prop> =` OR bare `<field>.<prop> =` from
+          # elsewhere in the module would silently break the thread-
+          # safety promise — one thread reading while another writes
+          # `.formatOptions` on the same `ISO8601DateFormatter` is a
+          # data race the compiler no longer catches.
+          #
+          # This guard enumerates every `nonisolated(unsafe) let <ID>`
+          # in `app/**.swift` and rejects any subsequent line that
+          # mutates a property on that ID via the qualified static
+          # name. Legitimate init-closure writes use a LOCAL variable
+          # (e.g. `let f = ISO8601DateFormatter(); f.formatOptions =
+          # ...; return f`) and never mention the static's own name,
+          # so they are correctly ignored.
+          #
+          # `nonisolated(unsafe) var` (e.g. SwiftUI PreferenceKey's
+          # `defaultValue: CGFloat = 0` in ClaudeUsageBar.swift) is
+          # excluded from the enumeration because SwiftUI's protocol
+          # requires `var` and no mutation is expected — the field
+          # exists to satisfy the `PreferenceKey` conformance.
+          #
+          # Known static-grep limitations (documented for future
+          # maintainers; not exploitable against the current 6 real
+          # declarations, all `ISO8601DateFormatter` — no mutating
+          # methods, only mutable properties):
+          #   - Aliasing: `let r = Self.iso; r.foo = ...` copies the
+          #     reference into a local, then mutates. Not caught.
+          #   - Method-call mutation: `Self.iso.setSomething(...)` is
+          #     not caught. `ISO8601DateFormatter` has no mutating
+          #     methods, but a future `nonisolated(unsafe) let` on
+          #     `DateFormatter` (which does) would need a broader guard.
+          #   - Lowercase-named type qualifier: `myModule.iso.foo = ...`
+          #     is legal Swift but not caught (heuristic requires
+          #     uppercase-first type identifier). Not in-codebase.
+          #   - Spaced form: `nonisolated (unsafe)` / `nonisolated
+          #     ( unsafe )` are legal Swift but the extraction regex
+          #     hardcodes the tight form. All 6 real declarations use
+          #     the tight form.
+          set -euo pipefail
+          # Enumerate field names of every `nonisolated(unsafe) let`
+          # declaration in app/. Deduplicated to build the alternation.
+          NAMES=$(grep -rhoE 'nonisolated\(unsafe\)[[:space:]]+(private[[:space:]]+|internal[[:space:]]+|fileprivate[[:space:]]+|public[[:space:]]+)?static[[:space:]]+let[[:space:]]+[A-Za-z_][A-Za-z0-9_]*' -- app/ \
+            | awk '{print $NF}' | sort -u | paste -sd'|' -)
+          if [ -z "$NAMES" ]; then
+            echo "No nonisolated(unsafe) let declarations found — skipping guard (guard vacuous)."
+            exit 0
+          fi
+          echo "Guarding mutation of nonisolated(unsafe) let fields: $NAMES"
+          # Match a mutation of `<Qualifier>.<field>.<prop> =` where
+          # <Qualifier> is `Self` OR a Swift type identifier
+          # (uppercase-starting). Bare unqualified `<field>.<prop> = ...`
+          # is NOT matched — that shape is always a LOCAL variable in
+          # this codebase (Swift idiom prefers `Self.<static>` or
+          # `<Type>.<static>` for static-member access), and some of
+          # the static names (`iso`) collide with common local names.
+          # The narrower pattern still catches every plausible failure
+          # mode: attacker writes `Self.iso.formatOptions = …` or
+          # `GoogleCloudStatusParser.iso.formatOptions = …`. The
+          # `[^=]` tail rejects `==` / `!=` / `<=` / `>=` comparisons.
+          PATTERN="(Self|[A-Z][A-Za-z0-9_]*)\.($NAMES)\.[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=[^=]"
+          if grep -rnE "$PATTERN" -- app/ ; then
+            echo "::error::A nonisolated(unsafe) let field's underlying object is being mutated via the static's own name. The thread-safety promise (configure-once inside init closure) is broken. Either configure the object inside a LOCAL variable in the init closure or drop the nonisolated(unsafe) annotation." >&2
+            exit 1
+          fi
+
+      - name: Self-test the nonisolated(unsafe) mutation guard against hostile fixtures
+        run: |
+          # Self-tests for the PR 23 guard above. Each fixture is a
+          # synthetic hostile snippet the guard MUST catch. If the
+          # guard ever silently allows one to pass, this step fails.
+          set -euo pipefail
+          # We need at least ONE `nonisolated(unsafe) let` declaration
+          # in `app/` for the guard to have a non-empty alternation.
+          # The real code has 6 (ISO formatters). Verify.
+          real_count=$(grep -rhE 'nonisolated\(unsafe\)[[:space:]]+(private[[:space:]]+)?static[[:space:]]+let' -- app/ | wc -l | tr -d ' ')
+          if [ "$real_count" -lt 1 ]; then
+            echo "::error::Guard self-test cannot run — no real nonisolated(unsafe) let declarations exist in app/. Guard is vacuous." >&2
+            exit 1
+          fi
+          # Enumerate the real names to know what the guard is
+          # protecting.
+          NAMES=$(grep -rhoE 'nonisolated\(unsafe\)[[:space:]]+(private[[:space:]]+|internal[[:space:]]+|fileprivate[[:space:]]+|public[[:space:]]+)?static[[:space:]]+let[[:space:]]+[A-Za-z_][A-Za-z0-9_]*' -- app/ \
+            | awk '{print $NF}' | sort -u | paste -sd'|' -)
+          PATTERN="(Self|[A-Z][A-Za-z0-9_]*)\.($NAMES)\.[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=[^=]"
+          # Fixture 1: qualified mutation via `Self.` — HOSTILE.
+          FIXTURE1='Self.isoFormatter.formatOptions = [.withInternetDateTime]'
+          # Fixture 2: qualified mutation via type name — HOSTILE.
+          FIXTURE2='StatuspageV2Parser.isoFormatter.timeZone = TimeZone(identifier: "UTC")!'
+          # Fixture 3: qualified mutation via a different type prefix — HOSTILE.
+          FIXTURE3='ClaudeCodeUsageFetcher.isoFormatterNoFractional.formatOptions = []'
+          # Fixture 4: legitimate init-closure via LOCAL variable — SAFE.
+          # (`f` is not in NAMES; the guard sees no static-qualified match.)
+          FIXTURE4='let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime]; return f'
+          # Fixture 5: legitimate local `iso` mutation (a bare name that
+          # collides with a static's short name in this codebase) —
+          # SAFE. The narrowed pattern requires a Type/Self prefix.
+          FIXTURE5='let iso = ISO8601DateFormatter(); iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]'
+          # Fixture 6: comparison, not mutation — SAFE.
+          FIXTURE6='if Self.isoFormatter.formatOptions == [.withInternetDateTime] { return }'
+          for i in 1 2 3; do
+            var="FIXTURE$i"
+            snippet=$(eval "printf '%s' \"\$$var\"")
+            if ! printf '%s\n' "$snippet" | grep -qE "$PATTERN"; then
+              echo "::error::Guard self-test failed: fixture $i was NOT caught by the guard's pattern. Snippet: $snippet" >&2
+              exit 1
+            fi
+          done
+          for i in 4 5 6; do
+            var="FIXTURE$i"
+            snippet=$(eval "printf '%s' \"\$$var\"")
+            if printf '%s\n' "$snippet" | grep -qE "$PATTERN"; then
+              echo "::error::Guard self-test failed: fixture $i was WRONGLY flagged. Snippet: $snippet" >&2
+              exit 1
+            fi
+          done
+          echo "All 6 nonisolated(unsafe) guard self-test fixtures passed (3 hostile caught, 3 legitimate ignored)."
+
       - name: Enforce copy-only shape of the DMCA-allowlisted file
         run: |
           # Codex R4 P2#1: `app/ProviderCopy.swift` is whole-file
