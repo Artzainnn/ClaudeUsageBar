@@ -1,5 +1,11 @@
 # PR 21 — Anthropic on StatusSource (design)
 
+**Status: Superseded by shipped code (commit cba0cb1).** Post-audit
+(2026-07-16), several details in this spec drifted from the shipped
+implementation. Reconciling notes are inline; the shipped code in
+`app/StatusManager.swift`, `app/StatusTypes.swift`, and
+`app/StatusSource.swift` is the source of truth.
+
 ## Problem
 
 `StatusManager.fetch()` and `StatusManager.parse(_:)` (in
@@ -86,8 +92,12 @@ func fetch() {
     }
 }
 
-private func apply(_ snapshot: StatusSnapshot) {
-    guard !snapshot.indicator.isEmpty else { return }  // failed fetch — leave prior state
+// Shipped code exposes `apply(_:)` as `public` (not `private` as originally
+// drafted) so TestRunner can drive the pipeline synchronously without
+// spinning a URLSession stub. Matches the codebase convention for every
+// other provider store.
+public func apply(_ snapshot: StatusSnapshot) {
+    guard !snapshot.indicator.isEmpty else { return }  // empty-sentinel snapshot — leave prior state
     let isFirstFetch = !hasFetched
 
     indicator = snapshot.indicator
@@ -169,9 +179,30 @@ Add to `Tests/TestRunner/main.swift` (~10 new `run(...)` blocks):
 - **`StatusManager notifies on effective-indicator transition`** —
   first fetch, then second with a different component set; assert the
   `last_effective_indicator` UserDefaults key transitions.
+- **`StatusManager fetch() drives apply via stub source`** —
+  end-to-end call via `mgr.fetch()`, pumps the run loop until the
+  `Task { @MainActor }` hop completes, asserts `hasFetched`.
+  (Added during implementation, not in original spec.)
+- **`StatusManager filteredAffectedComponents honours tracked
+  selection`** — verifies the popover-facing filter. (Added during
+  implementation, not in original spec.)
+- **`StatusManager notification-on-transition writes
+  last_effective_indicator on effective-indicator change`** —
+  three sequential applies, asserts pref-write logic at each
+  transition. (Added in 3cc round-2 to close a correctness coverage
+  gap flagged by the reviewer.)
 
 Test doubles: a `StubStatusSource` conforming to `StatusSource` that
 holds an array of pre-canned snapshots and delivers them in order.
+
+The stub is declared `final class StubStatusSource: StatusSource,
+@unchecked Sendable` because `StatusSource: Sendable` and the stub has
+mutable state (`pending`, `fetchCallCount`). The `@unchecked` is safe
+in this test harness — every test drives `fetch` inline from the main
+thread and completions run synchronously in the same call frame; no
+URLSession, no queue hop. A production adopter of `StatusSource` MUST
+serialise mutable state properly (or, better, use immutable value
+types); the stub's shortcut is a test-only concession.
 
 ### 6. UI parity check
 
@@ -205,7 +236,16 @@ site source-compatible.
 ## Verification
 
 - `swift build` — clean.
-- `swift run TestRunner` — 2012 + 12 new = 2024 passing.
+- `swift run TestRunner` — 2071/2071 passing (baseline 2012 + 14 new
+  `run()` blocks contributing 59 net assertions). The count in this
+  spec's original draft (2024) was wrong: the 12 planned tests were
+  supplemented with 2 additional cases during implementation
+  (`fetch() drives apply via stub source` and
+  `filteredAffectedComponents honours tracked selection`), and each
+  test contains multiple `expect()` calls. A 14th test
+  (`notification-on-transition writes last_effective_indicator on
+  effective-indicator change`) was added in 3cc round-2 to close a
+  correctness coverage gap the reviewer flagged.
 - `app/build.sh` on arm64 + x86_64 — clean.
 - All 5 CI static-grep guards — clean.
 - Manual popover walk — no UI regressions (verified by build + test,

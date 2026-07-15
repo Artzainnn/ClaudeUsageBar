@@ -73,6 +73,8 @@ internal-docs/
 EXPANSION_PLAN.md
 docs/tracking-issue-draft.md
 .pr-bodies/
+docs/audits/
+docs/confluence-drafts/
 
 # SwiftPM build artefacts
 .build/

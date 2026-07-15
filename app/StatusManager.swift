@@ -51,9 +51,6 @@ public class StatusManager: ObservableObject {
     // been populated at least once (empty snapshots suppress the
     // card so the popover doesn't show noise on cold start).
     @Published public var extraSnapshots: [String: StatusSnapshot] = [:]
-    // Last-notified per-source indicator, keyed by source.id. Used
-    // for the notification-on-transition path.
-    private var lastNotifiedIndicators: [String: String] = [:]
 
     /// Registered non-Anthropic status sources. Order matters — cards
     /// render in this order. Every source is behind a feature flag
@@ -117,7 +114,6 @@ public class StatusManager: ObservableObject {
                         notification.soundName = NSUserNotificationDefaultSoundName
                         NSUserNotificationCenter.default.deliver(notification)
                     }
-                    self.lastNotifiedIndicators[sourceId] = snap.indicator
                 }
             }
         }
@@ -128,7 +124,6 @@ public class StatusManager: ObservableObject {
     /// source's feature flag.
     public func clearExtraSource(_ id: String) {
         extraSnapshots.removeValue(forKey: id)
-        lastNotifiedIndicators.removeValue(forKey: id)
     }
 
     public init(anthropicSource: any StatusSource = StatuspageV2Source.anthropic) {
