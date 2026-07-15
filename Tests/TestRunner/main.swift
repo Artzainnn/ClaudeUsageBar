@@ -11158,13 +11158,18 @@ run("GeminiUsageFetcher.parseLine: 2.5 Pro with exactly 200_000 input tokens cos
     expect(abs((record?.costUSD ?? 0) - 0.35) < 0.0001)
 }
 
-run("GeminiUsageFetcher.parseLine: 2.5 Pro >200k with cachedTokens costed at high-tier cached rate (PR 24 3cc R2 end-to-end coverage)") {
-    // 300k input + 50k cached + 10k output on 2.5 Pro. Cached must
-    // apply the high-tier $0.25/1M rate (not the old buggy $0.625/1M
-    // and not the low-tier $0.125/1M).
-    // Expected: 300_000 * $2.50/1e6 + 10_000 * $15.00/1e6 + 50_000 * $0.25/1e6
-    //         = 0.75 + 0.15 + 0.0125
-    //         = 0.9125 USD.
+run("GeminiUsageFetcher.parseLine: 2.5 Pro >200k with cachedTokens costed at high-tier, cached subtracted from input (PR 28 audit fix)") {
+    // 300k input (250k non-cached + 50k cached) + 10k output on 2.5 Pro.
+    // Post-PR-28 correct formula: input INCLUDES cached, so bill only
+    // the non-cached portion at input rate:
+    //   non_cached_input = 300_000 - 50_000 = 250_000
+    // Expected: 250_000 * $2.50/1e6 + 10_000 * $15.00/1e6 + 50_000 * $0.25/1e6
+    //         = 0.625 + 0.15 + 0.0125
+    //         = 0.7875 USD.
+    // (Previously the test asserted 0.9125 which baked in the
+    // pre-audit double-count. Verified against ai.google.dev/gemini-
+    // api/docs/tokens: cachedContentTokenCount is a SUBSET of
+    // promptTokenCount.)
     let line: [String: Any] = [
         "id": "m4",
         "type": "gemini",
@@ -11184,16 +11189,18 @@ run("GeminiUsageFetcher.parseLine: 2.5 Pro >200k with cachedTokens costed at hig
     )
     expect(record != nil)
     expect(record?.cachedTokens == 50_000)
-    expect(abs((record?.costUSD ?? 0) - 0.9125) < 0.0001)
+    expect(abs((record?.costUSD ?? 0) - 0.7875) < 0.0001)
 }
 
-run("GeminiUsageFetcher.parseLine: 2.5 Pro <=200k with cachedTokens costed at low-tier cached rate (PR 24 3cc R2 low-tier correction verification)") {
-    // 100k input + 50k cached + 10k output on 2.5 Pro. Cached must
-    // apply the low-tier $0.125/1M rate (the pre-existing $0.31/1M
-    // bug was fixed as part of PR 24's 3cc round-1 correction).
-    // Expected: 100_000 * $1.25/1e6 + 10_000 * $10.00/1e6 + 50_000 * $0.125/1e6
-    //         = 0.125 + 0.10 + 0.00625
-    //         = 0.23125 USD.
+run("GeminiUsageFetcher.parseLine: 2.5 Pro <=200k with cachedTokens costed at low-tier, cached subtracted from input (PR 28 audit fix)") {
+    // 100k input (50k non-cached + 50k cached) + 10k output on 2.5 Pro.
+    // Post-PR-28 correct formula:
+    //   non_cached_input = 100_000 - 50_000 = 50_000
+    // Expected: 50_000 * $1.25/1e6 + 10_000 * $10.00/1e6 + 50_000 * $0.125/1e6
+    //         = 0.0625 + 0.10 + 0.00625
+    //         = 0.16875 USD.
+    // (Previously the test asserted 0.23125 which baked in the
+    // pre-audit double-count.)
     let line: [String: Any] = [
         "id": "m5",
         "type": "gemini",
@@ -11213,7 +11220,35 @@ run("GeminiUsageFetcher.parseLine: 2.5 Pro <=200k with cachedTokens costed at lo
     )
     expect(record != nil)
     expect(record?.cachedTokens == 50_000)
-    expect(abs((record?.costUSD ?? 0) - 0.23125) < 0.0001)
+    expect(abs((record?.costUSD ?? 0) - 0.16875) < 0.0001)
+}
+
+run("GeminiUsageFetcher.cost: cached tokens are NOT double-billed (PR 28 audit fix regression guard)") {
+    // Explicit regression guard: a record with cached tokens > 0 must
+    // NOT charge both input rate AND cached rate for the cached
+    // portion. Given the same record, cost with cached=0 vs cached=X
+    // should differ by exactly `X * (cachedRate - inputRate)` (a
+    // credit against the input rate — cached tokens are cheaper).
+    let rate = GeminiPricing.rate(for: "gemini-2.5-pro")!  // low-tier
+    let baseline = GeminiUsageRecord(
+        model: "gemini-2.5-pro", timestamp: nil, inputTokens: 100_000,
+        outputTokens: 0, cachedTokens: 0, thoughtsTokens: 0,
+        toolTokens: 0, costUSD: 0.0, sourceFile: "/tmp/x"
+    )
+    let withCache = GeminiUsageRecord(
+        model: "gemini-2.5-pro", timestamp: nil, inputTokens: 100_000,
+        outputTokens: 0, cachedTokens: 50_000, thoughtsTokens: 0,
+        toolTokens: 0, costUSD: 0.0, sourceFile: "/tmp/x"
+    )
+    let baselineCost = GeminiPricing.cost(for: rate, record: baseline)
+    let cachedCost = GeminiPricing.cost(for: rate, record: withCache)
+    // Baseline: 100_000 * $1.25/1e6 = $0.125
+    expect(abs(baselineCost - 0.125) < 0.0001)
+    // With cache: (100k - 50k) * $1.25/1e6 + 50k * $0.125/1e6
+    //           = $0.0625 + $0.00625 = $0.06875
+    expect(abs(cachedCost - 0.06875) < 0.0001)
+    // Delta = 50_000 * (0.125 - 1.25) / 1e6 = -0.05625 USD (cheaper)
+    expect(abs((cachedCost - baselineCost) - (-0.05625)) < 0.0001)
 }
 
 run("GeminiUsageFetcher.parseLine: 2.5 Flash big request stays flat (no tier)") {

@@ -362,17 +362,54 @@ public enum GeminiPricing {
 
     /// Compute cost from a Rate + record's token counts.
     ///
-    /// - `input` billed at input rate.
+    /// Google's usageMetadata contract (verified 2026-07-16 via
+    /// primary sources — `ai.google.dev/gemini-api/docs/tokens` +
+    /// Vertex context-cache overview):
+    ///
+    /// - `promptTokenCount` (mapped to `record.inputTokens` by
+    ///   gemini-cli) is the FULL prompt count and INCLUDES the
+    ///   cached portion. `cachedContentTokenCount` (mapped to
+    ///   `record.cachedTokens`) is a SUBSET of `promptTokenCount`.
+    ///   Non-cached input tokens = inputTokens - cachedTokens.
+    /// - `toolUsePromptTokenCount` (mapped to `record.toolTokens`)
+    ///   is SEPARATE from `promptTokenCount`, not a subset.
+    /// - `thoughtsTokenCount` (mapped to `record.thoughtsTokens`):
+    ///   Google's docs say the Gemini API includes thoughts inside
+    ///   `candidatesTokenCount` (which is `record.outputTokens`), but
+    ///   observed API responses have them as separate additive values.
+    ///   Ambiguity noted — this code adds thoughts to output at the
+    ///   output rate, which matches Vertex's contract and the observed
+    ///   API behaviour but may over-count on the pure Gemini API when
+    ///   the docs are authoritative. Follow-up when Google clarifies.
+    ///
+    /// Billing formula (post PR 28 audit fix):
+    ///
+    /// - non-cached input = `max(inputTokens - cachedTokens, 0)`
+    ///   billed at `input` rate.
+    /// - cached input billed at `cached` rate (10% of input rate on
+    ///   Gemini's standard tier).
     /// - `output` billed at output rate.
-    /// - `cached` billed at cached rate.
-    /// - `thoughts` billed at output rate (Gemini 2.5's reasoning
-    ///   tokens are output-side).
+    /// - `thoughts` billed at output rate (see ambiguity note above).
     /// - `tool` billed at input rate (Google's
     ///   `toolUsePromptTokenCount` is prompt-side; billing on the
     ///   input side would otherwise overcharge tool-heavy sessions
     ///   by up to 8x on 2.5 Pro/Flash). 3cc PR 15-BE F1.
+    ///
+    /// PR 28 audit fix — the pre-existing formula charged `inputTokens`
+    /// AT THE FULL RATE AND `cachedTokens` AT THE CACHED RATE, which
+    /// double-billed the cached portion (once at input rate, once at
+    /// cached rate). This over-billed every Gemini record with cached
+    /// tokens > 0 by `cachedTokens * inputRate`. Correction here uses
+    /// the non-cached-input-minus-cached formula; matches Google's own
+    /// tier documentation and the invoice-reconciliation guidance on
+    /// their pricing page.
     public static func cost(for rate: Rate, record: GeminiUsageRecord) -> Double {
-        var c = Double(record.inputTokens) * rate.inputPerToken
+        // Subtract cached from input to avoid double-billing the
+        // cached portion. Clamp at 0 for the hostile case where the
+        // on-disk log has cached > input (should never happen given
+        // Google's own contract, but defensive).
+        let nonCachedInput = max(record.inputTokens - record.cachedTokens, 0)
+        var c = Double(nonCachedInput) * rate.inputPerToken
         c += Double(record.outputTokens) * rate.outputPerToken
         c += Double(record.cachedTokens) * rate.cachedPerToken
         c += Double(record.thoughtsTokens) * rate.outputPerToken
