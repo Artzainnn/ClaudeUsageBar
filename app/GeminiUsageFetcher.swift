@@ -231,9 +231,13 @@ public enum GeminiPathResolver {
 ///   `cached` per cached input token.
 public enum GeminiPricing {
     public struct Rate: Equatable, Sendable {
-        public var inputPerToken: Double
-        public var outputPerToken: Double
-        public var cachedPerToken: Double
+        // PR 29 audit R2 fix: fields flipped from `var` to `let`. Every
+        // Rate instance in the codebase is constructed via memberwise
+        // init and never mutated afterwards; the mutability had no
+        // callers. Same pattern applied to `StatusSnapshot` in PR 25.
+        public let inputPerToken: Double
+        public let outputPerToken: Double
+        public let cachedPerToken: Double
         public init(inputPerToken: Double, outputPerToken: Double, cachedPerToken: Double) {
             self.inputPerToken = inputPerToken
             self.outputPerToken = outputPerToken
@@ -250,7 +254,7 @@ public enum GeminiPricing {
     /// Gemini 2.5 Pro > 200k input tokens per request:
     ///   input $2.50 / 1M, output $15.00 / 1M, cached $0.25 / 1M.
     /// Gemini 2.5 Flash:
-    ///   input $0.30 / 1M, output $2.50 / 1M, cached $0.075 / 1M.
+    ///   input $0.30 / 1M, output $2.50 / 1M, cached $0.03 / 1M.
     /// Gemini 1.5 Pro:
     ///   input $1.25 / 1M, output $5.00 / 1M, cached $0.3125 / 1M.
     /// Gemini 1.5 Flash:
@@ -278,7 +282,15 @@ public enum GeminiPricing {
                                         cachedPerToken: 0.125 / 1_000_000),
         "gemini-2.5-flash":       Rate(inputPerToken: 0.30 / 1_000_000,
                                         outputPerToken: 2.50 / 1_000_000,
-                                        cachedPerToken: 0.075 / 1_000_000),
+                                        cachedPerToken: 0.03 / 1_000_000),
+                                        // PR 29 audit-cycle-2 fix: cached rate
+                                        // was $0.075/M — Google's actual page
+                                        // has always been $0.03/M (10% of input
+                                        // rate, matching the platform-wide rule).
+                                        // Same class of error as PR 24's 2.5 Pro
+                                        // cached-rate correction, missed on the
+                                        // first pass because the reviewer only
+                                        // checked 2.5 Pro not 2.5 Flash.
         // 3cc PR 15-BE F3 — Gemini 2.0 Flash rows added. Prefix-longest-
         // first sort ensures `gemini-2.0-flash-lite` matches BEFORE
         // `gemini-2.0-flash` (26 chars vs 20 chars — length DESC).

@@ -10972,13 +10972,15 @@ run("GeminiPricing.cost: input/output/cached/thoughts/tool billing rates (3cc PR
     )
     expect(abs(GeminiPricing.cost(for: rate, record: outputOnly) - 2.50) < 0.0001)
 
-    // Cached-only: 1M × 0.075/1M = 0.075
+    // Cached-only: 1M × 0.03/1M = 0.03 (PR 29 audit-cycle-2 fix — was
+    // 0.075 based on the wrong pre-fix cached rate; Google's page has
+    // always been $0.03/M for 2.5 Flash text/image/video caching.)
     let cachedOnly = GeminiUsageRecord(
         model: "gemini-2.5-flash", timestamp: nil, inputTokens: 0,
         outputTokens: 0, cachedTokens: 1_000_000, thoughtsTokens: 0, toolTokens: 0,
         costUSD: 0, sourceFile: "/x"
     )
-    expect(abs(GeminiPricing.cost(for: rate, record: cachedOnly) - 0.075) < 0.0001)
+    expect(abs(GeminiPricing.cost(for: rate, record: cachedOnly) - 0.03) < 0.0001)
 
     // Thoughts billed at OUTPUT rate — 1M × 2.50/1M = 2.50.
     let thoughtsOnly = GeminiUsageRecord(
@@ -11221,6 +11223,30 @@ run("GeminiUsageFetcher.parseLine: 2.5 Pro <=200k with cachedTokens costed at lo
     expect(record != nil)
     expect(record?.cachedTokens == 50_000)
     expect(abs((record?.costUSD ?? 0) - 0.16875) < 0.0001)
+}
+
+run("GeminiPricing.cost: hostile cached>input clamps non-cached-input to zero (PR 29 audit-cycle-2 clamp coverage)") {
+    // Google's contract guarantees cachedContentTokenCount ≤
+    // promptTokenCount, but a corrupted or hostile on-disk log could
+    // in principle have cached > input. The `max(input - cached, 0)`
+    // clamp in cost() prevents this from producing a negative
+    // non-cached-input contribution. This test exercises the clamp.
+    let rate = GeminiPricing.rate(for: "gemini-2.5-pro")!  // low-tier
+    let hostile = GeminiUsageRecord(
+        model: "gemini-2.5-pro", timestamp: nil, inputTokens: 100_000,
+        outputTokens: 0, cachedTokens: 150_000, thoughtsTokens: 0,
+        toolTokens: 0, costUSD: 0.0, sourceFile: "/tmp/x"
+    )
+    // Post-clamp: nonCachedInput = max(100_000 - 150_000, 0) = 0.
+    // Cost = 0 * $1.25/1e6 + 150_000 * $0.125/1e6 + 0 (no output)
+    //      = 0 + 0.01875 + 0 = 0.01875 USD.
+    // If the clamp were absent, a naive Int subtraction would
+    // produce -50_000 * $1.25/1e6 = -0.0625, giving a negative-
+    // contribution total of -0.04375 — clearly wrong.
+    let cost = GeminiPricing.cost(for: rate, record: hostile)
+    expect(abs(cost - 0.01875) < 0.0001)
+    // Sanity: cost must be non-negative.
+    expect(cost >= 0)
 }
 
 run("GeminiUsageFetcher.cost: cached tokens are NOT double-billed (PR 28 audit fix regression guard)") {
