@@ -207,7 +207,14 @@ jobs:
           # We need at least ONE `nonisolated(unsafe) let` declaration
           # in `app/` for the guard to have a non-empty alternation.
           # The real code has 6 (ISO formatters). Verify.
-          real_count=$(grep -rhE 'nonisolated\(unsafe\)[[:space:]]+(private[[:space:]]+)?static[[:space:]]+let' -- app/ | wc -l | tr -d ' ')
+          #
+          # Audit-fix PR 27: harmonised the regex with the NAMES-enum
+          # regex above. Previously this only recognised `private` (or
+          # no) modifier; if all declarations were `public`/`internal`/
+          # `fileprivate`, `real_count` returned 0 while NAMES was
+          # non-empty — spurious "guard vacuous" failure. The full
+          # optional-modifier list now matches whatever NAMES enumerates.
+          real_count=$(grep -rhE 'nonisolated\(unsafe\)[[:space:]]+(private[[:space:]]+|internal[[:space:]]+|fileprivate[[:space:]]+|public[[:space:]]+)?static[[:space:]]+let' -- app/ | wc -l | tr -d ' ')
           if [ "$real_count" -lt 1 ]; then
             echo "::error::Guard self-test cannot run — no real nonisolated(unsafe) let declarations exist in app/. Guard is vacuous." >&2
             exit 1
