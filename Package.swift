@@ -159,19 +159,26 @@ let package = Package(
                 // session-*.jsonl`. Feature-flagged off. Tokens + cost
                 // via a bundled per-token rate table.
                 "GeminiUsageFetcher.swift",
-                "GeminiUsageStore.swift"
+                "GeminiUsageStore.swift",
+                // PR 21 — StatusTypes / StatusSource / StatusManager
+                // lifted out of ClaudeUsageBar.swift. `StatusTypes`
+                // holds the value types that used to sit in the app-
+                // only compile (StatusIncident, StatusComponent,
+                // AffectedComponent, defaultTrackedComponents,
+                // defaultTrackedComponentIdSet). `StatusSource.swift`
+                // (added PR 14) now compiles in the library thanks to
+                // that move. `StatusManager` migrated its bespoke
+                // Anthropic fetch/parse onto `StatuspageV2Source.
+                // anthropic` — the sole live Anthropic-facing
+                // duplicated statuspage.io v2 parser is now gone.
+                "StatusTypes.swift",
+                "StatusSource.swift",
+                "StatusManager.swift"
                 // AnthropicUsageStore.swift depends on UsageManager
                 // (defined in ClaudeUsageBar.swift), so it stays in the
                 // app-bundle compile only, not in the SwiftPM library
                 // target. Tests for AnthropicUsageStore live in the
                 // full-app integration tier, not this unit-test layer.
-                //
-                // PR 14 — StatusSource.swift depends on StatusIncident /
-                // StatusComponent / AffectedComponent, which live in
-                // ClaudeUsageBar.swift. Same rationale — app-only.
-                // Parser tests would need duplicated struct
-                // definitions in the library, which is not worth the
-                // maintenance tax.
             ],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),

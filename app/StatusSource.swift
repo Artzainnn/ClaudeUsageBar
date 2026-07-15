@@ -38,25 +38,32 @@ import Foundation
 // MARK: - Common types
 
 /// Per-source snapshot delivered to `StatusManager` after a fetch.
-struct StatusSnapshot: Equatable, Sendable {
+///
+/// PR 21 promoted this to `public` (was implicit-internal) so
+/// TestRunner can construct fixture snapshots and verify parser +
+/// StatusManager behaviour end-to-end. Fields are `let` — snapshots
+/// are constructed once (by the parser or a test fixture) and never
+/// mutated afterward; the 3cc YAGNI reviewer confirmed zero write
+/// sites exist across the codebase.
+public struct StatusSnapshot: Equatable, Sendable {
     /// One of statuspage.io's four indicator strings, or an
     /// equivalent Google-Cloud-derived value: `none | minor | major
     /// | critical`. Empty string when the fetch failed and no prior
     /// state should be trusted.
-    var indicator: String
+    public let indicator: String
     /// Human description ("All Systems Operational", "Partially
     /// Degraded Service"). Empty when the fetch failed.
-    var description: String
+    public let description: String
     /// Non-resolved incidents (best-effort — some sources omit
     /// resolved incidents from the summary endpoint).
-    var incidents: [StatusIncident]
+    public let incidents: [StatusIncident]
     /// All known components. Empty for sources that do not expose a
     /// component list (Google Cloud).
-    var components: [StatusComponent]
+    public let components: [StatusComponent]
     /// Non-operational components.
-    var affectedComponents: [AffectedComponent]
+    public let affectedComponents: [AffectedComponent]
 
-    init(
+    public init(
         indicator: String = "",
         description: String = "",
         incidents: [StatusIncident] = [],
@@ -72,7 +79,10 @@ struct StatusSnapshot: Equatable, Sendable {
 }
 
 /// A single source that produces status snapshots on demand.
-internal protocol StatusSource: Sendable {
+///
+/// PR 21 promoted this to `public` so TestRunner can define a
+/// `StubStatusSource` for injection into `StatusManager`.
+public protocol StatusSource: Sendable {
     /// Machine identifier: `"anthropic" | "openai" | "github" |
     /// "xai" | "gcloud"`. Used for feature flags and per-source
     /// UserDefaults keys.
@@ -104,9 +114,9 @@ internal protocol StatusSource: Sendable {
 /// Handles OpenAI's slim variant that omits `.incidents` when empty:
 /// missing top-level `incidents` yields an empty list rather than a
 /// parse failure.
-internal enum StatuspageV2Parser {
+public enum StatuspageV2Parser {
 
-    static func parse(_ data: Data) -> StatusSnapshot? {
+    public static func parse(_ data: Data) -> StatusSnapshot? {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let status = json["status"] as? [String: Any],
               let indicator = status["indicator"] as? String,
@@ -183,14 +193,14 @@ internal enum StatuspageV2Parser {
 
 /// Base type for statuspage.io v2 sources. Concrete sources supply
 /// endpoint URL, id, and display name.
-internal struct StatuspageV2Source: StatusSource, Sendable {
-    let id: String
-    let displayName: String
-    let webURL: URL
-    let featureFlagKey: String
-    let endpoint: URL
+public struct StatuspageV2Source: StatusSource, Sendable {
+    public let id: String
+    public let displayName: String
+    public let webURL: URL
+    public let featureFlagKey: String
+    public let endpoint: URL
 
-    init(
+    public init(
         id: String,
         displayName: String,
         webURL: URL,
@@ -204,7 +214,7 @@ internal struct StatuspageV2Source: StatusSource, Sendable {
         self.endpoint = endpoint
     }
 
-    func fetch(_ completion: @escaping @Sendable (StatusSnapshot) -> Void) {
+    public func fetch(_ completion: @escaping @Sendable (StatusSnapshot) -> Void) {
         let request = URLRequest(
             url: endpoint,
             cachePolicy: .reloadIgnoringLocalCacheData,
@@ -221,7 +231,7 @@ internal struct StatuspageV2Source: StatusSource, Sendable {
     }
 }
 
-internal extension StatuspageV2Source {
+public extension StatuspageV2Source {
     static let anthropic = StatuspageV2Source(
         id: "anthropic",
         displayName: "Anthropic",
@@ -263,14 +273,14 @@ internal extension StatuspageV2Source {
 /// Google Cloud's `incidents.json` is a bare array of incident
 /// objects, NOT statuspage.io. There is no server-side overall
 /// indicator; we synthesise one from the active-incident severities.
-internal enum GoogleCloudStatusParser {
+public enum GoogleCloudStatusParser {
 
     /// Parse `incidents.json`. Filters to currently-affecting incidents
     /// (`end` missing or null OR `currently_affected_locations` non-
     /// empty), maps each to a `StatusIncident`, and derives an overall
     /// indicator from the worst active `status_impact`/`severity`
     /// pair.
-    static func parse(_ data: Data) -> StatusSnapshot? {
+    public static func parse(_ data: Data) -> StatusSnapshot? {
         guard let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
             return nil
         }
@@ -329,7 +339,7 @@ internal enum GoogleCloudStatusParser {
     /// Higher is worse. `AVAILABLE` scores 0; `SERVICE_INFORMATION`
     /// with low severity scores 0-1; `SERVICE_DISRUPTION` and
     /// `SERVICE_OUTAGE` scale from 2 to 3.
-    static func severityScore(statusImpact: String, severity: String) -> Int {
+    public static func severityScore(statusImpact: String, severity: String) -> Int {
         // Prefer explicit outage/disruption impact regardless of the
         // separately-published severity field (which sometimes lags).
         switch statusImpact {
@@ -350,7 +360,7 @@ internal enum GoogleCloudStatusParser {
         }
     }
 
-    static func mapStatus(sevScore: Int) -> String {
+    public static func mapStatus(sevScore: Int) -> String {
         switch sevScore {
         case 3: return "major_outage"
         case 2: return "partial_outage"
@@ -359,7 +369,7 @@ internal enum GoogleCloudStatusParser {
         }
     }
 
-    static func mapOverall(worstSeverity: Int) -> (indicator: String, description: String) {
+    public static func mapOverall(worstSeverity: Int) -> (indicator: String, description: String) {
         switch worstSeverity {
         case 0: return ("none",     "All systems operational")
         case 1: return ("minor",    "Minor service disruption")
@@ -379,22 +389,22 @@ internal enum GoogleCloudStatusParser {
         f.formatOptions = [.withInternetDateTime]
         return f
     }()
-    static func parseGCTimestamp(_ raw: String?) -> Date? {
+    public static func parseGCTimestamp(_ raw: String?) -> Date? {
         guard let s = raw else { return nil }
         return iso.date(from: s) ?? isoNoFrac.date(from: s)
     }
 }
 
-internal struct GoogleCloudStatusSource: StatusSource, Sendable {
-    let id: String = "gcloud"
-    let displayName: String = "Google Cloud"
-    let webURL: URL = URL(string: "https://status.cloud.google.com")!
-    let featureFlagKey: String = "features.status.gcloud.enabled"
-    let endpoint: URL = URL(string: "https://status.cloud.google.com/incidents.json")!
+public struct GoogleCloudStatusSource: StatusSource, Sendable {
+    public let id: String = "gcloud"
+    public let displayName: String = "Google Cloud"
+    public let webURL: URL = URL(string: "https://status.cloud.google.com")!
+    public let featureFlagKey: String = "features.status.gcloud.enabled"
+    public let endpoint: URL = URL(string: "https://status.cloud.google.com/incidents.json")!
 
-    init() {}
+    public init() {}
 
-    func fetch(_ completion: @escaping @Sendable (StatusSnapshot) -> Void) {
+    public func fetch(_ completion: @escaping @Sendable (StatusSnapshot) -> Void) {
         let request = URLRequest(
             url: endpoint,
             cachePolicy: .reloadIgnoringLocalCacheData,
@@ -413,12 +423,12 @@ internal struct GoogleCloudStatusSource: StatusSource, Sendable {
 
 // MARK: - Aggregation
 
-internal enum StatusAggregator {
+public enum StatusAggregator {
 
     /// Reduce a set of per-source snapshots to a single indicator
     /// using statuspage.io's severity ordering. Empty indicators
     /// (fetch failure) contribute nothing.
-    static func aggregateIndicator(_ snapshots: [StatusSnapshot]) -> String {
+    public static func aggregateIndicator(_ snapshots: [StatusSnapshot]) -> String {
         var worst = 0
         for s in snapshots {
             let score: Int

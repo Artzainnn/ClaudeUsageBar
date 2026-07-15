@@ -81,7 +81,9 @@ swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_arm64" \
     RooZooPathResolver.swift \
     RooZooUsageFetcher.swift \
     RooUsageStore.swift \
+    StatusTypes.swift \
     StatusSource.swift \
+    StatusManager.swift \
     GeminiUsageFetcher.swift \
     GeminiUsageStore.swift \
     -framework SwiftUI \
@@ -133,7 +135,9 @@ swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_x86_64" \
     RooZooPathResolver.swift \
     RooZooUsageFetcher.swift \
     RooUsageStore.swift \
+    StatusTypes.swift \
     StatusSource.swift \
+    StatusManager.swift \
     GeminiUsageFetcher.swift \
     GeminiUsageStore.swift \
     -framework SwiftUI \

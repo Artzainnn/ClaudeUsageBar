@@ -11071,6 +11071,372 @@ run("GeminiUsageFetcher.parse: end-to-end file → snapshot") {
     expectEqual(total, 2000)  // 1000+500 + 300+200
 }
 
+// MARK: - PR 21 — StatusSource / StatuspageV2Parser / GoogleCloudStatusParser
+//                / StatusAggregator / StatusManager tests
+//
+// PR 21 lifted these types into the SwiftPM library so TestRunner can
+// exercise them directly. Prior to this PR, parser tests could not run
+// because the value types lived in the app-only compile unit.
+
+// A minimal stub that records how many times `fetch` was called and
+// delivers pre-canned snapshots in order.
+final class StubStatusSource: StatusSource, @unchecked Sendable {
+    let id: String
+    let displayName: String
+    let webURL: URL
+    let featureFlagKey: String
+    // Access guarded by DispatchQueue.main — every test drives fetch
+    // from the main thread, and completions run inline on the same
+    // thread (no URLSession).
+    private var pending: [StatusSnapshot]
+    var fetchCallCount: Int = 0
+
+    init(id: String = "stub",
+         displayName: String = "Stub",
+         webURL: URL = URL(string: "https://example.invalid")!,
+         featureFlagKey: String = "features.status.stub.enabled",
+         snapshots: [StatusSnapshot]) {
+        self.id = id
+        self.displayName = displayName
+        self.webURL = webURL
+        self.featureFlagKey = featureFlagKey
+        self.pending = snapshots
+    }
+
+    func fetch(_ completion: @escaping @Sendable (StatusSnapshot) -> Void) {
+        fetchCallCount += 1
+        let snap = pending.isEmpty ? StatusSnapshot() : pending.removeFirst()
+        completion(snap)
+    }
+}
+
+run("StatuspageV2Parser: parses Anthropic-shape summary.json") {
+    let payload = """
+    {
+      "status": {"indicator": "minor", "description": "Partially Degraded Service"},
+      "incidents": [
+        {"id": "inc1", "name": "Elevated latency on api.anthropic.com",
+         "status": "identified",
+         "incident_updates": [
+           {"body": "We're investigating.", "created_at": "2026-07-15T10:00:00.000Z"}
+         ],
+         "components": [{"id": "c-claude-api"}]
+        },
+        {"id": "inc2", "name": "Resolved thing", "status": "resolved",
+         "incident_updates": []}
+      ],
+      "components": [
+        {"id": "c-claude-ai",      "name": "claude.ai",                            "status": "operational"},
+        {"id": "c-claude-api",     "name": "Claude API (api.anthropic.com)",       "status": "degraded_performance"},
+        {"id": "c-claude-console", "name": "Claude Console (platform.claude.com)", "status": "operational"}
+      ]
+    }
+    """
+    let data = payload.data(using: .utf8)!
+    let snap = StatuspageV2Parser.parse(data)
+    expect(snap != nil)
+    expectEqual(snap?.indicator, "minor")
+    expectEqual(snap?.description, "Partially Degraded Service")
+    // Resolved incident filtered out.
+    expectEqual(snap?.incidents.count, 1)
+    expectEqual(snap?.incidents.first?.id, "inc1")
+    expectEqual(snap?.incidents.first?.componentIds, ["c-claude-api"])
+    expectEqual(snap?.components.count, 3)
+    // Only degraded component surfaces as "affected".
+    expectEqual(snap?.affectedComponents.count, 1)
+    expectEqual(snap?.affectedComponents.first?.id, "c-claude-api")
+}
+
+run("StatuspageV2Parser: OpenAI slim variant (no top-level incidents) returns empty incident list") {
+    let payload = """
+    {"status": {"indicator": "none", "description": "All systems operational"},
+     "components": []}
+    """
+    let snap = StatuspageV2Parser.parse(payload.data(using: .utf8)!)
+    expect(snap != nil)
+    expectEqual(snap?.indicator, "none")
+    expectEqual(snap?.incidents.count, 0)
+}
+
+run("StatuspageV2Parser: malformed JSON returns nil") {
+    let snap = StatuspageV2Parser.parse("not json".data(using: .utf8)!)
+    expect(snap == nil)
+}
+
+run("StatuspageV2Parser: payload missing top-level status returns nil") {
+    let snap = StatuspageV2Parser.parse("{\"incidents\": []}".data(using: .utf8)!)
+    expect(snap == nil)
+}
+
+run("GoogleCloudStatusParser: parses incidents.json with active + ended + currently-affecting") {
+    let payload = """
+    [
+      {"id": "gc-1", "external_desc": "Compute Engine degraded (active)",
+       "status_impact": "SERVICE_DISRUPTION", "severity": "medium",
+       "most_recent_update": {"text": "Investigating.", "when": "2026-07-15T09:00:00Z"},
+       "affected_products": [{"id": "compute", "title": "Compute Engine"}]},
+      {"id": "gc-2", "external_desc": "Cloud SQL fully outaged",
+       "status_impact": "SERVICE_OUTAGE", "severity": "high",
+       "end": null,
+       "currently_affected_locations": [{"id": "us-east1"}],
+       "most_recent_update": {"text": "Root cause identified.", "when": "2026-07-15T10:15:00Z"},
+       "affected_products": [{"id": "sql", "title": "Cloud SQL"}]},
+      {"id": "gc-3", "external_desc": "Old resolved thing",
+       "status_impact": "SERVICE_INFORMATION", "severity": "low",
+       "end": "2026-07-01T00:00:00Z",
+       "currently_affected_locations": []}
+    ]
+    """
+    let snap = GoogleCloudStatusParser.parse(payload.data(using: .utf8)!)
+    expect(snap != nil)
+    // gc-1 and gc-2 are still active; gc-3 has end + empty currently-affected → filtered.
+    expectEqual(snap?.incidents.count, 2)
+    // Worst active is SERVICE_OUTAGE → indicator "critical", description
+    // "Service outage".
+    expectEqual(snap?.indicator, "critical")
+    expectEqual(snap?.description, "Service outage")
+    // Google Cloud sources never populate `components` (no top-level list).
+    expectEqual(snap?.components.count, 0)
+    expectEqual(snap?.affectedComponents.count, 2)
+}
+
+run("GoogleCloudStatusParser.severityScore: prefers status_impact over severity") {
+    // OUTAGE regardless of severity → 3 (critical).
+    expectEqual(GoogleCloudStatusParser.severityScore(statusImpact: "SERVICE_OUTAGE", severity: "low"), 3)
+    // DISRUPTION with high severity → 3.
+    expectEqual(GoogleCloudStatusParser.severityScore(statusImpact: "SERVICE_DISRUPTION", severity: "high"), 3)
+    // DISRUPTION with medium → 2.
+    expectEqual(GoogleCloudStatusParser.severityScore(statusImpact: "SERVICE_DISRUPTION", severity: "medium"), 2)
+    // INFORMATION with low → 1.
+    expectEqual(GoogleCloudStatusParser.severityScore(statusImpact: "SERVICE_INFORMATION", severity: "low"), 1)
+    // Unknown / AVAILABLE → 0.
+    expectEqual(GoogleCloudStatusParser.severityScore(statusImpact: "AVAILABLE", severity: "low"), 0)
+}
+
+run("StatusAggregator: returns worst-of across snapshots") {
+    let good = StatusSnapshot(indicator: "none",     description: "OK")
+    let minor = StatusSnapshot(indicator: "minor",    description: "M")
+    let major = StatusSnapshot(indicator: "major",    description: "MJ")
+    let crit  = StatusSnapshot(indicator: "critical", description: "C")
+    expectEqual(StatusAggregator.aggregateIndicator([good, good]), "none")
+    expectEqual(StatusAggregator.aggregateIndicator([good, minor]), "minor")
+    expectEqual(StatusAggregator.aggregateIndicator([minor, major]), "major")
+    expectEqual(StatusAggregator.aggregateIndicator([good, crit, minor]), "critical")
+}
+
+run("StatusAggregator: empty-indicator snapshots (failed fetch) ignored") {
+    let empty = StatusSnapshot()  // indicator == ""
+    let ok = StatusSnapshot(indicator: "none", description: "OK")
+    // Empty must not downgrade a good signal — aggregator returns
+    // "none" (from ok) rather than blank.
+    expectEqual(StatusAggregator.aggregateIndicator([empty, ok]), "none")
+    // All-empty → clamps to "none" (no signal ≠ "critical").
+    expectEqual(StatusAggregator.aggregateIndicator([empty, empty]), "none")
+}
+
+run("StatusManager: apply(snapshot) sets indicator, description, incidents, hasFetched, lastUpdated") {
+    // Clear UserDefaults keys that would otherwise interfere.
+    UserDefaults.standard.removeObject(forKey: "tracked_component_ids")
+    UserDefaults.standard.removeObject(forKey: "last_effective_indicator")
+    UserDefaults.standard.removeObject(forKey: "status_notifications_enabled")
+
+    let mgr = StatusManager(anthropicSource: StubStatusSource(snapshots: []))
+    expect(mgr.hasFetched == false)
+    let snap = StatusSnapshot(
+        indicator: "minor",
+        description: "Partial",
+        incidents: [StatusIncident(
+            id: "i1", name: "n", status: "identified",
+            latestUpdate: "u", updatedAt: nil, componentIds: ["c-claude-api"]
+        )],
+        components: [
+            StatusComponent(id: "c-claude-api", name: "Claude API",       status: "degraded_performance"),
+            StatusComponent(id: "c-claude-ai",  name: "claude.ai",        status: "operational"),
+        ],
+        affectedComponents: [
+            AffectedComponent(id: "c-claude-api", name: "Claude API", status: "degraded_performance")
+        ]
+    )
+    mgr.apply(snap)
+    expectEqual(mgr.indicator, "minor")
+    expectEqual(mgr.statusDescription, "Partial")
+    expectEqual(mgr.incidents.count, 1)
+    expectEqual(mgr.affectedComponents.count, 1)
+    expectEqual(mgr.allComponents.count, 2)
+    expect(mgr.hasFetched == true)
+    expect(mgr.lastUpdated != nil)
+}
+
+run("StatusManager: empty-indicator snapshot preserves prior state (no-op)") {
+    UserDefaults.standard.removeObject(forKey: "tracked_component_ids")
+    let mgr = StatusManager(anthropicSource: StubStatusSource(snapshots: []))
+    let good = StatusSnapshot(indicator: "none", description: "OK", components: [
+        StatusComponent(id: "c-claude-api", name: "Claude API", status: "operational")
+    ])
+    mgr.apply(good)
+    let priorIndicator = mgr.indicator
+    let priorDesc = mgr.statusDescription
+    let priorAll = mgr.allComponents.count
+    // Simulate a fetch that failed — empty snapshot.
+    mgr.apply(StatusSnapshot())
+    // State unchanged.
+    expectEqual(mgr.indicator, priorIndicator)
+    expectEqual(mgr.statusDescription, priorDesc)
+    expectEqual(mgr.allComponents.count, priorAll)
+}
+
+run("StatusManager: first-fetch default component selection excludes 'Claude for Government'") {
+    UserDefaults.standard.removeObject(forKey: "tracked_component_ids")
+    let mgr = StatusManager(anthropicSource: StubStatusSource(snapshots: []))
+    let snap = StatusSnapshot(
+        indicator: "none",
+        description: "OK",
+        components: [
+            StatusComponent(id: "c-claude-ai",   name: "claude.ai",              status: "operational"),
+            StatusComponent(id: "c-claude-api",  name: "Claude API",             status: "operational"),
+            StatusComponent(id: "c-claude-gov",  name: "Claude for Government",  status: "operational"),
+        ]
+    )
+    mgr.apply(snap)
+    // Government excluded by default.
+    expect(mgr.selectedComponentIds.contains("c-claude-ai"))
+    expect(mgr.selectedComponentIds.contains("c-claude-api"))
+    expect(mgr.selectedComponentIds.contains("c-claude-gov") == false)
+    // Persisted to UserDefaults so subsequent launches don't re-derive.
+    let persisted = UserDefaults.standard.array(forKey: "tracked_component_ids") as? [String] ?? []
+    expect(persisted.contains("c-claude-gov") == false)
+    expect(Set(persisted) == mgr.selectedComponentIds)
+    // Cleanup so we don't leak into other tests.
+    UserDefaults.standard.removeObject(forKey: "tracked_component_ids")
+}
+
+run("StatusManager: subsequent fetches with existing tracked_component_ids DO NOT overwrite selection") {
+    // Seed the pref so first-fetch defaulting is skipped.
+    UserDefaults.standard.set(["c-claude-ai"], forKey: "tracked_component_ids")
+    let mgr = StatusManager(anthropicSource: StubStatusSource(snapshots: []))
+    expectEqual(mgr.selectedComponentIds, Set(["c-claude-ai"]))
+    let snap = StatusSnapshot(
+        indicator: "none",
+        description: "OK",
+        components: [
+            StatusComponent(id: "c-claude-ai",   name: "claude.ai",              status: "operational"),
+            StatusComponent(id: "c-claude-api",  name: "Claude API",             status: "operational"),
+            StatusComponent(id: "c-claude-gov",  name: "Claude for Government",  status: "operational"),
+        ]
+    )
+    mgr.apply(snap)
+    // Selection preserved from UserDefaults; NOT re-derived from the snapshot.
+    expectEqual(mgr.selectedComponentIds, Set(["c-claude-ai"]))
+    // effectiveIndicator uses only tracked components; the sole tracked
+    // component is operational, so effective is "none".
+    expectEqual(mgr.effectiveIndicator, "none")
+    UserDefaults.standard.removeObject(forKey: "tracked_component_ids")
+}
+
+run("StatusManager: fetch() drives apply via stub source") {
+    UserDefaults.standard.removeObject(forKey: "tracked_component_ids")
+    let stub = StubStatusSource(snapshots: [
+        StatusSnapshot(indicator: "none", description: "OK", components: [
+            StatusComponent(id: "c-claude-api", name: "API", status: "operational")
+        ])
+    ])
+    let mgr = StatusManager(anthropicSource: stub)
+    mgr.fetch()
+    // fetch() hops through Task { @MainActor }. Run the run loop
+    // briefly so the Task completes.
+    let expectation = Date().addingTimeInterval(1.0)
+    while mgr.hasFetched == false, Date() < expectation {
+        RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05))
+    }
+    expect(mgr.hasFetched == true)
+    expectEqual(stub.fetchCallCount, 1)
+    expectEqual(mgr.indicator, "none")
+    UserDefaults.standard.removeObject(forKey: "tracked_component_ids")
+}
+
+run("StatusManager: notification-on-transition writes last_effective_indicator on effective-indicator change (3cc R1 correctness gap)") {
+    // Clear all interfering UserDefaults keys.
+    UserDefaults.standard.removeObject(forKey: "tracked_component_ids")
+    UserDefaults.standard.removeObject(forKey: "last_effective_indicator")
+    // Do NOT enable notifications — the actual NSUserNotificationCenter
+    // deliver call is a no-op in the test environment, and we don't want
+    // to spam the OS. We're testing the UserDefaults write path.
+    UserDefaults.standard.set(false, forKey: "status_notifications_enabled")
+
+    let mgr = StatusManager(anthropicSource: StubStatusSource(snapshots: []))
+
+    // First fetch — all operational. hasFetched flips true. isFirstFetch
+    // suppresses transition notification. last_effective_indicator is
+    // written as "none".
+    mgr.apply(StatusSnapshot(
+        indicator: "none",
+        description: "OK",
+        components: [
+            StatusComponent(id: "c-claude-api", name: "Claude API",             status: "operational"),
+            StatusComponent(id: "c-claude-gov", name: "Claude for Government",  status: "operational"),
+        ]
+    ))
+    expectEqual(UserDefaults.standard.string(forKey: "last_effective_indicator"), "none")
+
+    // Second fetch — Claude API degraded. effectiveIndicator transitions
+    // from "none" to "minor" (degraded_performance = severity 1 = minor).
+    // Not first fetch, previous was "none", new is "minor" — transition
+    // detected. last_effective_indicator updated to "minor".
+    mgr.apply(StatusSnapshot(
+        indicator: "minor",
+        description: "Degraded",
+        components: [
+            StatusComponent(id: "c-claude-api", name: "Claude API",             status: "degraded_performance"),
+            StatusComponent(id: "c-claude-gov", name: "Claude for Government",  status: "operational"),
+        ],
+        affectedComponents: [
+            AffectedComponent(id: "c-claude-api", name: "Claude API", status: "degraded_performance"),
+        ]
+    ))
+    expectEqual(UserDefaults.standard.string(forKey: "last_effective_indicator"), "minor")
+
+    // Third fetch — recovery to operational. Transition minor → none.
+    // last_effective_indicator updated back to "none".
+    mgr.apply(StatusSnapshot(
+        indicator: "none",
+        description: "OK",
+        components: [
+            StatusComponent(id: "c-claude-api", name: "Claude API",             status: "operational"),
+            StatusComponent(id: "c-claude-gov", name: "Claude for Government",  status: "operational"),
+        ]
+    ))
+    expectEqual(UserDefaults.standard.string(forKey: "last_effective_indicator"), "none")
+
+    // Cleanup.
+    UserDefaults.standard.removeObject(forKey: "tracked_component_ids")
+    UserDefaults.standard.removeObject(forKey: "last_effective_indicator")
+    UserDefaults.standard.removeObject(forKey: "status_notifications_enabled")
+}
+
+run("StatusManager: filteredAffectedComponents honours tracked selection") {
+    UserDefaults.standard.set(["c-claude-api"], forKey: "tracked_component_ids")
+    let mgr = StatusManager(anthropicSource: StubStatusSource(snapshots: []))
+    mgr.apply(StatusSnapshot(
+        indicator: "major",
+        description: "Bad",
+        components: [
+            StatusComponent(id: "c-claude-api", name: "API",         status: "major_outage"),
+            StatusComponent(id: "c-claude-gov", name: "Gov",         status: "major_outage"),
+        ],
+        affectedComponents: [
+            AffectedComponent(id: "c-claude-api", name: "API", status: "major_outage"),
+            AffectedComponent(id: "c-claude-gov", name: "Gov", status: "major_outage"),
+        ]
+    ))
+    // Only the tracked component (API) surfaces.
+    expectEqual(mgr.filteredAffectedComponents.count, 1)
+    expectEqual(mgr.filteredAffectedComponents.first?.id, "c-claude-api")
+    // effectiveIndicator uses only tracked components (API is a
+    // major_outage → severity 3 → "critical").
+    expectEqual(mgr.effectiveIndicator, "critical")
+    UserDefaults.standard.removeObject(forKey: "tracked_component_ids")
+}
+
 // MARK: - Summary
 
 print("")
