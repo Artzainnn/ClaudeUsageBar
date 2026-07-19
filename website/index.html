@@ -357,6 +357,48 @@
       height: 22px;
     }
 
+    /* Homebrew one-liner under the download buttons */
+    .brew-line {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
+      margin-top: 18px;
+      animation: fadeInUp 0.6s ease-out;
+    }
+    .brew-line-label {
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    .brew-cmd {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      max-width: 100%;
+      padding: 9px 14px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-family: "SF Mono", ui-monospace, Menlo, monospace;
+      font-size: 12.5px;
+      color: var(--text-secondary);
+      cursor: pointer;
+      transition: border-color 0.2s ease, color 0.2s ease;
+      white-space: nowrap;
+      overflow-x: auto;
+    }
+    .brew-cmd:hover { border-color: rgba(218, 119, 86, 0.45); color: var(--text-primary); }
+    .brew-cmd .brew-copy {
+      flex-shrink: 0;
+      width: 14px;
+      height: 14px;
+      opacity: 0.6;
+    }
+    .brew-cmd.copied { border-color: rgba(33, 197, 93, 0.55); }
+    @media (max-width: 480px) {
+      .brew-cmd { font-size: 11px; padding: 8px 10px; }
+    }
+
     .github-btn {
       display: inline-flex;
       align-items: center;
@@ -1086,7 +1128,7 @@
   <!-- Full-width announcement banner -->
   <a href="https://github.com/Artzainnn/ClaudeUsageBar/releases/latest/download/ClaudeUsageBar-Installer.dmg" class="announce-bar" data-fast-goal="download_macos">
     <span class="announce-bar-tag">NEW</span>
-    Now tracking Fable usage<span class="announce-bar-cta"> <span class="announce-bar-sep">•</span> Free Download</span>
+    Now tracking Fable usage + extra credits<span class="announce-bar-cta"> <span class="announce-bar-sep">•</span> Free Download</span>
   </a>
   <div class="ambient"></div>
 
@@ -1169,6 +1211,24 @@
           </span>
         </a>
       </div>
+
+      <div class="brew-line">
+        <span class="brew-line-label">or install with Homebrew</span>
+        <code class="brew-cmd" id="brewCmd" title="Click to copy" data-fast-goal="copy_brew">brew tap Artzainnn/tap &amp;&amp; brew install --cask claudeusagebar
+          <svg class="brew-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+        </code>
+      </div>
+      <script>
+        document.getElementById('brewCmd').addEventListener('click', function () {
+          navigator.clipboard.writeText('brew tap Artzainnn/tap && brew install --cask claudeusagebar').then(() => {
+            this.classList.add('copied');
+            const label = document.querySelector('.brew-line-label');
+            const prev = label.textContent;
+            label.textContent = 'copied to clipboard ✓';
+            setTimeout(() => { this.classList.remove('copied'); label.textContent = prev; }, 1600);
+          });
+        });
+      </script>
       <div class="download-meta">
         <span>
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
