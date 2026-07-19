@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import WebKit
 import Carbon
+import ServiceManagement
 
 // Main entry point
 class AppDelegate: NSObject, NSApplicationDelegate {
@@ -14,6 +15,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var hotKeyRef: EventHotKeyRef?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // The UI is designed for dark; force dark appearance regardless of the
+        // system light/dark setting (light mode had poor contrast).
+        NSApp.appearance = NSAppearance(named: .darkAqua)
+
         // NSUserNotification (deprecated but works without permissions for unsigned apps)
         NSLog("✅ App launched, notifications ready")
 
@@ -321,6 +326,13 @@ class UsageManager: ObservableObject {
     @Published var weeklySonnetLimit: Int = 100
     @Published var weeklyFableUsage: Int = 0
     @Published var weeklyFableLimit: Int = 100
+    // Extra usage spend (from /overage_spend_limit). Shown only when there's spend.
+    @Published var extraSpentMinor: Int = 0
+    @Published var extraLimitMinor: Int = 0
+    @Published var extraResetsAt: Date?
+    @Published var freeCreditsMinor: Int = 0   // remaining free/promo credits (/prepaid/credits)
+    @Published var creditCurrency: String = "USD"
+    @Published var hasCreditUsage: Bool = false
     @Published var sessionResetsAt: Date?
     @Published var weeklyResetsAt: Date?
     @Published var weeklySonnetResetsAt: Date?
@@ -384,7 +396,12 @@ class UsageManager: ObservableObject {
             statusNotificationsEnabled = UserDefaults.standard.bool(forKey: "status_notifications_enabled")
         }
 
-        openAtLogin = UserDefaults.standard.bool(forKey: "open_at_login")
+        // Reflect the real system login-item state, not just a stored bool.
+        if #available(macOS 13.0, *) {
+            openAtLogin = (SMAppService.mainApp.status == .enabled)
+        } else {
+            openAtLogin = UserDefaults.standard.bool(forKey: "open_at_login")
+        }
         lastNotifiedThreshold = UserDefaults.standard.integer(forKey: "last_notified_threshold")
         // Default shortcut to enabled if not previously set
         if UserDefaults.standard.object(forKey: "shortcut_enabled") == nil {
@@ -400,6 +417,25 @@ class UsageManager: ObservableObject {
         UserDefaults.standard.set(openAtLogin, forKey: "open_at_login")
         UserDefaults.standard.set(shortcutEnabled, forKey: "shortcut_enabled")
         UserDefaults.standard.synchronize()
+    }
+
+    // Actually register/unregister the app as a macOS login item.
+    func applyLoginItem(_ enabled: Bool) {
+        guard #available(macOS 13.0, *) else { return }
+        do {
+            if enabled {
+                if SMAppService.mainApp.status != .enabled {
+                    try SMAppService.mainApp.register()
+                }
+            } else {
+                if SMAppService.mainApp.status == .enabled {
+                    try SMAppService.mainApp.unregister()
+                }
+            }
+            NSLog("🔑 Login item \(enabled ? "registered" : "unregistered")")
+        } catch {
+            NSLog("❌ Login item error: \(error.localizedDescription)")
+        }
     }
 
     func saveSessionCookie(_ cookie: String) {
@@ -425,6 +461,11 @@ class UsageManager: ObservableObject {
         weeklyResetsAt = nil
         weeklySonnetResetsAt = nil
         weeklyFableResetsAt = nil
+        extraSpentMinor = 0
+        extraLimitMinor = 0
+        extraResetsAt = nil
+        freeCreditsMinor = 0
+        hasCreditUsage = false
         hasFetchedData = false
         hasWeeklySonnet = false
         hasWeeklyFable = false
@@ -500,7 +541,82 @@ class UsageManager: ObservableObject {
             }
 
             self.fetchUsageWithOrgId(orgId)
+            self.fetchExtraUsage(orgId)
+            self.fetchFreeCredits(orgId)
         }
+    }
+
+    // Remaining free/promo credits (balance) from /prepaid/credits.
+    func fetchFreeCredits(_ orgId: String) {
+        guard let url = URL(string: "https://claude.ai/api/organizations/\(orgId)/prepaid/credits") else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue(sessionCookie, forHTTPHeaderField: "Cookie")
+        request.setValue("*/*", forHTTPHeaderField: "Accept")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("https://claude.ai", forHTTPHeaderField: "Origin")
+        request.setValue("https://claude.ai", forHTTPHeaderField: "Referer")
+        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
+        request.setValue("claude.ai", forHTTPHeaderField: "authority")
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
+            DispatchQueue.main.async {
+                guard let self = self,
+                      let http = response as? HTTPURLResponse, http.statusCode == 200,
+                      let data = data,
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+                // `amount` is the current balance; fall back to summing remaining tranches.
+                if let amount = json["amount"] as? Int {
+                    self.freeCreditsMinor = amount
+                } else {
+                    var remaining = 0
+                    for key in ["tranches", "promo_tranches"] {
+                        if let arr = json[key] as? [[String: Any]] {
+                            for t in arr { remaining += (t["remaining_amount_minor_units"] as? Int) ?? 0 }
+                        }
+                    }
+                    self.freeCreditsMinor = remaining
+                }
+                if let cur = json["currency"] as? String { self.creditCurrency = cur }
+                NSLog("🎁 Free credits left: \(self.freeCreditsMinor) \(self.creditCurrency)")
+            }
+        }.resume()
+    }
+
+    // Extra usage spend + monthly limit live on a separate endpoint (not /usage).
+    func fetchExtraUsage(_ orgId: String) {
+        guard let url = URL(string: "https://claude.ai/api/organizations/\(orgId)/overage_spend_limit") else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue(sessionCookie, forHTTPHeaderField: "Cookie")
+        request.setValue("*/*", forHTTPHeaderField: "Accept")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("https://claude.ai", forHTTPHeaderField: "Origin")
+        request.setValue("https://claude.ai", forHTTPHeaderField: "Referer")
+        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
+        request.setValue("claude.ai", forHTTPHeaderField: "authority")
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
+            DispatchQueue.main.async {
+                guard let self = self,
+                      let http = response as? HTTPURLResponse, http.statusCode == 200,
+                      let data = data,
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+
+                let spent = (json["used_credits"] as? Int) ?? 0
+                let limit = (json["monthly_credit_limit"] as? Int) ?? 0
+                self.extraSpentMinor = spent
+                self.extraLimitMinor = limit
+                self.creditCurrency = (json["currency"] as? String) ?? "USD"
+                if let resetStr = json["disabled_until"] as? String {
+                    let f = ISO8601DateFormatter()
+                    f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                    self.extraResetsAt = f.date(from: resetStr) ?? ISO8601DateFormatter().date(from: resetStr)
+                }
+                self.hasCreditUsage = spent > 0
+                NSLog("💳 Extra usage: \(spent)/\(limit) \(self.creditCurrency)")
+            }
+        }.resume()
     }
 
     func fetchUsageWithOrgId(_ orgId: String) {
@@ -658,6 +774,8 @@ class UsageManager: ObservableObject {
                     }
                 }
             }
+
+            // (Prepaid usage credits are fetched separately from /prepaid/credits.)
 
             // Log what we found
             NSLog("✅ Parsed: Session \(sessionUsage)%, Weekly \(weeklyUsage)%\(hasWeeklySonnet ? ", Weekly Sonnet \(weeklySonnetUsage)%" : "")\(hasWeeklyFable ? ", Weekly Fable \(weeklyFableUsage)%" : "")")
@@ -1326,6 +1444,9 @@ struct UsageView: View {
                     )
             }
             .frame(width: 360, height: min(max(measuredHeight, 100), maxPopupHeight))
+            // Darken the translucent popover material so contrast stays consistent
+            // no matter how light the content behind the popover is.
+            .background(Color(red: 0.07, green: 0.07, blue: 0.08).opacity(0.62))
             .onPreferenceChange(ContentHeightKey.self) { value in
                 guard value > 0 else { return }
                 measuredHeight = value
@@ -1533,6 +1654,91 @@ struct UsageView: View {
                     Text("\(Int(usageManager.weeklyFablePercentage * 100))% used")
                         .font(.caption)
                         .foregroundColor(.secondary)
+                }
+            }
+
+            // Usage credits (pay-as-you-go). Only shown once credits are actually
+            // used; links out to manage credits on claude.ai.
+            if usageManager.hasCreditUsage || usageManager.freeCreditsMinor > 0 {
+                let spentMinor = usageManager.extraSpentMinor
+                let limitMinor = usageManager.extraLimitMinor
+                let pct = limitMinor > 0 ? Double(spentMinor) / Double(limitMinor) : 0
+                let pctInt = Int((pct * 100).rounded())
+                // Show the exact % up to the limit; once over, just say "over limit".
+                let pctLabel = pctInt > 100 ? "over limit" : "\(pctInt)%"
+                let fmt: (Int) -> String = { minor in
+                    let v = Double(minor) / 100.0
+                    return usageManager.creditCurrency == "USD"
+                        ? String(format: "$%.2f", v)
+                        : String(format: "%@ %.2f", usageManager.creditCurrency, v)
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Extra usage")
+                            .font(.subheadline)
+                        Spacer()
+                        Button(action: {
+                            if let url = URL(string: "https://claude.ai/new#settings/usage") {
+                                NSWorkspace.shared.open(url)
+                            }
+                        }) {
+                            Text("Manage →")
+                                .font(.caption.weight(.semibold))
+                                .foregroundColor(.accentColor)
+                        }
+                        .buttonStyle(.borderless)
+                    }
+
+                    // Reset date, shortened (e.g. "Resets Aug 1") so it fits inline.
+                    let shortReset: String? = usageManager.extraResetsAt.map { d in
+                        let f = DateFormatter(); f.dateFormat = "MMM d"
+                        return "Resets \(f.string(from: d))"
+                    }
+
+                    // Spend vs monthly limit — only when there's actual spend.
+                    if usageManager.hasCreditUsage {
+                        if limitMinor > 0 {
+                            ProgressView(value: min(pct, 1.0))
+                                .tint(colorForPercentage(pct))
+                        }
+                        HStack {
+                            Text(limitMinor > 0
+                                 ? "\(fmt(spentMinor)) of \(fmt(limitMinor)) · \(pctLabel)"
+                                 : "\(fmt(spentMinor)) spent")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            Spacer()
+                            if let r = shortReset {
+                                Text(r)
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                    }
+
+                    if usageManager.freeCreditsMinor > 0 {
+                        Text("\(fmt(usageManager.freeCreditsMinor)) free credits left")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                            .opacity(0.85)
+                    }
+                }
+            }
+
+            // Discreet reassurance line naming whichever of Fable / extra usage
+            // is not being consumed (nothing shown when both are active).
+            if usageManager.hasFetchedData {
+                let fableActive = usageManager.hasWeeklyFable && usageManager.weeklyFableUsage >= 1
+                let extraActive = usageManager.hasCreditUsage || usageManager.freeCreditsMinor > 0
+                if !fableActive || !extraActive {
+                    Text(
+                        !fableActive && !extraActive ? "No Fable or extra usage"
+                        : !extraActive ? "No extra usage"
+                        : "No Fable usage"
+                    )
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .opacity(0.6)
                 }
             }
             }
@@ -1784,6 +1990,7 @@ struct UsageView: View {
                         get: { usageManager.openAtLogin },
                         set: { newValue in
                             usageManager.openAtLogin = newValue
+                            usageManager.applyLoginItem(newValue)
                             usageManager.saveSettings()
                         }
                     )) {
