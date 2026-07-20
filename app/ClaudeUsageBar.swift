@@ -4,6 +4,11 @@ import WebKit
 import Carbon
 import ServiceManagement
 
+// The categorical logger (enum Log, enum LogValue) lives in Log.swift so
+// the SwiftPM library target can compile it without also compiling this
+// file's @main entry point. Both files are compiled together by
+// app/build.sh into the final .app bundle.
+
 // Main entry point
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
@@ -439,15 +444,15 @@ class UsageManager: ObservableObject {
     }
 
     func saveSessionCookie(_ cookie: String) {
-        NSLog("ClaudeUsage: Saving cookie, length: \(cookie.count)")
+        Log.info("ClaudeUsage: saving cookie", .count(cookie.count))
         sessionCookie = cookie
         UserDefaults.standard.set(cookie, forKey: "claude_session_cookie")
         UserDefaults.standard.synchronize()
-        NSLog("ClaudeUsage: Cookie saved successfully")
+        Log.info("ClaudeUsage: cookie saved successfully")
     }
 
     func clearSessionCookie() {
-        NSLog("ClaudeUsage: Clearing cookie")
+        Log.info("ClaudeUsage: clearing cookie")
         sessionCookie = ""
         UserDefaults.standard.removeObject(forKey: "claude_session_cookie")
         UserDefaults.standard.synchronize()
@@ -476,7 +481,7 @@ class UsageManager: ObservableObject {
         // Update status bar to show 0%
         delegate?.updateStatusIcon(percentage: 0)
 
-        NSLog("ClaudeUsage: Cookie cleared, data reset")
+        Log.info("ClaudeUsage: cookie cleared, data reset")
     }
 
     func fetchOrganizationId(completion: @escaping (String?) -> Void) {
@@ -486,7 +491,7 @@ class UsageManager: ObservableObject {
             let trimmed = part.trimmingCharacters(in: .whitespaces)
             if trimmed.hasPrefix("lastActiveOrg=") {
                 let orgId = trimmed.replacingOccurrences(of: "lastActiveOrg=", with: "")
-                NSLog("📋 Found org ID in cookie: \(orgId)")
+                Log.info("Found org ID in cookie", .identifier(orgId))
                 completion(orgId)
                 return
             }
@@ -661,11 +666,17 @@ class UsageManager: ObservableObject {
                     return
                 }
 
-                NSLog("📡 Status: \(httpResponse.statusCode)")
+                Log.info("Usage API response", .count(httpResponse.statusCode))
 
+                // Response body is intentionally NOT logged. It contains the
+                // full usage JSON tied to the user's cookie and would land in
+                // unified log. Diagnostics for debugging live parse issues
+                // must go through the DEBUG-only path.
+                #if DEBUG
                 if let data = data, let responseString = String(data: data, encoding: .utf8) {
-                    NSLog("📦 Response: \(responseString)")
+                    Log.debug("Usage API body (DEBUG only): \(responseString)")
                 }
+                #endif
 
                 if httpResponse.statusCode == 200, let data = data {
                     self?.parseUsageData(data)
@@ -1935,7 +1946,7 @@ struct UsageView: View {
 
                             HStack(spacing: 8) {
                                 Button("Save Cookie & Fetch") {
-                                    NSLog("ClaudeUsage: Save clicked, input length: \(sessionCookieInput.count)")
+                                    Log.info("ClaudeUsage: save clicked", .count(sessionCookieInput.count))
                                     if sessionCookieInput.isEmpty {
                                         usageManager.errorMessage = "Cookie field is empty!"
                                     } else {
