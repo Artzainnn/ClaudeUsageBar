@@ -27,7 +27,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         if let button = statusItem.button {
             // Create Claude logo as initial icon
-            updateStatusIcon(percentage: 0)
+            updateStatusIcon(colorPercentage: 0, label: " 0%")
             button.action = #selector(handleClick)
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
             button.target = self
@@ -235,25 +235,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func updateStatusIcon(percentage: Int) {
+    func updateStatusIcon(colorPercentage: Int, label: String) {
         guard let button = statusItem.button else { return }
 
-        // Determine color based on percentage
         let color: NSColor
-        if percentage < 70 {
+        if colorPercentage < 70 {
             color = NSColor(red: 0.13, green: 0.77, blue: 0.37, alpha: 1.0) // Green
-        } else if percentage < 90 {
+        } else if colorPercentage < 90 {
             color = NSColor(red: 1.0, green: 0.8, blue: 0.0, alpha: 1.0) // Yellow
         } else {
             color = NSColor(red: 1.0, green: 0.23, blue: 0.19, alpha: 1.0) // Red
         }
 
-        // Create spark icon with color
-        let sparkIcon = createSparkIcon(color: color)
-
-        // Set image and title
-        button.image = sparkIcon
-        button.title = " \(percentage)%"
+        button.image = createSparkIcon(color: color)
+        button.title = label
     }
 
     func createSparkIcon(color: NSColor) -> NSImage {
@@ -348,6 +343,7 @@ class UsageManager: ObservableObject {
     @Published var hasFetchedData: Bool = false
     @Published var isAccessibilityEnabled: Bool = false
     @Published var shortcutEnabled: Bool = true
+    @Published var showRelativePace: Bool = false
 
     private var statusItem: NSStatusItem?
     private var sessionCookie: String = ""
@@ -409,6 +405,7 @@ class UsageManager: ObservableObject {
         } else {
             shortcutEnabled = UserDefaults.standard.bool(forKey: "shortcut_enabled")
         }
+        showRelativePace = UserDefaults.standard.bool(forKey: "show_relative_pace")
     }
 
     func saveSettings() {
@@ -416,6 +413,7 @@ class UsageManager: ObservableObject {
         UserDefaults.standard.set(statusNotificationsEnabled, forKey: "status_notifications_enabled")
         UserDefaults.standard.set(openAtLogin, forKey: "open_at_login")
         UserDefaults.standard.set(shortcutEnabled, forKey: "shortcut_enabled")
+        UserDefaults.standard.set(showRelativePace, forKey: "show_relative_pace")
         UserDefaults.standard.synchronize()
     }
 
@@ -474,7 +472,7 @@ class UsageManager: ObservableObject {
         UserDefaults.standard.set(0, forKey: "last_notified_threshold")
 
         // Update status bar to show 0%
-        delegate?.updateStatusIcon(percentage: 0)
+        delegate?.updateStatusIcon(colorPercentage: 0, label: " 0%")
 
         NSLog("ClaudeUsage: Cookie cleared, data reset")
     }
@@ -793,13 +791,20 @@ class UsageManager: ObservableObject {
     }
 
     func updateStatusBar() {
-        let sessionPercent = Int((Double(sessionUsage) / Double(sessionLimit)) * 100)
+        let tokenPct = Int((Double(sessionUsage) / Double(sessionLimit)) * 100)
 
-        // Update the icon color
-        delegate?.updateStatusIcon(percentage: sessionPercent)
+        let label: String
+        if showRelativePace, let resetsAt = sessionResetsAt {
+            let remaining = max(0, resetsAt.timeIntervalSinceNow)
+            let elapsed = max(0.0, min(1.0, (5 * 3600 - remaining) / (5 * 3600)))
+            let delta = tokenPct - Int(elapsed * 100)
+            label = delta >= 0 ? " +\(delta)%" : " \(delta)%"
+        } else {
+            label = " \(tokenPct)%"
+        }
 
-        // Check for notification thresholds
-        checkNotificationThresholds(percentage: sessionPercent)
+        delegate?.updateStatusIcon(colorPercentage: tokenPct, label: label)
+        checkNotificationThresholds(percentage: tokenPct)
     }
 
     func checkNotificationThresholds(percentage: Int) {
@@ -1584,9 +1589,25 @@ struct UsageView: View {
                 ProgressView(value: usageManager.sessionPercentage)
                     .tint(colorForPercentage(usageManager.sessionPercentage))
 
-                Text("\(Int(usageManager.sessionPercentage * 100))% used")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
+                let sessionTimeElapsed = timeElapsedPercentage(resetsAt: usageManager.sessionResetsAt, windowDuration: 5 * 3600)
+                if let t = sessionTimeElapsed {
+                    ProgressView(value: t)
+                        .tint(.blue.opacity(0.5))
+                }
+
+                HStack {
+                    Text("\(Int(usageManager.sessionPercentage * 100))% tokens used")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    if let t = sessionTimeElapsed {
+                        Text("·")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Text("\(Int(t * 100))% time elapsed")
+                            .font(.caption)
+                            .foregroundColor(.blue.opacity(0.7))
+                    }
+                }
             }
 
             // Weekly Usage
@@ -1605,9 +1626,25 @@ struct UsageView: View {
                 ProgressView(value: usageManager.weeklyPercentage)
                     .tint(colorForPercentage(usageManager.weeklyPercentage))
 
-                Text("\(Int(usageManager.weeklyPercentage * 100))% used")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
+                let weeklyTimeElapsed = timeElapsedPercentage(resetsAt: usageManager.weeklyResetsAt, windowDuration: 7 * 24 * 3600)
+                if let t = weeklyTimeElapsed {
+                    ProgressView(value: t)
+                        .tint(.blue.opacity(0.5))
+                }
+
+                HStack {
+                    Text("\(Int(usageManager.weeklyPercentage * 100))% tokens used")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    if let t = weeklyTimeElapsed {
+                        Text("·")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Text("\(Int(t * 100))% time elapsed")
+                            .font(.caption)
+                            .foregroundColor(.blue.opacity(0.7))
+                    }
+                }
             }
 
             // Weekly Sonnet Usage (only show if available)
@@ -1627,9 +1664,25 @@ struct UsageView: View {
                     ProgressView(value: usageManager.weeklySonnetPercentage)
                         .tint(colorForPercentage(usageManager.weeklySonnetPercentage))
 
-                    Text("\(Int(usageManager.weeklySonnetPercentage * 100))% used")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
+                    let sonnetTimeElapsed = timeElapsedPercentage(resetsAt: usageManager.weeklySonnetResetsAt, windowDuration: 7 * 24 * 3600)
+                    if let t = sonnetTimeElapsed {
+                        ProgressView(value: t)
+                            .tint(.blue.opacity(0.5))
+                    }
+
+                    HStack {
+                        Text("\(Int(usageManager.weeklySonnetPercentage * 100))% tokens used")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        if let t = sonnetTimeElapsed {
+                            Text("·")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            Text("\(Int(t * 100))% time elapsed")
+                                .font(.caption)
+                                .foregroundColor(.blue.opacity(0.7))
+                        }
+                    }
                 }
             }
 
@@ -2088,6 +2141,27 @@ struct UsageView: View {
 
                     Divider()
 
+                    Toggle(isOn: Binding(
+                        get: { usageManager.showRelativePace },
+                        set: { newValue in
+                            usageManager.showRelativePace = newValue
+                            usageManager.saveSettings()
+                            usageManager.updateStatusBar()
+                        }
+                    )) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Show relative pace in menu bar")
+                                .font(.caption)
+                            Text("Displays token use minus time elapsed (+ahead / −behind pace). Icon color still reflects absolute usage.")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .toggleStyle(.switch)
+
+                    Divider()
+
                     VStack(alignment: .leading, spacing: 6) {
                         Text("Status alerts: services to track")
                             .font(.caption)
@@ -2259,6 +2333,13 @@ struct UsageView: View {
         case "under_maintenance":    return "maintenance"
         default:                     return status
         }
+    }
+
+    func timeElapsedPercentage(resetsAt: Date?, windowDuration: TimeInterval) -> Double? {
+        guard let resetsAt = resetsAt else { return nil }
+        let remaining = resetsAt.timeIntervalSinceNow
+        guard remaining >= 0 else { return 1.0 }
+        return min(max((windowDuration - remaining) / windowDuration, 0), 1)
     }
 
 }
