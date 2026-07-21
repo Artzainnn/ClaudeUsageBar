@@ -209,12 +209,38 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func openPopover() {
         if let button = statusItem.button {
+            // Rebuild the content view on every open. The hosting controller is
+            // otherwise reused, so the SwiftUI view's @State (Settings expanded,
+            // last measured height) persists between opens. Reopening after
+            // Settings was left open then restores that tall height, which is too
+            // big to fit below the menu bar and renders cropped at the top. A
+            // fresh view always starts compact, so the popover only grows
+            // downward and never opens oversized. (Pre-existing upstream bug.)
+            popover.contentViewController = NSHostingController(rootView: UsageView(
+                usageManager: usageManager,
+                statusManager: statusManager,
+                updateManager: updateManager
+            ))
+
             // Force UI refresh by updating percentages
             DispatchQueue.main.async {
                 self.usageManager.updatePercentages()
             }
 
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+
+            // Re-anchor once, shortly after the content has measured its true
+            // height. The popover shows at a provisional size then grows to fit;
+            // because it grows from a fixed bottom edge, when the menu bar icon is
+            // at the top screen edge that growth pushes the top off-screen and it
+            // renders cropped. Re-showing here (from an idle timer, NOT from a
+            // SwiftUI layout callback — that desyncs the window from the content)
+            // lets AppKit reposition it correctly below the icon for the true size.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                guard let self = self, self.popover.isShown,
+                      let b = self.statusItem.button else { return }
+                self.popover.show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
+            }
 
             // Add event monitor to detect clicks outside the popover
             eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
@@ -235,7 +261,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func updateStatusIcon(percentage: Int) {
+    // `percentage` drives the spark icon color (green/yellow/red). `title`, when
+    // provided, overrides the default single-percentage text — used by the
+    // "both" display mode to show session and weekly side by side.
+    func updateStatusIcon(percentage: Int, title: String? = nil) {
         guard let button = statusItem.button else { return }
 
         // Determine color based on percentage
@@ -253,7 +282,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Set image and title
         button.image = sparkIcon
-        button.title = " \(percentage)%"
+        button.title = title ?? " \(percentage)%"
     }
 
     func createSparkIcon(color: NSColor) -> NSImage {
@@ -317,6 +346,22 @@ struct Main {
     }
 }
 
+// What the menu bar text shows. Icon color always follows the higher of the
+// two percentages when both are visible (see updateStatusBar).
+enum MenuBarDisplayMode: String, CaseIterable {
+    case session   // 5-hour session usage only (default, original behavior)
+    case weekly    // 7-day weekly usage only
+    case both      // session first, weekly second
+
+    var label: String {
+        switch self {
+        case .session: return "Session (5-hour)"
+        case .weekly:  return "Weekly (7-day)"
+        case .both:    return "Both (session · weekly)"
+        }
+    }
+}
+
 class UsageManager: ObservableObject {
     @Published var sessionUsage: Int = 0
     @Published var sessionLimit: Int = 100
@@ -348,6 +393,7 @@ class UsageManager: ObservableObject {
     @Published var hasFetchedData: Bool = false
     @Published var isAccessibilityEnabled: Bool = false
     @Published var shortcutEnabled: Bool = true
+    @Published var menuBarDisplayMode: MenuBarDisplayMode = .session
 
     private var statusItem: NSStatusItem?
     private var sessionCookie: String = ""
@@ -409,6 +455,11 @@ class UsageManager: ObservableObject {
         } else {
             shortcutEnabled = UserDefaults.standard.bool(forKey: "shortcut_enabled")
         }
+        // Menu bar display mode — default to session (original behavior)
+        if let stored = UserDefaults.standard.string(forKey: "menu_bar_display_mode"),
+           let mode = MenuBarDisplayMode(rawValue: stored) {
+            menuBarDisplayMode = mode
+        }
     }
 
     func saveSettings() {
@@ -416,6 +467,7 @@ class UsageManager: ObservableObject {
         UserDefaults.standard.set(statusNotificationsEnabled, forKey: "status_notifications_enabled")
         UserDefaults.standard.set(openAtLogin, forKey: "open_at_login")
         UserDefaults.standard.set(shortcutEnabled, forKey: "shortcut_enabled")
+        UserDefaults.standard.set(menuBarDisplayMode.rawValue, forKey: "menu_bar_display_mode")
         UserDefaults.standard.synchronize()
     }
 
@@ -794,11 +846,28 @@ class UsageManager: ObservableObject {
 
     func updateStatusBar() {
         let sessionPercent = Int((Double(sessionUsage) / Double(sessionLimit)) * 100)
+        let weeklyPercent  = Int((Double(weeklyUsage) / Double(weeklyLimit)) * 100)
 
-        // Update the icon color
-        delegate?.updateStatusIcon(percentage: sessionPercent)
+        // Build the menu bar title and choose which percentage drives the icon color.
+        let title: String
+        let colorPercent: Int
+        switch menuBarDisplayMode {
+        case .session:
+            title = " \(sessionPercent)%"
+            colorPercent = sessionPercent
+        case .weekly:
+            title = " \(weeklyPercent)%"
+            colorPercent = weeklyPercent
+        case .both:
+            // Session first, weekly second. Color follows whichever is higher.
+            title = " \(sessionPercent)% · \(weeklyPercent)%"
+            colorPercent = max(sessionPercent, weeklyPercent)
+        }
 
-        // Check for notification thresholds
+        // Update the icon color and text
+        delegate?.updateStatusIcon(percentage: colorPercent, title: title)
+
+        // Notifications remain session-based (unchanged).
         checkNotificationThresholds(percentage: sessionPercent)
     }
 
@@ -1420,6 +1489,28 @@ private struct ContentHeightKey: PreferenceKey {
     }
 }
 
+// Custom progress bar. Replaces the native ProgressView, whose fill desaturates
+// to gray while the popover window isn't key (the popover opens without focus),
+// leaving the usage bars gray until clicked. A plain filled shape keeps its
+// color regardless of window focus.
+struct UsageBar: View {
+    let value: Double   // 0.0 ... 1.0
+    let color: Color
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Color.white.opacity(0.14))
+                Capsule()
+                    .fill(color)
+                    .frame(width: max(0, min(1, value)) * geo.size.width)
+            }
+        }
+        .frame(height: 6)
+    }
+}
+
 struct UsageView: View {
     @ObservedObject var usageManager: UsageManager
     @ObservedObject var statusManager: StatusManager
@@ -1581,8 +1672,8 @@ struct UsageView: View {
                     }
                 }
 
-                ProgressView(value: usageManager.sessionPercentage)
-                    .tint(colorForPercentage(usageManager.sessionPercentage))
+                UsageBar(value: usageManager.sessionPercentage,
+                         color: colorForPercentage(usageManager.sessionPercentage))
 
                 Text("\(Int(usageManager.sessionPercentage * 100))% used")
                     .font(.caption)
@@ -1602,8 +1693,8 @@ struct UsageView: View {
                     }
                 }
 
-                ProgressView(value: usageManager.weeklyPercentage)
-                    .tint(colorForPercentage(usageManager.weeklyPercentage))
+                UsageBar(value: usageManager.weeklyPercentage,
+                         color: colorForPercentage(usageManager.weeklyPercentage))
 
                 Text("\(Int(usageManager.weeklyPercentage * 100))% used")
                     .font(.caption)
@@ -1624,8 +1715,8 @@ struct UsageView: View {
                         }
                     }
 
-                    ProgressView(value: usageManager.weeklySonnetPercentage)
-                        .tint(colorForPercentage(usageManager.weeklySonnetPercentage))
+                    UsageBar(value: usageManager.weeklySonnetPercentage,
+                             color: colorForPercentage(usageManager.weeklySonnetPercentage))
 
                     Text("\(Int(usageManager.weeklySonnetPercentage * 100))% used")
                         .font(.caption)
@@ -1648,8 +1739,8 @@ struct UsageView: View {
                         }
                     }
 
-                    ProgressView(value: usageManager.weeklyFablePercentage)
-                        .tint(colorForPercentage(usageManager.weeklyFablePercentage))
+                    UsageBar(value: usageManager.weeklyFablePercentage,
+                             color: colorForPercentage(usageManager.weeklyFablePercentage))
 
                     Text("\(Int(usageManager.weeklyFablePercentage * 100))% used")
                         .font(.caption)
@@ -1698,8 +1789,7 @@ struct UsageView: View {
                     // Spend vs monthly limit — only when there's actual spend.
                     if usageManager.hasCreditUsage {
                         if limitMinor > 0 {
-                            ProgressView(value: min(pct, 1.0))
-                                .tint(colorForPercentage(pct))
+                            UsageBar(value: min(pct, 1.0), color: colorForPercentage(pct))
                         }
                         HStack {
                             Text(limitMinor > 0
@@ -1986,6 +2076,31 @@ struct UsageView: View {
 
             if showingSettings {
                 VStack(alignment: .leading, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Menu Bar Display")
+                            .font(.caption)
+                        Picker("", selection: Binding(
+                            get: { usageManager.menuBarDisplayMode },
+                            set: { newValue in
+                                usageManager.menuBarDisplayMode = newValue
+                                usageManager.saveSettings()
+                                // Re-render the menu bar text/color immediately.
+                                usageManager.updateStatusBar()
+                            }
+                        )) {
+                            ForEach(MenuBarDisplayMode.allCases, id: \.self) { mode in
+                                Text(mode.label).tag(mode)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+                        .font(.caption)
+                        Text("Choose what the menu bar shows. In Both mode the\nicon color follows whichever usage is higher.")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
                     Toggle(isOn: Binding(
                         get: { usageManager.openAtLogin },
                         set: { newValue in
