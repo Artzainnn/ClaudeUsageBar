@@ -44,8 +44,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Create popover
         popover = NSPopover()
-        // Initial guess; SwiftUI's intrinsic size (capped at 600) will drive the actual size.
-        popover.contentSize = NSSize(width: 360, height: 320)
+        popover.contentSize = NSSize(width: 360, height: activeScreenPopupHeightLimit())
         popover.behavior = .transient
         popover.contentViewController = NSHostingController(rootView: UsageView(
             usageManager: usageManager,
@@ -62,6 +61,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { _ in
             self.usageManager.fetchUsage()
             self.statusManager.fetch()
+        }
+
+        // Keep the status-bar countdown current without making extra API requests.
+        Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in
+            self.usageManager.refreshStatusDisplay()
         }
 
         // App updates are infrequent (new release at most weekly) — poll every 3 hours.
@@ -209,6 +213,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func openPopover() {
         if let button = statusItem.button {
+            // Size the viewport for the screen containing the status item before
+            // anchoring it, so the popover never grows beyond the visible area.
+            popover.contentSize = NSSize(width: 360, height: activeScreenPopupHeightLimit())
+
             // Force UI refresh by updating percentages
             DispatchQueue.main.async {
                 self.usageManager.updatePercentages()
@@ -235,7 +243,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func updateStatusIcon(percentage: Int) {
+    func updateStatusIcon(percentage: Int, resetDate: Date? = nil, now: Date = Date()) {
         guard let button = statusItem.button else { return }
 
         // Determine color based on percentage
@@ -253,7 +261,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Set image and title
         button.image = sparkIcon
-        button.title = " \(percentage)%"
+        if let resetDate {
+            button.title = " \(percentage)% · \(UsagePace.compactRemainingText(until: resetDate, now: now))"
+        } else {
+            button.title = " \(percentage)%"
+        }
     }
 
     func createSparkIcon(color: NSColor) -> NSImage {
@@ -795,11 +807,19 @@ class UsageManager: ObservableObject {
     func updateStatusBar() {
         let sessionPercent = Int((Double(sessionUsage) / Double(sessionLimit)) * 100)
 
-        // Update the icon color
-        delegate?.updateStatusIcon(percentage: sessionPercent)
+        refreshStatusDisplay()
 
         // Check for notification thresholds
         checkNotificationThresholds(percentage: sessionPercent)
+    }
+
+    func refreshStatusDisplay(now: Date = Date()) {
+        let sessionPercent = Int((Double(sessionUsage) / Double(sessionLimit)) * 100)
+        delegate?.updateStatusIcon(
+            percentage: sessionPercent,
+            resetDate: sessionResetsAt,
+            now: now
+        )
     }
 
     func checkNotificationThresholds(percentage: Int) {
@@ -1413,10 +1433,122 @@ struct PasteableTextField: NSViewRepresentable {
     }
 }
 
-private struct ContentHeightKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
+private func activeScreenPopupHeightLimit() -> CGFloat {
+    let pointer = NSEvent.mouseLocation
+    let screen = NSScreen.screens.first { NSMouseInRect(pointer, $0.frame, false) } ?? NSScreen.main
+    let visibleHeight = screen?.visibleFrame.height ?? 600
+    return min(520, max(260, visibleHeight - 32))
+}
+
+private struct UsagePaceBar: View {
+    let usageFraction: Double
+    let elapsedFraction: Double
+    let usageColor: Color
+
+    var body: some View {
+        GeometryReader { geometry in
+            let width = geometry.size.width
+            let clampedUsage = min(max(usageFraction, 0), 1)
+            let clampedElapsed = min(max(elapsedFraction, 0), 1)
+            let markerOffset = min(max((width * clampedElapsed) - 1, 0), max(width - 2, 0))
+
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Color.secondary.opacity(0.22))
+                Capsule()
+                    .fill(usageColor)
+                    .frame(width: width * clampedUsage)
+                Rectangle()
+                    .fill(Color.white.opacity(0.95))
+                    .frame(width: 2, height: 10)
+                    .offset(x: markerOffset)
+            }
+        }
+        .frame(height: 8)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(
+            "Usage \(Int((usageFraction * 100).rounded())) percent, " +
+            "time marker \(Int((elapsedFraction * 100).rounded())) percent"
+        )
+    }
+}
+
+private struct UsageLimitRow: View {
+    let title: String
+    let usageFraction: Double
+    let resetDate: Date?
+    let window: TimeInterval
+
+    private var usageColor: Color {
+        if usageFraction < 0.7 { return .green }
+        if usageFraction < 0.9 { return .orange }
+        return .red
+    }
+
+    private func paceLabel(_ status: UsagePaceStatus) -> String {
+        switch status {
+        case .underPace: return "Under pace"
+        case .onPace: return "On pace"
+        case .overPace: return "Over pace"
+        }
+    }
+
+    private func paceColor(_ status: UsagePaceStatus) -> Color {
+        switch status {
+        case .underPace: return .green
+        case .onPace: return .blue
+        case .overPace: return .orange
+        }
+    }
+
+    var body: some View {
+        TimelineView(.periodic(from: Date(), by: 60)) { context in
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text(title)
+                        .font(.subheadline)
+                    Spacer()
+                    if let resetDate {
+                        Text(UsagePace.remainingText(until: resetDate, now: context.date))
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+
+                if let resetDate {
+                    let elapsedFraction = UsagePace.elapsedFraction(
+                        until: resetDate,
+                        window: window,
+                        now: context.date
+                    )
+                    let status = UsagePace.status(
+                        usageFraction: usageFraction,
+                        elapsedFraction: elapsedFraction
+                    )
+
+                    UsagePaceBar(
+                        usageFraction: usageFraction,
+                        elapsedFraction: elapsedFraction,
+                        usageColor: usageColor
+                    )
+
+                    HStack {
+                        Text("\(Int((usageFraction * 100).rounded()))% used")
+                        Spacer()
+                        Text("Time \(Int((elapsedFraction * 100).rounded()))% · \(paceLabel(status))")
+                            .foregroundColor(paceColor(status))
+                    }
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                } else {
+                    ProgressView(value: usageFraction)
+                        .tint(usageColor)
+                    Text("\(Int((usageFraction * 100).rounded()))% used")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+        }
     }
 }
 
@@ -1428,40 +1560,37 @@ struct UsageView: View {
     @State private var showingCookieInput: Bool = false
     @State private var showingSettings: Bool = false
     @State private var showingStatusDetails: Bool = false
-    @State private var measuredHeight: CGFloat = 250
-
-    private let maxPopupHeight: CGFloat = 600
 
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 content
                     .padding()
-                    .background(
-                        GeometryReader { geo in
-                            Color.clear.preference(key: ContentHeightKey.self, value: geo.size.height)
-                        }
-                    )
             }
-            .frame(width: 360, height: min(max(measuredHeight, 100), maxPopupHeight))
+            .frame(width: 360, height: activeScreenPopupHeightLimit())
             // Darken the translucent popover material so contrast stays consistent
             // no matter how light the content behind the popover is.
             .background(Color(red: 0.07, green: 0.07, blue: 0.08).opacity(0.62))
-            .onPreferenceChange(ContentHeightKey.self) { value in
-                guard value > 0 else { return }
-                measuredHeight = value
-            }
             .onAppear {
                 if let savedCookie = UserDefaults.standard.string(forKey: "claude_session_cookie") {
                     sessionCookieInput = String(savedCookie.prefix(20)) + "..."
                 }
                 usageManager.updatePercentages()
+                DispatchQueue.main.async {
+                    proxy.scrollTo("usage-top", anchor: .top)
+                }
             }
             .onChange(of: showingSettings) { isOpen in
                 if isOpen {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                         withAnimation(.easeInOut(duration: 0.35)) {
                             proxy.scrollTo("settings-anchor", anchor: .bottom)
+                        }
+                    }
+                } else {
+                    DispatchQueue.main.async {
+                        withAnimation(.easeInOut(duration: 0.25)) {
+                            proxy.scrollTo("usage-top", anchor: .top)
                         }
                     }
                 }
@@ -1474,6 +1603,7 @@ struct UsageView: View {
             Text("Claude Usage")
                 .font(.headline)
                 .padding(.bottom, 4)
+                .id("usage-top")
 
             // Free-form message banner (author-controlled). Takes priority over
             // the version-update banner when both are present.
@@ -1569,92 +1699,40 @@ struct UsageView: View {
 
             // Session Usage
             if usageManager.hasFetchedData {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text("Session (5 hour)")
-                        .font(.subheadline)
-                    Spacer()
-                    if let resetTime = usageManager.sessionResetsAt {
-                        Text("Resets \(formatResetTime(resetTime))")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                }
-
-                ProgressView(value: usageManager.sessionPercentage)
-                    .tint(colorForPercentage(usageManager.sessionPercentage))
-
-                Text("\(Int(usageManager.sessionPercentage * 100))% used")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
+            UsageLimitRow(
+                title: "Session (5 hour)",
+                usageFraction: usageManager.sessionPercentage,
+                resetDate: usageManager.sessionResetsAt,
+                window: 5 * 60 * 60
+            )
 
             // Weekly Usage
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text("Weekly (7 day)")
-                        .font(.subheadline)
-                    Spacer()
-                    if let resetTime = usageManager.weeklyResetsAt {
-                        Text("Resets \(formatResetTime(resetTime, includeDate: true))")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                }
-
-                ProgressView(value: usageManager.weeklyPercentage)
-                    .tint(colorForPercentage(usageManager.weeklyPercentage))
-
-                Text("\(Int(usageManager.weeklyPercentage * 100))% used")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
+            UsageLimitRow(
+                title: "Weekly (7 day)",
+                usageFraction: usageManager.weeklyPercentage,
+                resetDate: usageManager.weeklyResetsAt,
+                window: 7 * 24 * 60 * 60
+            )
 
             // Weekly Sonnet Usage (only show if available)
             if usageManager.hasWeeklySonnet && usageManager.hasFetchedData {
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text("Weekly Sonnet (7 day)")
-                            .font(.subheadline)
-                        Spacer()
-                        if let resetTime = usageManager.weeklySonnetResetsAt {
-                            Text("Resets \(formatResetTime(resetTime, includeDate: true))")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                    }
-
-                    ProgressView(value: usageManager.weeklySonnetPercentage)
-                        .tint(colorForPercentage(usageManager.weeklySonnetPercentage))
-
-                    Text("\(Int(usageManager.weeklySonnetPercentage * 100))% used")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
+                UsageLimitRow(
+                    title: "Weekly Sonnet (7 day)",
+                    usageFraction: usageManager.weeklySonnetPercentage,
+                    resetDate: usageManager.weeklySonnetResetsAt,
+                    window: 7 * 24 * 60 * 60
+                )
             }
 
             // Weekly Fable Usage — only surfaced once usage is above 1%
             // (new model, counted separately; hidden while idle to avoid clutter).
             if usageManager.hasWeeklyFable && usageManager.hasFetchedData && usageManager.weeklyFableUsage >= 1 {
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text("Weekly Fable (7 day)")
-                            .font(.subheadline)
-                        Spacer()
-                        if let resetTime = usageManager.weeklyFableResetsAt {
-                            Text("Resets \(formatResetTime(resetTime, includeDate: true))")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                    }
-
-                    ProgressView(value: usageManager.weeklyFablePercentage)
-                        .tint(colorForPercentage(usageManager.weeklyFablePercentage))
-
-                    Text("\(Int(usageManager.weeklyFablePercentage * 100))% used")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
+                UsageLimitRow(
+                    title: "Weekly Fable (7 day)",
+                    usageFraction: usageManager.weeklyFablePercentage,
+                    resetDate: usageManager.weeklyFableResetsAt,
+                    window: 7 * 24 * 60 * 60
+                )
             }
 
             // Usage credits (pay-as-you-go). Only shown once credits are actually
@@ -2131,20 +2209,6 @@ struct UsageView: View {
         let formatter = DateFormatter()
         formatter.timeStyle = .short
         return formatter.string(from: date)
-    }
-
-    func formatResetTime(_ date: Date, includeDate: Bool = false) -> String {
-        let formatter = DateFormatter()
-
-        if includeDate {
-            // Format: "on 31 Jan 2026 at 7:59 AM"
-            formatter.dateFormat = "d MMM yyyy 'at' h:mm a"
-            return "on \(formatter.string(from: date))"
-        } else {
-            formatter.timeStyle = .short
-            formatter.dateStyle = .none
-            return "at \(formatter.string(from: date))"
-        }
     }
 
     func colorForPercentage(_ percentage: Double) -> Color {
