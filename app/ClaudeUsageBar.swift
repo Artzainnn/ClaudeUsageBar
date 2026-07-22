@@ -1420,6 +1420,118 @@ private struct ContentHeightKey: PreferenceKey {
     }
 }
 
+private struct UsagePaceBar: View {
+    let usageFraction: Double
+    let elapsedFraction: Double
+    let usageColor: Color
+
+    var body: some View {
+        GeometryReader { geometry in
+            let width = geometry.size.width
+            let clampedUsage = min(max(usageFraction, 0), 1)
+            let clampedElapsed = min(max(elapsedFraction, 0), 1)
+            let markerOffset = min(max((width * clampedElapsed) - 1, 0), max(width - 2, 0))
+
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Color.secondary.opacity(0.22))
+                Capsule()
+                    .fill(usageColor)
+                    .frame(width: width * clampedUsage)
+                Rectangle()
+                    .fill(Color.white.opacity(0.95))
+                    .frame(width: 2, height: 10)
+                    .offset(x: markerOffset)
+            }
+        }
+        .frame(height: 8)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(
+            "Usage \(Int((usageFraction * 100).rounded())) percent, " +
+            "time marker \(Int((elapsedFraction * 100).rounded())) percent"
+        )
+    }
+}
+
+private struct UsageLimitRow: View {
+    let title: String
+    let usageFraction: Double
+    let resetDate: Date?
+    let window: TimeInterval
+
+    private var usageColor: Color {
+        if usageFraction < 0.7 { return .green }
+        if usageFraction < 0.9 { return .orange }
+        return .red
+    }
+
+    private func paceLabel(_ status: UsagePaceStatus) -> String {
+        switch status {
+        case .underPace: return "Under pace"
+        case .onPace: return "On pace"
+        case .overPace: return "Over pace"
+        }
+    }
+
+    private func paceColor(_ status: UsagePaceStatus) -> Color {
+        switch status {
+        case .underPace: return .green
+        case .onPace: return .blue
+        case .overPace: return .orange
+        }
+    }
+
+    var body: some View {
+        TimelineView(.periodic(from: Date(), by: 60)) { context in
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text(title)
+                        .font(.subheadline)
+                    Spacer()
+                    if let resetDate {
+                        Text(UsagePace.remainingText(until: resetDate, now: context.date))
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+
+                if let resetDate {
+                    let elapsedFraction = UsagePace.elapsedFraction(
+                        until: resetDate,
+                        window: window,
+                        now: context.date
+                    )
+                    let status = UsagePace.status(
+                        usageFraction: usageFraction,
+                        elapsedFraction: elapsedFraction
+                    )
+
+                    UsagePaceBar(
+                        usageFraction: usageFraction,
+                        elapsedFraction: elapsedFraction,
+                        usageColor: usageColor
+                    )
+
+                    HStack {
+                        Text("\(Int((usageFraction * 100).rounded()))% used")
+                        Spacer()
+                        Text("Time \(Int((elapsedFraction * 100).rounded()))% · \(paceLabel(status))")
+                            .foregroundColor(paceColor(status))
+                    }
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                } else {
+                    ProgressView(value: usageFraction)
+                        .tint(usageColor)
+                    Text("\(Int((usageFraction * 100).rounded()))% used")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+        }
+    }
+}
+
 struct UsageView: View {
     @ObservedObject var usageManager: UsageManager
     @ObservedObject var statusManager: StatusManager
@@ -1569,92 +1681,40 @@ struct UsageView: View {
 
             // Session Usage
             if usageManager.hasFetchedData {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text("Session (5 hour)")
-                        .font(.subheadline)
-                    Spacer()
-                    if let resetTime = usageManager.sessionResetsAt {
-                        Text("Resets \(formatResetTime(resetTime))")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                }
-
-                ProgressView(value: usageManager.sessionPercentage)
-                    .tint(colorForPercentage(usageManager.sessionPercentage))
-
-                Text("\(Int(usageManager.sessionPercentage * 100))% used")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
+            UsageLimitRow(
+                title: "Session (5 hour)",
+                usageFraction: usageManager.sessionPercentage,
+                resetDate: usageManager.sessionResetsAt,
+                window: 5 * 60 * 60
+            )
 
             // Weekly Usage
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text("Weekly (7 day)")
-                        .font(.subheadline)
-                    Spacer()
-                    if let resetTime = usageManager.weeklyResetsAt {
-                        Text("Resets \(formatResetTime(resetTime, includeDate: true))")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                }
-
-                ProgressView(value: usageManager.weeklyPercentage)
-                    .tint(colorForPercentage(usageManager.weeklyPercentage))
-
-                Text("\(Int(usageManager.weeklyPercentage * 100))% used")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
+            UsageLimitRow(
+                title: "Weekly (7 day)",
+                usageFraction: usageManager.weeklyPercentage,
+                resetDate: usageManager.weeklyResetsAt,
+                window: 7 * 24 * 60 * 60
+            )
 
             // Weekly Sonnet Usage (only show if available)
             if usageManager.hasWeeklySonnet && usageManager.hasFetchedData {
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text("Weekly Sonnet (7 day)")
-                            .font(.subheadline)
-                        Spacer()
-                        if let resetTime = usageManager.weeklySonnetResetsAt {
-                            Text("Resets \(formatResetTime(resetTime, includeDate: true))")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                    }
-
-                    ProgressView(value: usageManager.weeklySonnetPercentage)
-                        .tint(colorForPercentage(usageManager.weeklySonnetPercentage))
-
-                    Text("\(Int(usageManager.weeklySonnetPercentage * 100))% used")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
+                UsageLimitRow(
+                    title: "Weekly Sonnet (7 day)",
+                    usageFraction: usageManager.weeklySonnetPercentage,
+                    resetDate: usageManager.weeklySonnetResetsAt,
+                    window: 7 * 24 * 60 * 60
+                )
             }
 
             // Weekly Fable Usage — only surfaced once usage is above 1%
             // (new model, counted separately; hidden while idle to avoid clutter).
             if usageManager.hasWeeklyFable && usageManager.hasFetchedData && usageManager.weeklyFableUsage >= 1 {
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text("Weekly Fable (7 day)")
-                            .font(.subheadline)
-                        Spacer()
-                        if let resetTime = usageManager.weeklyFableResetsAt {
-                            Text("Resets \(formatResetTime(resetTime, includeDate: true))")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                    }
-
-                    ProgressView(value: usageManager.weeklyFablePercentage)
-                        .tint(colorForPercentage(usageManager.weeklyFablePercentage))
-
-                    Text("\(Int(usageManager.weeklyFablePercentage * 100))% used")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
+                UsageLimitRow(
+                    title: "Weekly Fable (7 day)",
+                    usageFraction: usageManager.weeklyFablePercentage,
+                    resetDate: usageManager.weeklyFableResetsAt,
+                    window: 7 * 24 * 60 * 60
+                )
             }
 
             // Usage credits (pay-as-you-go). Only shown once credits are actually
@@ -2131,20 +2191,6 @@ struct UsageView: View {
         let formatter = DateFormatter()
         formatter.timeStyle = .short
         return formatter.string(from: date)
-    }
-
-    func formatResetTime(_ date: Date, includeDate: Bool = false) -> String {
-        let formatter = DateFormatter()
-
-        if includeDate {
-            // Format: "on 31 Jan 2026 at 7:59 AM"
-            formatter.dateFormat = "d MMM yyyy 'at' h:mm a"
-            return "on \(formatter.string(from: date))"
-        } else {
-            formatter.timeStyle = .short
-            formatter.dateStyle = .none
-            return "at \(formatter.string(from: date))"
-        }
     }
 
     func colorForPercentage(_ percentage: Double) -> Color {
