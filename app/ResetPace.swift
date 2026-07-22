@@ -20,6 +20,14 @@ enum UsagePace {
         return "\(hours)h \(minutes)m remaining"
     }
 
+    static func compactRemainingText(until resetDate: Date, now: Date = Date()) -> String {
+        guard resetDate > now else { return "now" }
+        let totalMinutes = max(1, Int(ceil(resetDate.timeIntervalSince(now) / 60)))
+        let hours = totalMinutes / 60
+        let minutes = totalMinutes % 60
+        return "\(hours)h\(minutes)m"
+    }
+
     static func elapsedFraction(
         until resetDate: Date,
         window: TimeInterval,

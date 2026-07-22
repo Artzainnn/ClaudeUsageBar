@@ -19,6 +19,12 @@ struct ResetPaceTests {
             "session countdown includes hours and minutes"
         )
 
+        expectEqual(
+            UsagePace.compactRemainingText(until: reset, now: now),
+            "3h12m",
+            "menu bar countdown stays compact"
+        )
+
         let weeklyReset = now.addingTimeInterval((2 * 24 * 60 * 60) + (4 * 60 * 60))
         expectEqual(
             UsagePace.remainingText(until: weeklyReset, now: now),

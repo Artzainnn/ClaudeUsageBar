@@ -44,8 +44,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Create popover
         popover = NSPopover()
-        // Initial guess; SwiftUI's intrinsic size (capped at 600) will drive the actual size.
-        popover.contentSize = NSSize(width: 360, height: 320)
+        popover.contentSize = NSSize(width: 360, height: activeScreenPopupHeightLimit())
         popover.behavior = .transient
         popover.contentViewController = NSHostingController(rootView: UsageView(
             usageManager: usageManager,
@@ -62,6 +61,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { _ in
             self.usageManager.fetchUsage()
             self.statusManager.fetch()
+        }
+
+        // Keep the status-bar countdown current without making extra API requests.
+        Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in
+            self.usageManager.refreshStatusDisplay()
         }
 
         // App updates are infrequent (new release at most weekly) — poll every 3 hours.
@@ -209,6 +213,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func openPopover() {
         if let button = statusItem.button {
+            // Size the viewport for the screen containing the status item before
+            // anchoring it, so the popover never grows beyond the visible area.
+            popover.contentSize = NSSize(width: 360, height: activeScreenPopupHeightLimit())
+
             // Force UI refresh by updating percentages
             DispatchQueue.main.async {
                 self.usageManager.updatePercentages()
@@ -235,7 +243,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func updateStatusIcon(percentage: Int) {
+    func updateStatusIcon(percentage: Int, resetDate: Date? = nil, now: Date = Date()) {
         guard let button = statusItem.button else { return }
 
         // Determine color based on percentage
@@ -253,7 +261,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Set image and title
         button.image = sparkIcon
-        button.title = " \(percentage)%"
+        if let resetDate {
+            button.title = " \(percentage)% · \(UsagePace.compactRemainingText(until: resetDate, now: now))"
+        } else {
+            button.title = " \(percentage)%"
+        }
     }
 
     func createSparkIcon(color: NSColor) -> NSImage {
@@ -795,11 +807,19 @@ class UsageManager: ObservableObject {
     func updateStatusBar() {
         let sessionPercent = Int((Double(sessionUsage) / Double(sessionLimit)) * 100)
 
-        // Update the icon color
-        delegate?.updateStatusIcon(percentage: sessionPercent)
+        refreshStatusDisplay()
 
         // Check for notification thresholds
         checkNotificationThresholds(percentage: sessionPercent)
+    }
+
+    func refreshStatusDisplay(now: Date = Date()) {
+        let sessionPercent = Int((Double(sessionUsage) / Double(sessionLimit)) * 100)
+        delegate?.updateStatusIcon(
+            percentage: sessionPercent,
+            resetDate: sessionResetsAt,
+            now: now
+        )
     }
 
     func checkNotificationThresholds(percentage: Int) {
@@ -1413,11 +1433,11 @@ struct PasteableTextField: NSViewRepresentable {
     }
 }
 
-private struct ContentHeightKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
-    }
+private func activeScreenPopupHeightLimit() -> CGFloat {
+    let pointer = NSEvent.mouseLocation
+    let screen = NSScreen.screens.first { NSMouseInRect(pointer, $0.frame, false) } ?? NSScreen.main
+    let visibleHeight = screen?.visibleFrame.height ?? 600
+    return min(520, max(260, visibleHeight - 32))
 }
 
 private struct UsagePaceBar: View {
@@ -1540,40 +1560,37 @@ struct UsageView: View {
     @State private var showingCookieInput: Bool = false
     @State private var showingSettings: Bool = false
     @State private var showingStatusDetails: Bool = false
-    @State private var measuredHeight: CGFloat = 250
-
-    private let maxPopupHeight: CGFloat = 600
 
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 content
                     .padding()
-                    .background(
-                        GeometryReader { geo in
-                            Color.clear.preference(key: ContentHeightKey.self, value: geo.size.height)
-                        }
-                    )
             }
-            .frame(width: 360, height: min(max(measuredHeight, 100), maxPopupHeight))
+            .frame(width: 360, height: activeScreenPopupHeightLimit())
             // Darken the translucent popover material so contrast stays consistent
             // no matter how light the content behind the popover is.
             .background(Color(red: 0.07, green: 0.07, blue: 0.08).opacity(0.62))
-            .onPreferenceChange(ContentHeightKey.self) { value in
-                guard value > 0 else { return }
-                measuredHeight = value
-            }
             .onAppear {
                 if let savedCookie = UserDefaults.standard.string(forKey: "claude_session_cookie") {
                     sessionCookieInput = String(savedCookie.prefix(20)) + "..."
                 }
                 usageManager.updatePercentages()
+                DispatchQueue.main.async {
+                    proxy.scrollTo("usage-top", anchor: .top)
+                }
             }
             .onChange(of: showingSettings) { isOpen in
                 if isOpen {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                         withAnimation(.easeInOut(duration: 0.35)) {
                             proxy.scrollTo("settings-anchor", anchor: .bottom)
+                        }
+                    }
+                } else {
+                    DispatchQueue.main.async {
+                        withAnimation(.easeInOut(duration: 0.25)) {
+                            proxy.scrollTo("usage-top", anchor: .top)
                         }
                     }
                 }
@@ -1586,6 +1603,7 @@ struct UsageView: View {
             Text("Claude Usage")
                 .font(.headline)
                 .padding(.bottom, 4)
+                .id("usage-top")
 
             // Free-form message banner (author-controlled). Takes priority over
             // the version-update banner when both are present.

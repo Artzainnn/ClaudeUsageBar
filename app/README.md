@@ -7,7 +7,7 @@ A lightweight macOS menu bar app that displays your Claude.ai session and weekly
 ## ✨ Features
 
 - 🟢 **Real-time Usage Tracking**: Monitor session (5-hour) and weekly (7-day) usage
-- ⏱️ **Live Reset Pacing**: See time remaining and whether usage is under, on, or over pace
+- ⏱️ **Live Reset Pacing**: See time remaining in the popup and menu bar, plus whether usage is under, on, or over pace
 - 🎨 **Color-Coded Menu Bar Icon**: Visual indication of usage levels (green/yellow/red)
 - 🔔 **Smart Notifications**: Alerts at 25%, 50%, 75%, and 90% usage thresholds
 - ⚡ **Auto-Refresh**: Updates every 5 minutes automatically
