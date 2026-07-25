@@ -15,9 +15,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var hotKeyRef: EventHotKeyRef?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // The UI is designed for dark; force dark appearance regardless of the
-        // system light/dark setting (light mode had poor contrast).
-        NSApp.appearance = NSAppearance(named: .darkAqua)
+        // Follow the system light/dark setting. Contrast is kept consistent by the
+        // opaque, appearance-adaptive popover background (see UsageView.body),
+        // so there's no need to force a single appearance on every user.
 
         // NSUserNotification (deprecated but works without permissions for unsigned apps)
         NSLog("✅ App launched, notifications ready")
@@ -1444,9 +1444,10 @@ struct UsageView: View {
                     )
             }
             .frame(width: 360, height: min(max(measuredHeight, 100), maxPopupHeight))
-            // Darken the translucent popover material so contrast stays consistent
-            // no matter how light the content behind the popover is.
-            .background(Color(red: 0.07, green: 0.07, blue: 0.08).opacity(0.62))
+            // Opaque, appearance-adaptive backdrop so text contrast stays consistent
+            // no matter how light the content behind the popover is — and so the
+            // popover matches the user's light/dark system setting.
+            .background(Color(nsColor: .windowBackgroundColor))
             .onPreferenceChange(ContentHeightKey.self) { value in
                 guard value > 0 else { return }
                 measuredHeight = value
