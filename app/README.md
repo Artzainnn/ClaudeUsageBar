@@ -7,6 +7,7 @@ A lightweight macOS menu bar app that displays your Claude.ai session and weekly
 ## ✨ Features
 
 - 🟢 **Real-time Usage Tracking**: Monitor session (5-hour) and weekly (7-day) usage
+- ⏱️ **Live Reset Pacing**: See time remaining in the popup and menu bar, plus whether usage is under, on, or over pace
 - 🎨 **Color-Coded Menu Bar Icon**: Visual indication of usage levels (green/yellow/red)
 - 🔔 **Smart Notifications**: Alerts at 25%, 50%, 75%, and 90% usage thresholds
 - ⚡ **Auto-Refresh**: Updates every 5 minutes automatically
@@ -22,8 +23,8 @@ A lightweight macOS menu bar app that displays your Claude.ai session and weekly
 - Example: `🟢 45%` (green < 70%, yellow 70-90%, red > 90%)
 
 **Popup Interface:**
-- Session (5-hour) usage with progress bar and reset time
-- Weekly (7-day) usage with progress bar and reset date
+- Session (5-hour) usage with a live countdown and elapsed-time marker
+- Weekly (7-day) usage with a live countdown and elapsed-time marker
 - Weekly Sonnet usage (Pro plan only)
 - Settings for notifications and keyboard shortcuts
 
@@ -118,6 +119,12 @@ Access settings by clicking the gear icon in the popup:
 ### Build the App
 ```bash
 ./build.sh
+```
+
+### Run Pace Logic Tests
+```bash
+swiftc -parse-as-library ResetPace.swift ResetPaceTests.swift -o /tmp/claudeusagebar-reset-pace-tests
+/tmp/claudeusagebar-reset-pace-tests
 ```
 
 ### Create DMG Installer
