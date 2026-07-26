@@ -4,6 +4,35 @@ import WebKit
 import Carbon
 import ServiceManagement
 
+// Secondary text: system gray in dark; darker in light, where the vibrant
+// ~50% gray over the white popover backing reads as washed out.
+extension Color {
+    static let secondaryText = Color(nsColor: NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? .secondaryLabelColor
+            : NSColor(white: 0.24, alpha: 1.0) // opaque: vibrancy washes out alpha grays
+    })
+}
+
+// Deterministic usage bar: the native linear ProgressView ignores .tint() in
+// light (aqua) and vibrant rendering and falls back to accent blue.
+struct UsageBar: View {
+    let value: Double
+    let color: Color
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.primary.opacity(0.12))
+                Capsule()
+                    .fill(color)
+                    .frame(width: max(0, min(1, value)) * geo.size.width)
+            }
+        }
+        .frame(height: 6)
+    }
+}
+
 // Main entry point
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
@@ -15,10 +44,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var hotKeyRef: EventHotKeyRef?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // The UI is designed for dark; force dark appearance regardless of the
-        // system light/dark setting (light mode had poor contrast).
-        NSApp.appearance = NSAppearance(named: .darkAqua)
-
         // NSUserNotification (deprecated but works without permissions for unsigned apps)
         NSLog("✅ App launched, notifications ready")
 
@@ -53,6 +78,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             updateManager: updateManager
         ))
 
+        // Appearance preference: "system" (default) tracks the macOS light/dark
+        // setting; "dark"/"light" force one (dark was hard-forced in v1.3.2 and
+        // users complained about losing light mode). Applied after the popover
+        // exists so both NSApp and the popover get styled.
+        applyAppearancePreference()
+
+        // Re-apply when macOS flips light/dark, so a forced mode that matches
+        // the system switches back to the native (inherited) rendering.
+        DistributedNotificationCenter.default.addObserver(
+            forName: NSNotification.Name("AppleInterfaceThemeChangedNotification"),
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            // The defaults key can lag the notification; re-resolve a tick later.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                self?.applyAppearancePreference()
+            }
+        }
+
         // Fetch initial data
         usageManager.fetchUsage()
         statusManager.fetch()
@@ -71,6 +114,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Set up Cmd+U keyboard shortcut
         setupKeyboardShortcut()
+    }
+
+    func applyAppearancePreference() {
+        let mode = UserDefaults.standard.string(forKey: "appearance_mode") ?? "system"
+        let systemIsDark = UserDefaults.standard.string(forKey: "AppleInterfaceStyle") == "Dark"
+        let isDark: Bool
+        switch mode {
+        case "dark":  isDark = true
+        case "light": isDark = false
+        default:      isDark = systemIsDark
+        }
+        // Always set an explicit, resolved appearance ("System" resolves to the
+        // current macOS setting) so every mode uses the same rendering path:
+        // inherited "vibrant" rendering drops ProgressView tints (bars turn
+        // accent-blue) and shades colors slightly differently, which made
+        // System and Dark look different. Set on the popover too — it doesn't
+        // reliably restyle from NSApp.appearance alone once created.
+        let appearance = NSAppearance(named: isDark ? .darkAqua : .aqua)
+        NSApp.appearance = appearance
+        popover?.appearance = appearance
     }
 
     func setupKeyboardShortcut() {
@@ -1429,6 +1492,8 @@ struct UsageView: View {
     @State private var showingSettings: Bool = false
     @State private var showingStatusDetails: Bool = false
     @State private var measuredHeight: CGFloat = 250
+    @Environment(\.colorScheme) private var colorScheme
+    @AppStorage("appearance_mode") private var appearanceMode: String = "system"
 
     private let maxPopupHeight: CGFloat = 600
 
@@ -1444,9 +1509,16 @@ struct UsageView: View {
                     )
             }
             .frame(width: 360, height: min(max(measuredHeight, 100), maxPopupHeight))
-            // Darken the translucent popover material so contrast stays consistent
-            // no matter how light the content behind the popover is.
-            .background(Color(red: 0.07, green: 0.07, blue: 0.08).opacity(0.62))
+            // Dark: light scrim over the native material — between fully native
+            // (too transparent) and the v1.3.2 0.62 scrim (read as "too dark").
+            // TEST VALUE on ClaudeUsageBar only; CodexUsageBar stays fully native.
+            // Light: near-opaque backing, or a dark desktop bleeds through as
+            // murky blue-gray when forced.
+            .background(
+                colorScheme == .dark
+                    ? Color(red: 0.07, green: 0.07, blue: 0.08).opacity(0.3)
+                    : Color.white.opacity(0.85)
+            )
             .onPreferenceChange(ContentHeightKey.self) { value in
                 guard value > 0 else { return }
                 measuredHeight = value
@@ -1489,7 +1561,7 @@ struct UsageView: View {
                         Button(action: { updateManager.dismissCurrent() }) {
                             Image(systemName: "xmark")
                                 .font(.system(size: 9, weight: .semibold))
-                                .foregroundColor(.secondary)
+                                .foregroundColor(Color.secondaryText)
                         }
                         .buttonStyle(.borderless)
                     }
@@ -1500,7 +1572,7 @@ struct UsageView: View {
                     if !ann.body.isEmpty {
                         Text(ann.body)
                             .font(.caption2)
-                            .foregroundColor(.secondary)
+                            .foregroundColor(Color.secondaryText)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                     if !ann.buttons.isEmpty {
@@ -1529,7 +1601,7 @@ struct UsageView: View {
                         Button(action: { updateManager.dismissCurrent() }) {
                             Image(systemName: "xmark")
                                 .font(.system(size: 9, weight: .semibold))
-                                .foregroundColor(.secondary)
+                                .foregroundColor(Color.secondaryText)
                         }
                         .buttonStyle(.borderless)
                     }
@@ -1537,7 +1609,7 @@ struct UsageView: View {
                         .font(.caption)
                     Text(update.body)
                         .font(.caption2)
-                        .foregroundColor(.secondary)
+                        .foregroundColor(Color.secondaryText)
                         .fixedSize(horizontal: false, vertical: true)
                     if !update.buttons.isEmpty {
                         HStack(spacing: 6) {
@@ -1563,7 +1635,7 @@ struct UsageView: View {
             if !usageManager.hasFetchedData {
                 Text("👋 Welcome! Set your session cookie below to get started.")
                     .font(.subheadline)
-                    .foregroundColor(.secondary)
+                    .foregroundColor(Color.secondaryText)
                     .padding(.vertical, 8)
             }
 
@@ -1577,16 +1649,16 @@ struct UsageView: View {
                     if let resetTime = usageManager.sessionResetsAt {
                         Text("Resets \(formatResetTime(resetTime))")
                             .font(.caption)
-                            .foregroundColor(.secondary)
+                            .foregroundColor(Color.secondaryText)
                     }
                 }
 
-                ProgressView(value: usageManager.sessionPercentage)
-                    .tint(colorForPercentage(usageManager.sessionPercentage))
+                UsageBar(value: usageManager.sessionPercentage,
+                         color: colorForPercentage(usageManager.sessionPercentage))
 
                 Text("\(Int(usageManager.sessionPercentage * 100))% used")
                     .font(.caption)
-                    .foregroundColor(.secondary)
+                    .foregroundColor(Color.secondaryText)
             }
 
             // Weekly Usage
@@ -1598,16 +1670,16 @@ struct UsageView: View {
                     if let resetTime = usageManager.weeklyResetsAt {
                         Text("Resets \(formatResetTime(resetTime, includeDate: true))")
                             .font(.caption)
-                            .foregroundColor(.secondary)
+                            .foregroundColor(Color.secondaryText)
                     }
                 }
 
-                ProgressView(value: usageManager.weeklyPercentage)
-                    .tint(colorForPercentage(usageManager.weeklyPercentage))
+                UsageBar(value: usageManager.weeklyPercentage,
+                         color: colorForPercentage(usageManager.weeklyPercentage))
 
                 Text("\(Int(usageManager.weeklyPercentage * 100))% used")
                     .font(.caption)
-                    .foregroundColor(.secondary)
+                    .foregroundColor(Color.secondaryText)
             }
 
             // Weekly Sonnet Usage (only show if available)
@@ -1620,16 +1692,16 @@ struct UsageView: View {
                         if let resetTime = usageManager.weeklySonnetResetsAt {
                             Text("Resets \(formatResetTime(resetTime, includeDate: true))")
                                 .font(.caption)
-                                .foregroundColor(.secondary)
+                                .foregroundColor(Color.secondaryText)
                         }
                     }
 
-                    ProgressView(value: usageManager.weeklySonnetPercentage)
-                        .tint(colorForPercentage(usageManager.weeklySonnetPercentage))
+                    UsageBar(value: usageManager.weeklySonnetPercentage,
+                             color: colorForPercentage(usageManager.weeklySonnetPercentage))
 
                     Text("\(Int(usageManager.weeklySonnetPercentage * 100))% used")
                         .font(.caption)
-                        .foregroundColor(.secondary)
+                        .foregroundColor(Color.secondaryText)
                 }
             }
 
@@ -1644,16 +1716,16 @@ struct UsageView: View {
                         if let resetTime = usageManager.weeklyFableResetsAt {
                             Text("Resets \(formatResetTime(resetTime, includeDate: true))")
                                 .font(.caption)
-                                .foregroundColor(.secondary)
+                                .foregroundColor(Color.secondaryText)
                         }
                     }
 
-                    ProgressView(value: usageManager.weeklyFablePercentage)
-                        .tint(colorForPercentage(usageManager.weeklyFablePercentage))
+                    UsageBar(value: usageManager.weeklyFablePercentage,
+                             color: colorForPercentage(usageManager.weeklyFablePercentage))
 
                     Text("\(Int(usageManager.weeklyFablePercentage * 100))% used")
                         .font(.caption)
-                        .foregroundColor(.secondary)
+                        .foregroundColor(Color.secondaryText)
                 }
             }
 
@@ -1698,20 +1770,20 @@ struct UsageView: View {
                     // Spend vs monthly limit — only when there's actual spend.
                     if usageManager.hasCreditUsage {
                         if limitMinor > 0 {
-                            ProgressView(value: min(pct, 1.0))
-                                .tint(colorForPercentage(pct))
+                            UsageBar(value: min(pct, 1.0),
+                                     color: colorForPercentage(pct))
                         }
                         HStack {
                             Text(limitMinor > 0
                                  ? "\(fmt(spentMinor)) of \(fmt(limitMinor)) · \(pctLabel)"
                                  : "\(fmt(spentMinor)) spent")
                                 .font(.caption)
-                                .foregroundColor(.secondary)
+                                .foregroundColor(Color.secondaryText)
                             Spacer()
                             if let r = shortReset {
                                 Text(r)
                                     .font(.caption)
-                                    .foregroundColor(.secondary)
+                                    .foregroundColor(Color.secondaryText)
                             }
                         }
                     }
@@ -1719,7 +1791,7 @@ struct UsageView: View {
                     if usageManager.freeCreditsMinor > 0 {
                         Text("\(fmt(usageManager.freeCreditsMinor)) free credits left")
                             .font(.caption2)
-                            .foregroundColor(.secondary)
+                            .foregroundColor(Color.secondaryText)
                             .opacity(0.85)
                     }
                 }
@@ -1737,7 +1809,7 @@ struct UsageView: View {
                         : "No Fable usage"
                     )
                     .font(.caption2)
-                    .foregroundColor(.secondary)
+                    .foregroundColor(Color.secondaryText)
                     .opacity(0.6)
                 }
             }
@@ -1767,11 +1839,11 @@ struct UsageView: View {
                                  ? "All Claude services operational"
                                  : statusManager.statusDescription)
                                 .font(.caption)
-                                .foregroundColor(.secondary)
+                                .foregroundColor(Color.secondaryText)
                                 .fixedSize(horizontal: false, vertical: true)
                             Text(statusContextLine(for: statusManager))
                                 .font(.system(size: 10))
-                                .foregroundColor(.secondary)
+                                .foregroundColor(Color.secondaryText)
                                 .fixedSize(horizontal: false, vertical: true)
                         }
                         Spacer()
@@ -1810,7 +1882,7 @@ struct UsageView: View {
                                         if let updated = incident.updatedAt {
                                             Text("Updated \(relativeTime(updated))")
                                                 .font(.caption2)
-                                                .foregroundColor(.secondary)
+                                                .foregroundColor(Color.secondaryText)
                                         }
                                     }
 
@@ -1831,7 +1903,7 @@ struct UsageView: View {
                                     Text("Affected services")
                                         .font(.caption2)
                                         .fontWeight(.semibold)
-                                        .foregroundColor(.secondary)
+                                        .foregroundColor(Color.secondaryText)
                                     ForEach(filteredAffected) { c in
                                         HStack(spacing: 6) {
                                             Circle()
@@ -1841,7 +1913,7 @@ struct UsageView: View {
                                             Spacer()
                                             Text(componentLabel(c.status))
                                                 .font(.caption2)
-                                                .foregroundColor(.secondary)
+                                                .foregroundColor(Color.secondaryText)
                                         }
                                     }
                                 }
@@ -1853,7 +1925,7 @@ struct UsageView: View {
                                 if let lastCheck = statusManager.lastUpdated {
                                     Text("Checked \(relativeTime(lastCheck))")
                                         .font(.caption2)
-                                        .foregroundColor(.secondary)
+                                        .foregroundColor(Color.secondaryText)
                                 }
                                 Spacer()
                                 Button(action: {
@@ -1878,7 +1950,7 @@ struct UsageView: View {
             HStack {
                 Text("Last updated: \(formatTime(usageManager.lastUpdated))")
                     .font(.caption)
-                    .foregroundColor(.secondary)
+                    .foregroundColor(Color.secondaryText)
                 Spacer()
                 Button("Refresh") {
                     usageManager.fetchUsage()
@@ -1922,12 +1994,12 @@ struct UsageView: View {
                         Text("6. Copy full cookie value\n   (starts with anthropic-device-id=...)")
                     }
                     .font(.caption2)
-                    .foregroundColor(.secondary)
+                    .foregroundColor(Color.secondaryText)
 
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Paste full cookie string:")
                             .font(.caption2)
-                            .foregroundColor(.secondary)
+                            .foregroundColor(Color.secondaryText)
                         VStack(spacing: 4) {
                             PasteableTextField(text: $sessionCookieInput, placeholder: "Paste cookie here...")
                                 .frame(height: 60)
@@ -1999,7 +2071,7 @@ struct UsageView: View {
                                 .font(.caption)
                             Text("Launch app automatically when you log in")
                                 .font(.caption2)
-                                .foregroundColor(.secondary)
+                                .foregroundColor(Color.secondaryText)
                         }
                     }
                     .toggleStyle(.checkbox)
@@ -2017,7 +2089,7 @@ struct UsageView: View {
                                     .font(.caption)
                                 Text("Get alerts at 25%, 50%, 75%,\nand 90% session usage")
                                     .font(.caption2)
-                                    .foregroundColor(.secondary)
+                                    .foregroundColor(Color.secondaryText)
                                     .fixedSize(horizontal: false, vertical: true)
                             }
                         }
@@ -2035,7 +2107,7 @@ struct UsageView: View {
                                     .font(.caption)
                                 Text("Get alerts when tracked Claude services have an outage")
                                     .font(.caption2)
-                                    .foregroundColor(.secondary)
+                                    .foregroundColor(Color.secondaryText)
                                     .fixedSize(horizontal: false, vertical: true)
                             }
                         }
@@ -2066,7 +2138,7 @@ struct UsageView: View {
                                     .font(.caption)
                                 Text("Toggle popup from anywhere.\nDisable if it conflicts with other apps.")
                                     .font(.caption2)
-                                    .foregroundColor(.secondary)
+                                    .foregroundColor(Color.secondaryText)
                                     .fixedSize(horizontal: false, vertical: true)
                             }
                         }
@@ -2081,7 +2153,7 @@ struct UsageView: View {
 
                             Text("Accessibility permission may be needed\nfor the shortcut to work in all apps")
                                 .font(.caption2)
-                                .foregroundColor(.secondary)
+                                .foregroundColor(Color.secondaryText)
                                 .fixedSize(horizontal: false, vertical: true)
                         }
                     }
@@ -2094,7 +2166,7 @@ struct UsageView: View {
                             .fontWeight(.semibold)
                         Text("Only tick the Claude services you use. Status issues with unticked services won't be shown or trigger alerts.")
                             .font(.caption2)
-                            .foregroundColor(.secondary)
+                            .foregroundColor(Color.secondaryText)
                             .fixedSize(horizontal: false, vertical: true)
                         ForEach(statusManager.allComponents) { component in
                             Toggle(isOn: Binding(
@@ -2106,6 +2178,28 @@ struct UsageView: View {
                             }
                             .toggleStyle(.checkbox)
                         }
+                    }
+
+                    Divider()
+
+                    // Appearance sits last on purpose: opening Settings auto-scrolls
+                    // to the anchor below, so this lands in view.
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Appearance")
+                            .font(.caption)
+                        Picker("Appearance", selection: $appearanceMode) {
+                            Text("System").tag("system")
+                            Text("Dark").tag("dark")
+                            Text("Light").tag("light")
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .onChange(of: appearanceMode) { _ in
+                            (NSApplication.shared.delegate as? AppDelegate)?.applyAppearancePreference()
+                        }
+                        Text("Match macOS, or keep the classic dark look")
+                            .font(.caption2)
+                            .foregroundColor(Color.secondaryText)
                     }
 
                 }

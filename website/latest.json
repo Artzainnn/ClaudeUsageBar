@@ -1,7 +1,7 @@
 {
-  "version": "1.3.2",
-  "title": "Now tracking extra usage",
-  "description": "See your extra usage spend against your monthly limit, right from the menu bar.",
+  "version": "1.3.3",
+  "title": "Light mode is back!",
+  "description": "The app now matches macOS light and dark mode. Choose your look in Settings > Appearance.",
   "buttons": [
     {
       "label": "Download",
