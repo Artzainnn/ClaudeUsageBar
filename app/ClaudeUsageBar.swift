@@ -10,7 +10,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var popover: NSPopover!
     var usageManager: UsageManager!
     var statusManager: StatusManager!
-    var updateManager: UpdateManager!
+    let signInController = SignInWindowController()
     var eventMonitor: Any?
     var hotKeyRef: EventHotKeyRef?
 
@@ -18,6 +18,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // The UI is designed for dark; force dark appearance regardless of the
         // system light/dark setting (light mode had poor contrast).
         NSApp.appearance = NSAppearance(named: .darkAqua)
+
+        // Accessory apps have no menu bar, so Cmd+V/C/X/A don't route anywhere
+        // by default. A main menu with an Edit submenu (never visible) is what
+        // makes the standard edit shortcuts work in every window and webview.
+        setupEditMenu()
 
         // NSUserNotification (deprecated but works without permissions for unsigned apps)
         NSLog("✅ App launched, notifications ready")
@@ -40,7 +45,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Initialize managers
         usageManager = UsageManager(statusItem: statusItem, delegate: self)
         statusManager = StatusManager()
-        updateManager = UpdateManager()
 
         // Create popover
         popover = NSPopover()
@@ -49,14 +53,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         popover.behavior = .transient
         popover.contentViewController = NSHostingController(rootView: UsageView(
             usageManager: usageManager,
-            statusManager: statusManager,
-            updateManager: updateManager
+            statusManager: statusManager
         ))
 
         // Fetch initial data
         usageManager.fetchUsage()
         statusManager.fetch()
-        updateManager.fetch()
 
         // Usage + Anthropic status are time-sensitive — poll every 5 min.
         Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { _ in
@@ -64,20 +66,40 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self.statusManager.fetch()
         }
 
-        // App updates are infrequent (new release at most weekly) — poll every 3 hours.
-        Timer.scheduledTimer(withTimeInterval: 3 * 3600, repeats: true) { _ in
-            self.updateManager.fetch()
-        }
-
         // Set up Cmd+U keyboard shortcut
         setupKeyboardShortcut()
     }
 
-    func setupKeyboardShortcut() {
-        // Check Accessibility permissions
-        checkAccessibilityPermissions()
+    func setupEditMenu() {
+        let mainMenu = NSMenu()
 
-        // Only register if user has the shortcut enabled
+        let editItem = NSMenuItem()
+        let editMenu = NSMenu(title: "Edit")
+        editItem.submenu = editMenu
+
+        editMenu.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        editMenu.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+        editMenu.addItem(NSMenuItem.separator())
+        editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+
+        mainMenu.addItem(editItem)
+        NSApp.mainMenu = mainMenu
+    }
+
+    func presentSignInWindow() {
+        popover?.performClose(nil)
+        signInController.present { [weak self] cookie in
+            self?.usageManager.addAccount(cookie: cookie)
+        }
+    }
+
+    func setupKeyboardShortcut() {
+        // Carbon RegisterEventHotKey needs no Accessibility permission —
+        // just register when enabled. (The old Accessibility check/alert was
+        // unnecessary and re-prompted on every rebuild with ad-hoc signing.)
         if usageManager.shortcutEnabled {
             registerGlobalHotKey()
         }
@@ -88,32 +110,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             registerGlobalHotKey()
         } else {
             unregisterGlobalHotKey()
-        }
-    }
-
-    func checkAccessibilityPermissions() {
-        // Check if app has Accessibility permissions
-        let trusted = AXIsProcessTrusted()
-
-        if !trusted {
-            NSLog("⚠️ Accessibility permissions not granted")
-            // Show alert to guide user
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                let alert = NSAlert()
-                alert.messageText = "Accessibility Permission Required"
-                alert.informativeText = "ClaudeUsageBar needs Accessibility permission to use the Cmd+U keyboard shortcut.\n\nPlease enable it in:\nSystem Settings → Privacy & Security → Accessibility"
-                alert.alertStyle = .informational
-                alert.addButton(withTitle: "Open System Settings")
-                alert.addButton(withTitle: "Skip for Now")
-
-                let response = alert.runModal()
-                if response == .alertFirstButtonReturn {
-                    // Open System Settings
-                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
-                }
-            }
-        } else {
-            NSLog("✅ Accessibility permissions granted")
         }
     }
 
@@ -218,8 +214,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // downward and never opens oversized. (Pre-existing upstream bug.)
             popover.contentViewController = NSHostingController(rootView: UsageView(
                 usageManager: usageManager,
-                statusManager: statusManager,
-                updateManager: updateManager
+                statusManager: statusManager
             ))
 
             // Force UI refresh by updating percentages
@@ -362,6 +357,23 @@ enum MenuBarDisplayMode: String, CaseIterable {
     }
 }
 
+// A saved claude.ai login. `cookie` is the full Cookie header string; `orgId`
+// is cached after the first bootstrap lookup so switching accounts is instant.
+struct ClaudeAccount: Identifiable, Codable, Equatable {
+    let id: String
+    var label: String
+    var cookie: String
+    var orgId: String?
+}
+
+// Lightweight per-account numbers for the switcher menu (the active account
+// gets the full detailed fetch; others only need the two headline percents).
+struct AccountSummary: Equatable {
+    var session: Int = 0
+    var weekly: Int = 0
+    var failed: Bool = false
+}
+
 class UsageManager: ObservableObject {
     @Published var sessionUsage: Int = 0
     @Published var sessionLimit: Int = 100
@@ -391,30 +403,155 @@ class UsageManager: ObservableObject {
     @Published var hasWeeklySonnet: Bool = false
     @Published var hasWeeklyFable: Bool = false
     @Published var hasFetchedData: Bool = false
-    @Published var isAccessibilityEnabled: Bool = false
     @Published var shortcutEnabled: Bool = true
     @Published var menuBarDisplayMode: MenuBarDisplayMode = .session
+    @Published var accounts: [ClaudeAccount] = []
+    @Published var activeAccountId: String?
+    @Published var accountSummaries: [String: AccountSummary] = [:]
 
     private var statusItem: NSStatusItem?
-    private var sessionCookie: String = ""
     private weak var delegate: AppDelegate?
     private var lastNotifiedThreshold: Int = 0
+
+    var activeAccount: ClaudeAccount? {
+        accounts.first { $0.id == activeAccountId } ?? accounts.first
+    }
+
+    // Cookie of the active account — all existing fetch paths read this.
+    private var sessionCookie: String {
+        activeAccount?.cookie ?? ""
+    }
 
     init(statusItem: NSStatusItem?, delegate: AppDelegate? = nil) {
         self.statusItem = statusItem
         self.delegate = delegate
-        loadSessionCookie()
+        loadAccounts()
         loadSettings()
-        checkAccessibilityStatus()
     }
 
-    func checkAccessibilityStatus() {
-        isAccessibilityEnabled = AXIsProcessTrusted()
+    func loadAccounts() {
+        if let data = UserDefaults.standard.data(forKey: "claude_accounts"),
+           let saved = try? JSONDecoder().decode([ClaudeAccount].self, from: data) {
+            accounts = saved
+        }
+        // Migrate the pre-multi-account single cookie into an account entry.
+        if accounts.isEmpty,
+           let legacy = UserDefaults.standard.string(forKey: "claude_session_cookie"),
+           !legacy.isEmpty {
+            accounts = [ClaudeAccount(id: UUID().uuidString, label: "Account 1", cookie: legacy, orgId: nil)]
+            UserDefaults.standard.removeObject(forKey: "claude_session_cookie")
+            persistAccounts()
+        }
+        activeAccountId = UserDefaults.standard.string(forKey: "active_account_id") ?? accounts.first?.id
+        if accounts.first(where: { $0.id == activeAccountId }) == nil {
+            activeAccountId = accounts.first?.id
+        }
+        // Accounts still carrying a placeholder label (migrated, or added
+        // before bootstrap answered) get their email resolved in background.
+        for account in accounts where account.label.hasPrefix("Account ") {
+            resolveLabel(for: account.id)
+        }
     }
 
-    func loadSessionCookie() {
-        if let savedCookie = UserDefaults.standard.string(forKey: "claude_session_cookie") {
-            sessionCookie = savedCookie
+    func persistAccounts() {
+        if accounts.isEmpty {
+            // An empty write is only ever legitimate from removeAccount.
+            // Log a stack so any other path that lands here is caught.
+            NSLog("⚠️ persistAccounts writing EMPTY account list\n\(Thread.callStackSymbols.joined(separator: "\n"))")
+        }
+        if let data = try? JSONEncoder().encode(accounts) {
+            UserDefaults.standard.set(data, forKey: "claude_accounts")
+        }
+        if let id = activeAccountId {
+            UserDefaults.standard.set(id, forKey: "active_account_id")
+        } else {
+            UserDefaults.standard.removeObject(forKey: "active_account_id")
+        }
+    }
+
+    // Add (or refresh) an account from a captured/pasted cookie string. The
+    // label is resolved from bootstrap's email afterwards; if the email matches
+    // an existing account this replaces that account's cookie instead of
+    // creating a duplicate.
+    func addAccount(cookie: String, label: String? = nil) {
+        let trimmed = cookie.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            errorMessage = "Cookie field is empty!"
+            return
+        }
+        let account = ClaudeAccount(
+            id: UUID().uuidString,
+            label: label ?? "Account \(accounts.count + 1)",
+            cookie: trimmed,
+            orgId: nil
+        )
+        accounts.append(account)
+        activeAccountId = account.id
+        persistAccounts()
+        resetDisplayedData()
+        fetchUsage()
+        resolveLabel(for: account.id)
+    }
+
+    // Ask bootstrap for the account email to use as the display label, and
+    // fold duplicate logins (same email) into one entry.
+    func resolveLabel(for accountId: String) {
+        guard let account = accounts.first(where: { $0.id == accountId }) else { return }
+        guard let url = URL(string: "https://claude.ai/api/bootstrap") else { return }
+        var request = URLRequest(url: url)
+        request.setValue(account.cookie, forHTTPHeaderField: "Cookie")
+        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
+        URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
+            guard let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let acct = json["account"] as? [String: Any] else { return }
+            let email = acct["email_address"] as? String
+            let orgId = acct["lastActiveOrgId"] as? String
+            DispatchQueue.main.async {
+                guard let self = self,
+                      let idx = self.accounts.firstIndex(where: { $0.id == accountId }) else { return }
+                if let email = email, !email.isEmpty {
+                    // Same email already saved under another entry? Keep the
+                    // old entry's position, adopt the new cookie, drop the dup.
+                    if let dupIdx = self.accounts.firstIndex(where: { $0.label == email && $0.id != accountId }) {
+                        self.accounts[dupIdx].cookie = self.accounts[idx].cookie
+                        self.accounts[dupIdx].orgId = orgId ?? self.accounts[dupIdx].orgId
+                        let dupId = self.accounts[dupIdx].id
+                        self.accounts.remove(at: idx)
+                        if self.activeAccountId == accountId { self.activeAccountId = dupId }
+                    } else {
+                        self.accounts[idx].label = email
+                        self.accounts[idx].orgId = orgId ?? self.accounts[idx].orgId
+                    }
+                } else if let orgId = orgId {
+                    self.accounts[idx].orgId = orgId
+                }
+                self.persistAccounts()
+            }
+        }.resume()
+    }
+
+    func switchAccount(to id: String) {
+        guard id != activeAccountId, accounts.contains(where: { $0.id == id }) else { return }
+        activeAccountId = id
+        lastNotifiedThreshold = UserDefaults.standard.integer(forKey: "last_notified_threshold_\(id)")
+        persistAccounts()
+        resetDisplayedData()
+        fetchUsage()
+    }
+
+    func removeAccount(id: String) {
+        accounts.removeAll { $0.id == id }
+        accountSummaries.removeValue(forKey: id)
+        UserDefaults.standard.removeObject(forKey: "last_notified_threshold_\(id)")
+        if activeAccountId == id {
+            activeAccountId = accounts.first?.id
+            resetDisplayedData()
+            if activeAccountId != nil { fetchUsage() }
+        }
+        persistAccounts()
+        if accounts.isEmpty {
+            delegate?.updateStatusIcon(percentage: 0)
         }
     }
 
@@ -448,7 +585,9 @@ class UsageManager: ObservableObject {
         } else {
             openAtLogin = UserDefaults.standard.bool(forKey: "open_at_login")
         }
-        lastNotifiedThreshold = UserDefaults.standard.integer(forKey: "last_notified_threshold")
+        lastNotifiedThreshold = activeAccountId.map {
+            UserDefaults.standard.integer(forKey: "last_notified_threshold_\($0)")
+        } ?? 0
         // Default shortcut to enabled if not previously set
         if UserDefaults.standard.object(forKey: "shortcut_enabled") == nil {
             shortcutEnabled = true
@@ -490,21 +629,9 @@ class UsageManager: ObservableObject {
         }
     }
 
-    func saveSessionCookie(_ cookie: String) {
-        NSLog("ClaudeUsage: Saving cookie, length: \(cookie.count)")
-        sessionCookie = cookie
-        UserDefaults.standard.set(cookie, forKey: "claude_session_cookie")
-        UserDefaults.standard.synchronize()
-        NSLog("ClaudeUsage: Cookie saved successfully")
-    }
-
-    func clearSessionCookie() {
-        NSLog("ClaudeUsage: Clearing cookie")
-        sessionCookie = ""
-        UserDefaults.standard.removeObject(forKey: "claude_session_cookie")
-        UserDefaults.standard.synchronize()
-
-        // Reset all data
+    // Clear the displayed usage numbers (used when switching/removing accounts
+    // so one account's bars never linger while another account's data loads).
+    func resetDisplayedData() {
         sessionUsage = 0
         weeklyUsage = 0
         weeklySonnetUsage = 0
@@ -522,23 +649,34 @@ class UsageManager: ObservableObject {
         hasWeeklySonnet = false
         hasWeeklyFable = false
         errorMessage = nil
-        lastNotifiedThreshold = 0
-        UserDefaults.standard.set(0, forKey: "last_notified_threshold")
+        lastNotifiedThreshold = activeAccountId.map {
+            UserDefaults.standard.integer(forKey: "last_notified_threshold_\($0)")
+        } ?? 0
 
         // Update status bar to show 0%
         delegate?.updateStatusIcon(percentage: 0)
-
-        NSLog("ClaudeUsage: Cookie cleared, data reset")
     }
 
     func fetchOrganizationId(completion: @escaping (String?) -> Void) {
-        // Get org ID from the lastActiveOrg cookie value
-        let cookieParts = sessionCookie.components(separatedBy: ";")
+        guard let account = activeAccount else { completion(nil); return }
+        resolveOrgId(for: account, completion: completion)
+    }
+
+    // Org ID for any account: cached value, then the lastActiveOrg cookie
+    // value, then a bootstrap call (result cached back onto the account).
+    func resolveOrgId(for account: ClaudeAccount, completion: @escaping (String?) -> Void) {
+        if let cached = account.orgId, !cached.isEmpty {
+            completion(cached)
+            return
+        }
+
+        let cookieParts = account.cookie.components(separatedBy: ";")
         for part in cookieParts {
             let trimmed = part.trimmingCharacters(in: .whitespaces)
             if trimmed.hasPrefix("lastActiveOrg=") {
                 let orgId = trimmed.replacingOccurrences(of: "lastActiveOrg=", with: "")
                 NSLog("📋 Found org ID in cookie: \(orgId)")
+                cacheOrgId(orgId, accountId: account.id)
                 completion(orgId)
                 return
             }
@@ -552,28 +690,40 @@ class UsageManager: ObservableObject {
 
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
-        request.setValue("sessionKey=\(sessionCookie)", forHTTPHeaderField: "Cookie")
+        request.setValue(account.cookie, forHTTPHeaderField: "Cookie")
+        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
 
         NSLog("📡 Fetching bootstrap to get org ID...")
 
-        URLSession.shared.dataTask(with: request) { data, response, error in
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             guard let data = data,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let account = json["account"] as? [String: Any],
-                  let lastActiveOrgId = account["lastActiveOrgId"] as? String else {
+                  let acct = json["account"] as? [String: Any],
+                  let lastActiveOrgId = acct["lastActiveOrgId"] as? String else {
                 NSLog("❌ Could not parse org ID from bootstrap")
                 completion(nil)
                 return
             }
             NSLog("✅ Got org ID from bootstrap: \(lastActiveOrgId)")
+            self?.cacheOrgId(lastActiveOrgId, accountId: account.id)
             completion(lastActiveOrgId)
         }.resume()
+    }
+
+    private func cacheOrgId(_ orgId: String, accountId: String) {
+        DispatchQueue.main.async {
+            if let idx = self.accounts.firstIndex(where: { $0.id == accountId }),
+               self.accounts[idx].orgId != orgId {
+                self.accounts[idx].orgId = orgId
+                self.persistAccounts()
+            }
+        }
     }
 
     func fetchUsage() {
         guard !sessionCookie.isEmpty else {
             DispatchQueue.main.async {
-                self.errorMessage = "Session cookie not set"
+                self.errorMessage = "No account signed in"
                 self.updateStatusBar()
             }
             return
@@ -595,6 +745,50 @@ class UsageManager: ObservableObject {
             self.fetchUsageWithOrgId(orgId)
             self.fetchExtraUsage(orgId)
             self.fetchFreeCredits(orgId)
+        }
+
+        // Headline percents for every saved account (drives the switcher menu).
+        fetchAccountSummaries()
+    }
+
+    func fetchAccountSummaries() {
+        for account in accounts {
+            resolveOrgId(for: account) { [weak self] orgId in
+                guard let orgId = orgId else {
+                    DispatchQueue.main.async {
+                        self?.accountSummaries[account.id] = AccountSummary(failed: true)
+                    }
+                    return
+                }
+                guard let url = URL(string: "https://claude.ai/api/organizations/\(orgId)/usage") else { return }
+                var request = URLRequest(url: url)
+                request.setValue(account.cookie, forHTTPHeaderField: "Cookie")
+                request.setValue("*/*", forHTTPHeaderField: "Accept")
+                request.setValue("https://claude.ai", forHTTPHeaderField: "Origin")
+                request.setValue("https://claude.ai", forHTTPHeaderField: "Referer")
+                request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
+                URLSession.shared.dataTask(with: request) { data, response, _ in
+                    DispatchQueue.main.async {
+                        guard let self = self else { return }
+                        guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+                              let data = data,
+                              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                            self.accountSummaries[account.id] = AccountSummary(failed: true)
+                            return
+                        }
+                        var summary = AccountSummary()
+                        if let fiveHour = json["five_hour"] as? [String: Any],
+                           let util = fiveHour["utilization"] as? Double {
+                            summary.session = Int(util)
+                        }
+                        if let sevenDay = json["seven_day"] as? [String: Any],
+                           let util = sevenDay["utilization"] as? Double {
+                            summary.weekly = Int(util)
+                        }
+                        self.accountSummaries[account.id] = summary
+                    }
+                }.resume()
+            }
         }
     }
 
@@ -881,13 +1075,17 @@ class UsageManager: ObservableObject {
 
         let thresholds = [25, 50, 75, 90]
 
+        // Threshold state is per-account so switching accounts doesn't
+        // suppress (or re-fire) alerts that belong to a different login.
+        let thresholdKey = "last_notified_threshold_\(activeAccountId ?? "default")"
+
         for threshold in thresholds {
             if percentage >= threshold && lastNotifiedThreshold < threshold {
                 NSLog("📬 Sending notification for \(threshold)% threshold")
                 sendNotification(percentage: percentage, threshold: threshold)
                 lastNotifiedThreshold = threshold
                 // Persist the threshold
-                UserDefaults.standard.set(lastNotifiedThreshold, forKey: "last_notified_threshold")
+                UserDefaults.standard.set(lastNotifiedThreshold, forKey: thresholdKey)
                 UserDefaults.standard.synchronize()
             }
         }
@@ -897,7 +1095,7 @@ class UsageManager: ObservableObject {
             let newThreshold = thresholds.filter { $0 <= percentage }.last ?? 0
             NSLog("🔄 Resetting notification threshold from \(lastNotifiedThreshold)% to \(newThreshold)%")
             lastNotifiedThreshold = newThreshold
-            UserDefaults.standard.set(lastNotifiedThreshold, forKey: "last_notified_threshold")
+            UserDefaults.standard.set(lastNotifiedThreshold, forKey: thresholdKey)
             UserDefaults.standard.synchronize()
         }
     }
@@ -934,6 +1132,143 @@ class UsageManager: ObservableObject {
         weeklyPercentage = Double(weeklyUsage) / Double(weeklyLimit)
         weeklySonnetPercentage = Double(weeklySonnetUsage) / Double(weeklySonnetLimit)
         weeklyFablePercentage = Double(weeklyFableUsage) / Double(weeklyFableLimit)
+    }
+
+    func requestSignIn() {
+        delegate?.presentSignInWindow()
+    }
+}
+
+// MARK: - Embedded claude.ai sign-in
+
+// Opens a real WebKit window on claude.ai's login page and captures the
+// session cookie automatically once login completes — no DevTools digging.
+// Uses a throwaway non-persistent cookie store, so signing in to a second
+// account never reuses (or disturbs) an earlier account's session.
+class SignInWindowController: NSObject, WKNavigationDelegate, NSWindowDelegate {
+    private var window: NSWindow?
+    private var webView: WKWebView?
+    private var pollTimer: Timer?
+    private var onCookieCaptured: ((String) -> Void)?
+    private var captured = false
+
+    func present(onCookieCaptured: @escaping (String) -> Void) {
+        // Already open — just bring it forward.
+        if let window = window {
+            NSApp.activate(ignoringOtherApps: true)
+            window.makeKeyAndOrderFront(nil)
+            return
+        }
+        self.onCookieCaptured = onCookieCaptured
+        captured = false
+
+        let config = WKWebViewConfiguration()
+        config.websiteDataStore = .nonPersistent()
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.navigationDelegate = self
+        // Safari UA: Google blocks OAuth in generic embedded webviews, and
+        // Cloudflare is friendlier to a recognized browser.
+        webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
+
+        // Email login: the emailed magic link, opened in the default browser,
+        // shows a one-time code — which gets typed back into THIS window's
+        // login form. The hint spells that out; the paste field remains as a
+        // fallback for completing the link inside this window instead.
+        let hint = NSTextField(wrappingLabelWithString:
+            "Email login: click the emailed link in your browser, then type the code it shows into the form below. (Or paste the link here and press Return.)")
+        hint.font = NSFont.systemFont(ofSize: 10)
+        hint.textColor = .secondaryLabelColor
+
+        let linkField = NSTextField()
+        linkField.placeholderString = "Optional: paste the emailed sign-in link here and press Return"
+        linkField.font = NSFont.systemFont(ofSize: 11)
+        linkField.target = self
+        linkField.action = #selector(openPastedLink(_:))
+
+        let stack = NSStackView(views: [hint, linkField, webView])
+        stack.orientation = .vertical
+        stack.spacing = 6
+        stack.edgeInsets = NSEdgeInsets(top: 8, left: 8, bottom: 0, right: 8)
+        webView.setContentHuggingPriority(.defaultLow, for: .vertical)
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 500, height: 700),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered, defer: false
+        )
+        window.title = "Sign in to Claude"
+        window.contentView = stack
+        window.center()
+        window.isReleasedWhenClosed = false
+        window.delegate = self
+
+        self.webView = webView
+        self.window = window
+
+        webView.load(URLRequest(url: URL(string: "https://claude.ai/login")!))
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+
+        // The login flow is an SPA — route changes don't always fire
+        // navigation callbacks, so poll the cookie store as well.
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+            self?.checkForSession()
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        checkForSession()
+    }
+
+    @objc func openPastedLink(_ sender: NSTextField) {
+        let text = sender.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: text),
+              url.scheme == "https",
+              let host = url.host?.lowercased(),
+              host == "claude.ai" || host.hasSuffix(".claude.ai")
+                || host == "anthropic.com" || host.hasSuffix(".anthropic.com") else {
+            NSSound.beep()
+            sender.placeholderString = "That doesn't look like a claude.ai link — paste the full URL from the email"
+            sender.stringValue = ""
+            return
+        }
+        webView?.load(URLRequest(url: url))
+        sender.stringValue = ""
+    }
+
+    private func checkForSession() {
+        guard !captured, let webView = webView else { return }
+        webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { [weak self] cookies in
+            guard let self = self, !self.captured else { return }
+            let claudeCookies = cookies.filter { $0.domain.hasSuffix("claude.ai") }
+            guard claudeCookies.contains(where: { $0.name == "sessionKey" && !$0.value.isEmpty }) else { return }
+            self.captured = true
+            let cookieString = claudeCookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
+            NSLog("🔐 Captured session cookie from sign-in window (\(claudeCookies.count) cookies)")
+            DispatchQueue.main.async {
+                self.onCookieCaptured?(cookieString)
+                self.closeWindow()
+            }
+        }
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        teardown()
+    }
+
+    private func closeWindow() {
+        window?.delegate = nil
+        window?.close()
+        teardown()
+    }
+
+    private func teardown() {
+        pollTimer?.invalidate()
+        pollTimer = nil
+        webView?.navigationDelegate = nil
+        webView = nil
+        window = nil
+        onCookieCaptured = nil
     }
 }
 
@@ -1147,208 +1482,6 @@ class StatusManager: ObservableObject {
     }
 }
 
-// MARK: - App Updates
-
-struct BannerButton: Equatable {
-    let label: String
-    let url: URL?         // optional — opens this URL (validated)
-    let action: String?   // "dismiss" closes the banner; nil = no extra side effect
-    let style: String?    // "primary" | "secondary" | nil
-}
-
-struct AvailableUpdate: Equatable {
-    let version: String
-    let title: String
-    let body: String
-    let buttons: [BannerButton]
-}
-
-// Free-form message channel, decoupled from the app version. Driven by the
-// `message` object in latest.json and keyed on `id` (not version), so any
-// message can be sent at any time without shipping a new build. Every field is
-// author-controlled — including the notification title, which is NOT possible
-// on the legacy version-based channel.
-struct Announcement: Equatable {
-    let id: String
-    let heading: String?          // optional small top line on the card (nil = none)
-    let title: String
-    let body: String
-    let buttons: [BannerButton]
-    let notify: Bool              // false = show the in-app card only, no OS notification
-    let notifTitle: String        // fully custom notification title
-    let notifBody: String         // fully custom notification body
-}
-
-class UpdateManager: ObservableObject {
-    @Published var available: AvailableUpdate?
-    @Published var announcement: Announcement?
-
-    // Served directly from the repo via GitHub — free, unlimited, no Vercel meter.
-    // Same file as website/latest.json so existing v1.1 users on Vercel see the same JSON.
-    private let endpoint = URL(string: "https://raw.githubusercontent.com/Artzainnn/ClaudeUsageBar/main/website/latest.json")!
-
-    var currentVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
-    }
-
-    private static let allowedHostSuffixes = [
-        "github.com",
-        "claudeusagebar.com"
-    ]
-
-    static func isSafeURL(_ url: URL) -> Bool {
-        guard url.scheme == "https" else { return false }
-        guard let host = url.host?.lowercased() else { return false }
-        return allowedHostSuffixes.contains(where: { host == $0 || host.hasSuffix("." + $0) })
-    }
-
-    private static func parseButtons(from json: [String: Any]) -> [BannerButton] {
-        // Explicit `buttons` array (new schema, supports any combination)
-        if let raw = json["buttons"] as? [[String: Any]] {
-            return raw.compactMap { dict -> BannerButton? in
-                guard let label = dict["label"] as? String, !label.isEmpty else { return nil }
-                let urlStr = dict["url"] as? String
-                let url = urlStr.flatMap { URL(string: $0) }
-                if let url = url, !isSafeURL(url) { return nil }   // reject unsafe URLs
-                return BannerButton(
-                    label: label,
-                    url: url,
-                    action: dict["action"] as? String,
-                    style: dict["style"] as? String
-                )
-            }
-        }
-        // Back-compat: legacy `download_url` builds the default 2-button layout
-        if let urlStr = json["download_url"] as? String,
-           let url = URL(string: urlStr),
-           isSafeURL(url) {
-            return [
-                BannerButton(label: "Download", url: url, action: nil, style: "primary"),
-                BannerButton(label: "Later",    url: nil, action: "dismiss", style: nil)
-            ]
-        }
-        return []
-    }
-
-    func fetch() {
-        let request = URLRequest(url: endpoint, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
-        URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
-            guard let self = self,
-                  let data = data,
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                NSLog("⚠️ Update fetch failed or invalid payload")
-                return
-            }
-
-            // ---- Legacy version-update channel (for real releases; also what
-            //      pre-1.3.1 apps rely on). Optional — absent fields = no update.
-            let updatePayload: AvailableUpdate? = {
-                guard let version = json["version"] as? String,
-                      let title = json["title"] as? String,
-                      let body = json["description"] as? String else { return nil }
-                return AvailableUpdate(version: version, title: title, body: body,
-                                       buttons: Self.parseButtons(from: json))
-            }()
-
-            // ---- Free-form message channel (`message` object, keyed on `id`).
-            //      Every field author-controlled, including the notification title.
-            let announcementPayload: Announcement? = {
-                guard let msg = json["message"] as? [String: Any],
-                      let id = msg["id"] as? String, !id.isEmpty else { return nil }
-                let title = msg["title"] as? String ?? ""
-                let body  = msg["body"]  as? String ?? ""
-                let notif = msg["notification"] as? [String: Any]
-                return Announcement(
-                    id: id,
-                    heading: msg["heading"] as? String,
-                    title: title,
-                    body: body,
-                    buttons: Self.parseButtons(from: msg),
-                    notify: (msg["notify"] as? Bool) ?? true,
-                    notifTitle: (notif?["title"] as? String) ?? (title.isEmpty ? "ClaudeUsageBar" : title),
-                    notifBody:  (notif?["body"]  as? String) ?? body
-                )
-            }()
-
-            DispatchQueue.main.async {
-                // Version-update channel
-                if let update = updatePayload, self.isNewer(remote: update.version, than: self.currentVersion) {
-                    if self.available != update {
-                        self.available = update
-                        NSLog("⬆️ Update available: \(update.version)")
-                    }
-                    let lastNotified = UserDefaults.standard.string(forKey: "last_notified_update_version")
-                    if lastNotified != update.version {
-                        let n = NSUserNotification()
-                        n.title = "ClaudeUsageBar \(update.version) is available"
-                        n.informativeText = update.title
-                        n.soundName = NSUserNotificationDefaultSoundName
-                        NSUserNotificationCenter.default.deliver(n)
-                        UserDefaults.standard.set(update.version, forKey: "last_notified_update_version")
-                        NSLog("📬 Sent update notification for \(update.version)")
-                    }
-                } else {
-                    self.available = nil
-                }
-
-                // Message channel — notify once per `id`. On the very first run
-                // that supports messages, seed the current id WITHOUT notifying so
-                // updating from an older version doesn't re-ping the live message.
-                if let ann = announcementPayload {
-                    let dismissed = UserDefaults.standard.string(forKey: "dismissed_message_id")
-                    self.announcement = (dismissed == ann.id) ? nil : ann
-
-                    let lastShown = UserDefaults.standard.string(forKey: "last_shown_message_id")
-                    if lastShown == nil {
-                        UserDefaults.standard.set(ann.id, forKey: "last_shown_message_id")   // seed, no notif
-                    } else if lastShown != ann.id {
-                        if ann.notify {
-                            let n = NSUserNotification()
-                            n.title = ann.notifTitle
-                            n.informativeText = ann.notifBody
-                            n.soundName = NSUserNotificationDefaultSoundName
-                            NSUserNotificationCenter.default.deliver(n)
-                            NSLog("📬 Sent message notification for id \(ann.id)")
-                        }
-                        UserDefaults.standard.set(ann.id, forKey: "last_shown_message_id")
-                    }
-                } else {
-                    self.announcement = nil
-                }
-            }
-        }.resume()
-    }
-
-    func dismissCurrent() {
-        // Announcement takes priority in the UI, so dismiss it first if present.
-        if let id = announcement?.id {
-            UserDefaults.standard.set(id, forKey: "dismissed_message_id")
-            announcement = nil
-            return
-        }
-        if let v = available?.version {
-            UserDefaults.standard.set(v, forKey: "dismissed_update_version")
-        }
-        available = nil
-    }
-
-    var isCurrentDismissed: Bool {
-        guard let v = available?.version else { return false }
-        return UserDefaults.standard.string(forKey: "dismissed_update_version") == v
-    }
-
-    private func isNewer(remote: String, than current: String) -> Bool {
-        let r = remote.split(separator: ".").map { Int($0) ?? 0 }
-        let c = current.split(separator: ".").map { Int($0) ?? 0 }
-        for i in 0..<max(r.count, c.count) {
-            let a = i < r.count ? r[i] : 0
-            let b = i < c.count ? c[i] : 0
-            if a != b { return a > b }
-        }
-        return false
-    }
-}
-
 // Custom NSTextField that properly handles paste
 class CustomTextField: NSTextField {
     var onTextChange: ((String) -> Void)?
@@ -1514,7 +1647,6 @@ struct UsageBar: View {
 struct UsageView: View {
     @ObservedObject var usageManager: UsageManager
     @ObservedObject var statusManager: StatusManager
-    @ObservedObject var updateManager: UpdateManager
     @State private var sessionCookieInput: String = ""
     @State private var showingCookieInput: Bool = false
     @State private var showingSettings: Bool = false
@@ -1543,9 +1675,6 @@ struct UsageView: View {
                 measuredHeight = value
             }
             .onAppear {
-                if let savedCookie = UserDefaults.standard.string(forKey: "claude_session_cookie") {
-                    sessionCookieInput = String(savedCookie.prefix(20)) + "..."
-                }
                 usageManager.updatePercentages()
             }
             .onChange(of: showingSettings) { isOpen in
@@ -1562,86 +1691,15 @@ struct UsageView: View {
 
     var content: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("Claude Usage")
-                .font(.headline)
-                .padding(.bottom, 4)
-
-            // Free-form message banner (author-controlled). Takes priority over
-            // the version-update banner when both are present.
-            if let ann = updateManager.announcement {
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(spacing: 6) {
-                        if let heading = ann.heading, !heading.isEmpty {
-                            Text(heading)
-                                .font(.caption)
-                                .fontWeight(.semibold)
-                        }
-                        Spacer()
-                        Button(action: { updateManager.dismissCurrent() }) {
-                            Image(systemName: "xmark")
-                                .font(.system(size: 9, weight: .semibold))
-                                .foregroundColor(.secondary)
-                        }
-                        .buttonStyle(.borderless)
-                    }
-                    if !ann.title.isEmpty {
-                        Text(ann.title)
-                            .font(.caption)
-                    }
-                    if !ann.body.isEmpty {
-                        Text(ann.body)
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    if !ann.buttons.isEmpty {
-                        HStack(spacing: 6) {
-                            ForEach(ann.buttons.indices, id: \.self) { i in
-                                bannerButton(ann.buttons[i])
-                            }
-                        }
-                    }
+            HStack {
+                Text("Claude Usage")
+                    .font(.headline)
+                Spacer()
+                if !usageManager.accounts.isEmpty {
+                    accountMenu
                 }
-                .padding(8)
-                .background(Color.accentColor.opacity(0.12))
-                .cornerRadius(6)
             }
-
-            // App update banner (version-based). Hidden while a message banner shows.
-            if updateManager.announcement == nil,
-               let update = updateManager.available, !updateManager.isCurrentDismissed {
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(spacing: 6) {
-                        Text("⬆️")
-                        Text("Version \(update.version) available")
-                            .font(.caption)
-                            .fontWeight(.semibold)
-                        Spacer()
-                        Button(action: { updateManager.dismissCurrent() }) {
-                            Image(systemName: "xmark")
-                                .font(.system(size: 9, weight: .semibold))
-                                .foregroundColor(.secondary)
-                        }
-                        .buttonStyle(.borderless)
-                    }
-                    Text(update.title)
-                        .font(.caption)
-                    Text(update.body)
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    if !update.buttons.isEmpty {
-                        HStack(spacing: 6) {
-                            ForEach(update.buttons.indices, id: \.self) { i in
-                                bannerButton(update.buttons[i])
-                            }
-                        }
-                    }
-                }
-                .padding(8)
-                .background(Color.accentColor.opacity(0.12))
-                .cornerRadius(6)
-            }
+            .padding(.bottom, 4)
 
             if let error = usageManager.errorMessage {
                 Text(error)
@@ -1652,10 +1710,21 @@ struct UsageView: View {
 
             // Only show usage if data has been fetched
             if !usageManager.hasFetchedData {
-                Text("👋 Welcome! Set your session cookie below to get started.")
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
-                    .padding(.vertical, 8)
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(usageManager.accounts.isEmpty
+                         ? "👋 Welcome! Sign in to your Claude account to get started."
+                         : "👋 Welcome! Fetching usage data…")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                    if usageManager.accounts.isEmpty {
+                        Button("Sign in to Claude…") {
+                            usageManager.requestSignIn()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                    }
+                }
+                .padding(.vertical, 8)
             }
 
             // Session Usage
@@ -1973,14 +2042,13 @@ struct UsageView: View {
                 Button("Refresh") {
                     usageManager.fetchUsage()
                     statusManager.fetch()
-                    updateManager.fetch()
                 }
                 .buttonStyle(.borderless)
                 .font(.caption)
             }
             }
 
-            Button(showingCookieInput ? "Hide Cookie" : "Set Session Cookie") {
+            Button(showingCookieInput ? "Hide Manual Cookie" : "Add Account Manually (cookie)") {
                 showingCookieInput.toggle()
             }
             .buttonStyle(.borderless)
@@ -1988,20 +2056,10 @@ struct UsageView: View {
 
             if showingCookieInput {
                 VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Text("How to get your session cookie:")
-                            .font(.caption)
-                            .fontWeight(.semibold)
-                        Spacer()
-                        Button(action: {
-                            NSWorkspace.shared.open(URL(string: "https://github.com/Artzainnn/ClaudeUsageBar/blob/main/setup-guide.png")!)
-                        }) {
-                            Text("View tutorial →")
-                                .font(.caption2)
-                                .foregroundColor(.blue)
-                        }
-                        .buttonStyle(.borderless)
-                    }
+                    Text("Manual fallback — if the sign-in window doesn't work, paste a cookie from your browser:")
+                        .font(.caption)
+                        .fontWeight(.semibold)
+                        .fixedSize(horizontal: false, vertical: true)
 
                     VStack(alignment: .leading, spacing: 4) {
                         Text("1. Go to Settings > Usage on claude.ai")
@@ -2024,27 +2082,16 @@ struct UsageView: View {
                                 .cornerRadius(4)
 
                             HStack(spacing: 8) {
-                                Button("Save Cookie & Fetch") {
-                                    NSLog("ClaudeUsage: Save clicked, input length: \(sessionCookieInput.count)")
-                                    if sessionCookieInput.isEmpty {
-                                        usageManager.errorMessage = "Cookie field is empty!"
-                                    } else {
-                                        usageManager.saveSessionCookie(sessionCookieInput)
-                                        usageManager.fetchUsage()
-                                        usageManager.errorMessage = "Cookie saved, fetching..."
+                                Button("Add Account & Fetch") {
+                                    NSLog("ClaudeUsage: Add account clicked, input length: \(sessionCookieInput.count)")
+                                    usageManager.addAccount(cookie: sessionCookieInput)
+                                    if !sessionCookieInput.isEmpty {
+                                        sessionCookieInput = ""
+                                        showingCookieInput = false
                                     }
                                 }
                                 .buttonStyle(.borderedProminent)
                                 .controlSize(.small)
-
-                                if usageManager.hasFetchedData {
-                                    Button("Clear Cookie") {
-                                        sessionCookieInput = ""
-                                        usageManager.clearSessionCookie()
-                                    }
-                                    .buttonStyle(.bordered)
-                                    .controlSize(.small)
-                                }
                             }
                         }
                     }
@@ -2053,19 +2100,6 @@ struct UsageView: View {
                 .background(Color.secondary.opacity(0.1))
                 .cornerRadius(6)
             }
-
-            // Support Section
-            Button(action: {
-                NSWorkspace.shared.open(URL(string: "https://donate.stripe.com/3cIcN5b5H7Q8ay8bIDfIs02")!)
-            }) {
-                HStack(spacing: 4) {
-                    Text("☕")
-                    Text("Buy Dev a Coffee")
-                }
-            }
-            .buttonStyle(.borderless)
-            .font(.caption)
-            .foregroundColor(.orange)
 
             // Settings Section
             Button(showingSettings ? "Hide Settings" : "Settings") {
@@ -2186,19 +2220,6 @@ struct UsageView: View {
                             }
                         }
                         .toggleStyle(.switch)
-
-                        if usageManager.shortcutEnabled && !usageManager.isAccessibilityEnabled {
-                            Button("Grant Accessibility Permission") {
-                                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .controlSize(.small)
-
-                            Text("Accessibility permission may be needed\nfor the shortcut to work in all apps")
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
                     }
 
                     Divider()
@@ -2335,25 +2356,48 @@ struct UsageView: View {
         return raw
     }
 
-    @ViewBuilder
-    func bannerButton(_ btn: BannerButton) -> some View {
-        let tap = {
-            if let url = btn.url {
-                NSWorkspace.shared.open(url)
+    // Compact account switcher in the header. Each entry shows the account's
+    // headline percents so you can compare accounts without switching.
+    var accountMenu: some View {
+        Menu {
+            ForEach(usageManager.accounts) { account in
+                Button(action: { usageManager.switchAccount(to: account.id) }) {
+                    Text((account.id == usageManager.activeAccount?.id ? "✓ " : "") + accountMenuLabel(account))
+                }
             }
-            if btn.action == "dismiss" {
-                updateManager.dismissCurrent()
+            Divider()
+            Button("Add Account…") {
+                usageManager.requestSignIn()
             }
+            if let active = usageManager.activeAccount {
+                Button("Remove \(active.label)") {
+                    usageManager.removeAccount(id: active.id)
+                }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "person.crop.circle")
+                    .font(.system(size: 11))
+                Text(usageManager.activeAccount?.label ?? "Account")
+                    .font(.caption)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .foregroundColor(.secondary)
         }
-        if btn.style == "primary" {
-            Button(btn.label, action: tap)
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-        } else {
-            Button(btn.label, action: tap)
-                .buttonStyle(.bordered)
-                .controlSize(.small)
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .frame(maxWidth: 170)
+    }
+
+    func accountMenuLabel(_ account: ClaudeAccount) -> String {
+        if let summary = usageManager.accountSummaries[account.id] {
+            if summary.failed {
+                return "\(account.label) — session expired"
+            }
+            return "\(account.label) — S \(summary.session)% · W \(summary.weekly)%"
         }
+        return account.label
     }
 
     func badgeColor(for status: String) -> Color {
