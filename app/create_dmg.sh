@@ -70,13 +70,18 @@ echo "✅ DMG created: ${DMG_NAME}.dmg"
 DEVELOPER_ID="Developer ID Application: Linkko Technology Pte Ltd (Q467HQ5432)"
 NOTARY_PROFILE="claudeusagebar-notary"
 
-# Sign the DMG itself (the .app inside was already signed in build.sh)
+# Sign the DMG itself (the .app inside was already signed in build.sh).
+# Fail-fast on sign failure: an unsigned DMG will be rejected by notarytool
+# anyway, and the 5–15 min wait for that rejection is worse than aborting
+# here with a clear error. Matches the fail-fast policy in build.sh.
 echo ""
 echo "🔏 Signing DMG with Developer ID..."
 if codesign --force --sign "$DEVELOPER_ID" "${DMG_NAME}.dmg" 2>/dev/null; then
     echo "✅ DMG signed"
 else
-    echo "⚠️  DMG signing failed (continuing — Gatekeeper may reject)"
+    echo "❌ DMG signing failed — aborting before notarization." >&2
+    echo "   Fix the underlying cause (often: cert missing / expired, or stale xattrs on the DMG) and re-run." >&2
+    exit 1
 fi
 
 # Notarize

@@ -33,9 +33,12 @@ if [ -f "ClaudeUsageBar.icns" ]; then
     /usr/libexec/PlistBuddy -c "Set :CFBundleIconFile ClaudeUsageBar" "$APP_PATH/Contents/Info.plist"
 fi
 
-# Compile the Swift app for arm64
+# Compile the Swift app for arm64.
+# Log.swift is compiled alongside ClaudeUsageBar.swift; see the header
+# comment in Log.swift for why the split exists.
 swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_arm64" \
     ClaudeUsageBar.swift \
+    Log.swift \
     -framework SwiftUI \
     -framework AppKit \
     -framework WebKit \
@@ -44,6 +47,7 @@ swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_arm64" \
 # Compile for x86_64 (Intel)
 swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_x86_64" \
     ClaudeUsageBar.swift \
+    Log.swift \
     -framework SwiftUI \
     -framework AppKit \
     -framework WebKit \
