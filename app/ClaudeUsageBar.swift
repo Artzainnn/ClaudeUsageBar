@@ -72,11 +72,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Initial guess; SwiftUI's intrinsic size (capped at 600) will drive the actual size.
         popover.contentSize = NSSize(width: 360, height: 320)
         popover.behavior = .transient
-        popover.contentViewController = NSHostingController(rootView: UsageView(
+        let hostingController = NSHostingController(rootView: UsageView(
             usageManager: usageManager,
             statusManager: statusManager,
             updateManager: updateManager
         ))
+        // Let the SwiftUI content's fitting size drive the popover size. Without this the
+        // hosting controller never propagates its preferredContentSize, so the popover stays
+        // stuck at the initial contentSize (320) while the content is taller (~401pt). The
+        // overflow clips the top of the popover — the "Claude Usage" header row disappears.
+        // (The fixed contentSize above only seeds an initial guess, as its comment intends.)
+        if #available(macOS 13.0, *) {
+            hostingController.sizingOptions = [.preferredContentSize]
+        }
+        popover.contentViewController = hostingController
 
         // Appearance preference: "system" (default) tracks the macOS light/dark
         // setting; "dark"/"light" force one (dark was hard-forced in v1.3.2 and
