@@ -242,6 +242,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApplication.shared.terminate(nil)
     }
 
+    @objc func switchAccountFromMenu(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        usageManager.switchAccount(id)
+    }
+
     @objc func togglePopover() {
         if popover.isShown {
             closePopover()
@@ -259,6 +264,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let toggleItem = NSMenuItem(title: "Toggle Usage (⌘U)", action: #selector(togglePopover), keyEquivalent: "u")
             toggleItem.keyEquivalentModifierMask = .command
             menu.addItem(toggleItem)
+
+            // Quick account switcher (only when more than one is configured).
+            if usageManager.accounts.count > 1 {
+                menu.addItem(NSMenuItem.separator())
+                let accountsMenu = NSMenu()
+                for acct in usageManager.accounts {
+                    let item = NSMenuItem(title: usageManager.displayName(for: acct),
+                                          action: #selector(switchAccountFromMenu(_:)),
+                                          keyEquivalent: "")
+                    item.target = self
+                    item.representedObject = acct.id
+                    item.state = (acct.id == usageManager.activeAccountId) ? .on : .off
+                    accountsMenu.addItem(item)
+                }
+                let accountsItem = NSMenuItem(title: "Account", action: nil, keyEquivalent: "")
+                menu.addItem(accountsItem)
+                menu.setSubmenu(accountsMenu, for: accountsItem)
+            }
+
             menu.addItem(NSMenuItem.separator())
             menu.addItem(NSMenuItem(title: "Quit ClaudeUsageBar", action: #selector(quitApp), keyEquivalent: "q"))
             statusItem.menu = menu
@@ -380,6 +404,15 @@ struct Main {
     }
 }
 
+// A single Claude account: a user-facing name plus the full session cookie
+// string pasted from claude.ai. `id` is stable so renames/switches don't
+// disturb per-account state (notification thresholds keyed on it).
+struct Account: Identifiable, Codable, Equatable {
+    let id: String
+    var name: String
+    var cookie: String
+}
+
 class UsageManager: ObservableObject {
     @Published var sessionUsage: Int = 0
     @Published var sessionLimit: Int = 100
@@ -412,16 +445,28 @@ class UsageManager: ObservableObject {
     @Published var isAccessibilityEnabled: Bool = false
     @Published var shortcutEnabled: Bool = true
 
+    // Multi-account support. `accounts` holds every configured account and
+    // `activeAccountId` selects which one drives the menu bar + popover. The
+    // session cookie used for all network requests is derived from the active
+    // account, so the rest of the fetch code stays account-agnostic.
+    @Published var accounts: [Account] = []
+    @Published var activeAccountId: String?
+
+    var activeAccount: Account? {
+        accounts.first { $0.id == activeAccountId }
+    }
+
     private var statusItem: NSStatusItem?
-    private var sessionCookie: String = ""
+    private var sessionCookie: String { activeAccount?.cookie ?? "" }
     private weak var delegate: AppDelegate?
     private var lastNotifiedThreshold: Int = 0
 
     init(statusItem: NSStatusItem?, delegate: AppDelegate? = nil) {
         self.statusItem = statusItem
         self.delegate = delegate
-        loadSessionCookie()
+        loadAccounts()
         loadSettings()
+        loadNotifiedThreshold()
         checkAccessibilityStatus()
     }
 
@@ -429,10 +474,173 @@ class UsageManager: ObservableObject {
         isAccessibilityEnabled = AXIsProcessTrusted()
     }
 
-    func loadSessionCookie() {
-        if let savedCookie = UserDefaults.standard.string(forKey: "claude_session_cookie") {
-            sessionCookie = savedCookie
+    // MARK: - Account store
+
+    private let accountsKey = "accounts_v2"
+    private let activeAccountKey = "active_account_id"
+
+    func loadAccounts() {
+        if let data = UserDefaults.standard.data(forKey: accountsKey),
+           let decoded = try? JSONDecoder().decode([Account].self, from: data) {
+            accounts = decoded
         }
+        activeAccountId = UserDefaults.standard.string(forKey: activeAccountKey)
+
+        // Migrate the legacy single-cookie storage (pre multi-account) into the
+        // first account so existing users keep working with no re-setup.
+        if accounts.isEmpty,
+           let legacy = UserDefaults.standard.string(forKey: "claude_session_cookie"),
+           !legacy.isEmpty {
+            let acct = Account(id: UUID().uuidString, name: "Account 1", cookie: legacy)
+            accounts = [acct]
+            activeAccountId = acct.id
+            persistAccounts()
+            fetchAccountLabelIfNeeded(for: acct.id)
+        }
+
+        // Ensure the active id always points at a real account.
+        if activeAccountId == nil || !accounts.contains(where: { $0.id == activeAccountId }) {
+            activeAccountId = accounts.first?.id
+        }
+    }
+
+    func persistAccounts() {
+        if let data = try? JSONEncoder().encode(accounts) {
+            UserDefaults.standard.set(data, forKey: accountsKey)
+        }
+        UserDefaults.standard.set(activeAccountId, forKey: activeAccountKey)
+        // Keep the legacy key mirrored to the active cookie so a downgrade to an
+        // older build still finds a usable session cookie.
+        UserDefaults.standard.set(activeAccount?.cookie ?? "", forKey: "claude_session_cookie")
+        UserDefaults.standard.synchronize()
+    }
+
+    // Add a new account from a pasted cookie, make it active, and fetch.
+    @discardableResult
+    func addAccount(cookie: String, name: String? = nil) -> Account {
+        let trimmedCookie = cookie.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedName = (name ?? "").trimmingCharacters(in: .whitespaces)
+        let acct = Account(
+            id: UUID().uuidString,
+            name: trimmedName.isEmpty ? "Account \(accounts.count + 1)" : trimmedName,
+            cookie: trimmedCookie
+        )
+        accounts.append(acct)
+        activeAccountId = acct.id
+        persistAccounts()
+        resetUsageData()
+        lastNotifiedThreshold = 0
+        UserDefaults.standard.set(0, forKey: thresholdKey(for: acct.id))
+        fetchUsage()
+        // Best-effort: auto-name from the account's email when left as a default.
+        if trimmedName.isEmpty { fetchAccountLabelIfNeeded(for: acct.id) }
+        return acct
+    }
+
+    func switchAccount(_ id: String) {
+        guard id != activeAccountId, accounts.contains(where: { $0.id == id }) else { return }
+        activeAccountId = id
+        persistAccounts()
+        resetUsageData()
+        loadNotifiedThreshold()
+        fetchUsage()
+    }
+
+    // Allows an empty value while the user is mid-edit; a name is only committed
+    // for display once non-empty (see `displayName`).
+    func setAccountName(_ id: String, _ name: String) {
+        guard let idx = accounts.firstIndex(where: { $0.id == id }) else { return }
+        accounts[idx].name = name
+        persistAccounts()
+    }
+
+    func removeAccount(_ id: String) {
+        accounts.removeAll { $0.id == id }
+        UserDefaults.standard.removeObject(forKey: thresholdKey(for: id))
+        if activeAccountId == id {
+            activeAccountId = accounts.first?.id
+            resetUsageData()
+            loadNotifiedThreshold()
+        }
+        persistAccounts()
+        if activeAccountId != nil {
+            fetchUsage()
+        } else {
+            delegate?.updateStatusIcon(percentage: 0)
+        }
+    }
+
+    func displayName(for account: Account) -> String {
+        let trimmed = account.name.trimmingCharacters(in: .whitespaces)
+        return trimmed.isEmpty ? "Untitled account" : trimmed
+    }
+
+    // Fetch the account's email/full name from bootstrap to auto-label it,
+    // but never clobber a name the user has customised.
+    func fetchAccountLabelIfNeeded(for id: String) {
+        guard let acct = accounts.first(where: { $0.id == id }),
+              acct.name.hasPrefix("Account ") else { return }
+        let cookie = acct.cookie
+        guard let url = URL(string: "https://claude.ai/api/bootstrap") else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue(cookie, forHTTPHeaderField: "Cookie")
+        request.setValue("*/*", forHTTPHeaderField: "Accept")
+        request.setValue("https://claude.ai", forHTTPHeaderField: "Referer")
+        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
+            guard let self = self, let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let account = json["account"] as? [String: Any] else { return }
+            let label = (account["email_address"] as? String) ?? (account["full_name"] as? String)
+            guard let label = label, !label.isEmpty else { return }
+            DispatchQueue.main.async {
+                guard let idx = self.accounts.firstIndex(where: { $0.id == id }),
+                      self.accounts[idx].name.hasPrefix("Account ") else { return }
+                self.accounts[idx].name = label
+                self.persistAccounts()
+            }
+        }.resume()
+    }
+
+    // MARK: - Per-account notification threshold
+
+    private func thresholdKey(for id: String?) -> String {
+        "last_notified_threshold_" + (id ?? "none")
+    }
+
+    func loadNotifiedThreshold() {
+        let key = thresholdKey(for: activeAccountId)
+        // One-time migration of the old global threshold onto the active account.
+        if UserDefaults.standard.object(forKey: key) == nil,
+           UserDefaults.standard.object(forKey: "last_notified_threshold") != nil {
+            lastNotifiedThreshold = UserDefaults.standard.integer(forKey: "last_notified_threshold")
+        } else {
+            lastNotifiedThreshold = UserDefaults.standard.integer(forKey: key)
+        }
+    }
+
+    // Clears all displayed usage figures (used on account switch/removal).
+    func resetUsageData() {
+        sessionUsage = 0
+        weeklyUsage = 0
+        weeklySonnetUsage = 0
+        weeklyFableUsage = 0
+        sessionResetsAt = nil
+        weeklyResetsAt = nil
+        weeklySonnetResetsAt = nil
+        weeklyFableResetsAt = nil
+        extraSpentMinor = 0
+        extraLimitMinor = 0
+        extraResetsAt = nil
+        freeCreditsMinor = 0
+        hasCreditUsage = false
+        hasFetchedData = false
+        hasWeeklySonnet = false
+        hasWeeklyFable = false
+        errorMessage = nil
+        delegate?.updateStatusIcon(percentage: 0)
     }
 
     func loadSettings() {
@@ -465,7 +673,6 @@ class UsageManager: ObservableObject {
         } else {
             openAtLogin = UserDefaults.standard.bool(forKey: "open_at_login")
         }
-        lastNotifiedThreshold = UserDefaults.standard.integer(forKey: "last_notified_threshold")
         // Default shortcut to enabled if not previously set
         if UserDefaults.standard.object(forKey: "shortcut_enabled") == nil {
             shortcutEnabled = true
@@ -499,47 +706,6 @@ class UsageManager: ObservableObject {
         } catch {
             NSLog("❌ Login item error: \(error.localizedDescription)")
         }
-    }
-
-    func saveSessionCookie(_ cookie: String) {
-        NSLog("ClaudeUsage: Saving cookie, length: \(cookie.count)")
-        sessionCookie = cookie
-        UserDefaults.standard.set(cookie, forKey: "claude_session_cookie")
-        UserDefaults.standard.synchronize()
-        NSLog("ClaudeUsage: Cookie saved successfully")
-    }
-
-    func clearSessionCookie() {
-        NSLog("ClaudeUsage: Clearing cookie")
-        sessionCookie = ""
-        UserDefaults.standard.removeObject(forKey: "claude_session_cookie")
-        UserDefaults.standard.synchronize()
-
-        // Reset all data
-        sessionUsage = 0
-        weeklyUsage = 0
-        weeklySonnetUsage = 0
-        weeklyFableUsage = 0
-        sessionResetsAt = nil
-        weeklyResetsAt = nil
-        weeklySonnetResetsAt = nil
-        weeklyFableResetsAt = nil
-        extraSpentMinor = 0
-        extraLimitMinor = 0
-        extraResetsAt = nil
-        freeCreditsMinor = 0
-        hasCreditUsage = false
-        hasFetchedData = false
-        hasWeeklySonnet = false
-        hasWeeklyFable = false
-        errorMessage = nil
-        lastNotifiedThreshold = 0
-        UserDefaults.standard.set(0, forKey: "last_notified_threshold")
-
-        // Update status bar to show 0%
-        delegate?.updateStatusIcon(percentage: 0)
-
-        NSLog("ClaudeUsage: Cookie cleared, data reset")
     }
 
     func fetchOrganizationId(completion: @escaping (String?) -> Void) {
@@ -880,8 +1046,8 @@ class UsageManager: ObservableObject {
                 NSLog("📬 Sending notification for \(threshold)% threshold")
                 sendNotification(percentage: percentage, threshold: threshold)
                 lastNotifiedThreshold = threshold
-                // Persist the threshold
-                UserDefaults.standard.set(lastNotifiedThreshold, forKey: "last_notified_threshold")
+                // Persist the threshold (per active account)
+                UserDefaults.standard.set(lastNotifiedThreshold, forKey: thresholdKey(for: activeAccountId))
                 UserDefaults.standard.synchronize()
             }
         }
@@ -891,7 +1057,7 @@ class UsageManager: ObservableObject {
             let newThreshold = thresholds.filter { $0 <= percentage }.last ?? 0
             NSLog("🔄 Resetting notification threshold from \(lastNotifiedThreshold)% to \(newThreshold)%")
             lastNotifiedThreshold = newThreshold
-            UserDefaults.standard.set(lastNotifiedThreshold, forKey: "last_notified_threshold")
+            UserDefaults.standard.set(lastNotifiedThreshold, forKey: thresholdKey(for: activeAccountId))
             UserDefaults.standard.synchronize()
         }
     }
@@ -1488,7 +1654,9 @@ struct UsageView: View {
     @ObservedObject var statusManager: StatusManager
     @ObservedObject var updateManager: UpdateManager
     @State private var sessionCookieInput: String = ""
+    @State private var newAccountName: String = ""
     @State private var showingCookieInput: Bool = false
+    @State private var showingAddAccount: Bool = false
     @State private var showingSettings: Bool = false
     @State private var showingStatusDetails: Bool = false
     @State private var measuredHeight: CGFloat = 250
@@ -1524,9 +1692,6 @@ struct UsageView: View {
                 measuredHeight = value
             }
             .onAppear {
-                if let savedCookie = UserDefaults.standard.string(forKey: "claude_session_cookie") {
-                    sessionCookieInput = String(savedCookie.prefix(20)) + "..."
-                }
                 usageManager.updatePercentages()
             }
             .onChange(of: showingSettings) { isOpen in
@@ -1543,9 +1708,16 @@ struct UsageView: View {
 
     var content: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("Claude Usage")
-                .font(.headline)
-                .padding(.bottom, 4)
+            HStack(spacing: 8) {
+                Text("Claude Usage")
+                    .font(.headline)
+                Spacer()
+                // Account switcher — only meaningful with more than one account.
+                if usageManager.accounts.count > 1 {
+                    accountSwitcher
+                }
+            }
+            .padding(.bottom, 4)
 
             // Free-form message banner (author-controlled). Takes priority over
             // the version-update banner when both are present.
@@ -1962,78 +2134,20 @@ struct UsageView: View {
             }
             }
 
-            Button(showingCookieInput ? "Hide Cookie" : "Set Session Cookie") {
+            Button(showingCookieInput
+                   ? "Hide Accounts"
+                   : (usageManager.accounts.isEmpty ? "Set Session Cookie" : "Manage Accounts")) {
                 showingCookieInput.toggle()
+                // When there are no accounts yet, jump straight to the add form.
+                if showingCookieInput && usageManager.accounts.isEmpty {
+                    showingAddAccount = true
+                }
             }
             .buttonStyle(.borderless)
             .font(.caption)
 
             if showingCookieInput {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Text("How to get your session cookie:")
-                            .font(.caption)
-                            .fontWeight(.semibold)
-                        Spacer()
-                        Button(action: {
-                            NSWorkspace.shared.open(URL(string: "https://github.com/Artzainnn/ClaudeUsageBar/blob/main/setup-guide.png")!)
-                        }) {
-                            Text("View tutorial →")
-                                .font(.caption2)
-                                .foregroundColor(.blue)
-                        }
-                        .buttonStyle(.borderless)
-                    }
-
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("1. Go to Settings > Usage on claude.ai")
-                        Text("2. Press F12 (or Cmd+Option+I)")
-                        Text("3. Go to Network tab")
-                        Text("4. Refresh page, click 'usage' request")
-                        Text("5. Find 'Cookie' in Request Headers")
-                        Text("6. Copy full cookie value\n   (starts with anthropic-device-id=...)")
-                    }
-                    .font(.caption2)
-                    .foregroundColor(Color.secondaryText)
-
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Paste full cookie string:")
-                            .font(.caption2)
-                            .foregroundColor(Color.secondaryText)
-                        VStack(spacing: 4) {
-                            PasteableTextField(text: $sessionCookieInput, placeholder: "Paste cookie here...")
-                                .frame(height: 60)
-                                .cornerRadius(4)
-
-                            HStack(spacing: 8) {
-                                Button("Save Cookie & Fetch") {
-                                    NSLog("ClaudeUsage: Save clicked, input length: \(sessionCookieInput.count)")
-                                    if sessionCookieInput.isEmpty {
-                                        usageManager.errorMessage = "Cookie field is empty!"
-                                    } else {
-                                        usageManager.saveSessionCookie(sessionCookieInput)
-                                        usageManager.fetchUsage()
-                                        usageManager.errorMessage = "Cookie saved, fetching..."
-                                    }
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .controlSize(.small)
-
-                                if usageManager.hasFetchedData {
-                                    Button("Clear Cookie") {
-                                        sessionCookieInput = ""
-                                        usageManager.clearSessionCookie()
-                                    }
-                                    .buttonStyle(.bordered)
-                                    .controlSize(.small)
-                                }
-                            }
-                        }
-                    }
-                }
-                .padding(8)
-                .background(Color.secondary.opacity(0.1))
-                .cornerRadius(6)
+                accountsPanel
             }
 
             // Support Section
@@ -2211,6 +2325,191 @@ struct UsageView: View {
                 Color.clear
                     .frame(height: 1)
                     .id("settings-anchor")
+            }
+        }
+    }
+
+    // MARK: - Accounts UI
+
+    var activeAccountLabel: String {
+        if let a = usageManager.activeAccount { return usageManager.displayName(for: a) }
+        return "No account"
+    }
+
+    // Compact dropdown in the header for switching between accounts.
+    var accountSwitcher: some View {
+        Menu {
+            ForEach(usageManager.accounts) { acct in
+                Button {
+                    usageManager.switchAccount(acct.id)
+                } label: {
+                    if acct.id == usageManager.activeAccountId {
+                        Label(usageManager.displayName(for: acct), systemImage: "checkmark")
+                    } else {
+                        Text(usageManager.displayName(for: acct))
+                    }
+                }
+            }
+            Divider()
+            Button("Add Account…") {
+                showingCookieInput = true
+                showingAddAccount = true
+                sessionCookieInput = ""
+                newAccountName = ""
+            }
+        } label: {
+            HStack(spacing: 3) {
+                Image(systemName: "person.crop.circle")
+                    .font(.system(size: 10))
+                Text(activeAccountLabel)
+                    .font(.caption)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.system(size: 8))
+            }
+        }
+        .menuStyle(.borderlessButton)
+        .frame(maxWidth: 170, alignment: .trailing)
+    }
+
+    // The full accounts management panel shown under "Manage Accounts".
+    var accountsPanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if !usageManager.accounts.isEmpty {
+                Text("Accounts")
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                ForEach(usageManager.accounts) { acct in
+                    HStack(spacing: 6) {
+                        Button(action: { usageManager.switchAccount(acct.id) }) {
+                            Image(systemName: acct.id == usageManager.activeAccountId
+                                  ? "largecircle.fill.circle" : "circle")
+                                .foregroundColor(acct.id == usageManager.activeAccountId
+                                                 ? .accentColor : Color.secondaryText)
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Switch to this account")
+
+                        TextField("Account name", text: Binding(
+                            get: { usageManager.accounts.first(where: { $0.id == acct.id })?.name ?? "" },
+                            set: { usageManager.setAccountName(acct.id, $0) }
+                        ))
+                        .textFieldStyle(.roundedBorder)
+                        .font(.caption)
+
+                        Button(action: { usageManager.removeAccount(acct.id) }) {
+                            Image(systemName: "trash")
+                                .foregroundColor(.red)
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Remove account")
+                    }
+                }
+                Divider()
+            }
+
+            // Add-account form: always shown when there are no accounts yet,
+            // otherwise revealed by the "Add another account" button.
+            if usageManager.accounts.isEmpty || showingAddAccount {
+                addAccountForm
+            } else {
+                Button(action: {
+                    showingAddAccount = true
+                    sessionCookieInput = ""
+                    newAccountName = ""
+                }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "plus.circle")
+                        Text("Add another account")
+                    }
+                    .font(.caption)
+                }
+                .buttonStyle(.borderless)
+            }
+        }
+        .padding(8)
+        .background(Color.secondary.opacity(0.1))
+        .cornerRadius(6)
+    }
+
+    var addAccountForm: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(usageManager.accounts.isEmpty ? "How to get your session cookie:" : "Add an account")
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                Spacer()
+                Button(action: {
+                    NSWorkspace.shared.open(URL(string: "https://github.com/Artzainnn/ClaudeUsageBar/blob/main/setup-guide.png")!)
+                }) {
+                    Text("View tutorial →")
+                        .font(.caption2)
+                        .foregroundColor(.blue)
+                }
+                .buttonStyle(.borderless)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("1. Go to Settings > Usage on claude.ai")
+                Text("2. Press F12 (or Cmd+Option+I)")
+                Text("3. Go to Network tab")
+                Text("4. Refresh page, click 'usage' request")
+                Text("5. Find 'Cookie' in Request Headers")
+                Text("6. Copy full cookie value\n   (starts with anthropic-device-id=...)")
+            }
+            .font(.caption2)
+            .foregroundColor(Color.secondaryText)
+
+            Text("Tip: sign in to each account in a separate browser or private window so their cookies don't overwrite each other.")
+                .font(.caption2)
+                .foregroundColor(Color.secondaryText)
+                .opacity(0.8)
+                .fixedSize(horizontal: false, vertical: true)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Account name (optional):")
+                    .font(.caption2)
+                    .foregroundColor(Color.secondaryText)
+                TextField("e.g. Work, Personal…", text: $newAccountName)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+
+                Text("Paste full cookie string:")
+                    .font(.caption2)
+                    .foregroundColor(Color.secondaryText)
+                    .padding(.top, 2)
+                PasteableTextField(text: $sessionCookieInput, placeholder: "Paste cookie here...")
+                    .frame(height: 60)
+                    .cornerRadius(4)
+
+                HStack(spacing: 8) {
+                    Button(usageManager.accounts.isEmpty ? "Save Cookie & Fetch" : "Add Account & Fetch") {
+                        let cookie = sessionCookieInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                        NSLog("ClaudeUsage: Add account, cookie length: \(cookie.count)")
+                        if cookie.isEmpty {
+                            usageManager.errorMessage = "Cookie field is empty!"
+                        } else {
+                            usageManager.addAccount(cookie: cookie, name: newAccountName)
+                            usageManager.errorMessage = "Account added, fetching..."
+                            sessionCookieInput = ""
+                            newAccountName = ""
+                            showingAddAccount = false
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+
+                    if !usageManager.accounts.isEmpty {
+                        Button("Cancel") {
+                            sessionCookieInput = ""
+                            newAccountName = ""
+                            showingAddAccount = false
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+                }
             }
         }
     }
