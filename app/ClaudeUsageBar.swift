@@ -14,11 +14,24 @@ extension Color {
     })
 }
 
+// Where usage "should" sit right now, given how far into the reset window we
+// are. Built by the view layer from a Pace; the two fields travel together so a
+// tick can never be drawn without the tooltip explaining it.
+struct PaceMarker {
+    let expected: Double   // 0...1
+    let tooltip: String
+}
+
 // Deterministic usage bar: the native linear ProgressView ignores .tint() in
 // light (aqua) and vibrant rendering and falls back to accent blue.
 struct UsageBar: View {
     let value: Double
     let color: Color
+    var pace: PaceMarker? = nil
+
+    @State private var isHovering = false
+
+    private let tickWidth: CGFloat = 1.5
 
     var body: some View {
         GeometryReader { geo in
@@ -27,9 +40,65 @@ struct UsageBar: View {
                 Capsule()
                     .fill(color)
                     .frame(width: max(0, min(1, value)) * geo.size.width)
+                // Pace tick. Neutral rather than coloured so it stays legible over
+                // both the saturated fill and the faint track, in either
+                // appearance, without competing with the green/orange/red.
+                if let pace = pace {
+                    Rectangle()
+                        .fill(Color.primary.opacity(0.7))
+                        .frame(width: tickWidth)
+                        .offset(x: max(0, min(1, pace.expected)) * geo.size.width - tickWidth / 2)
+                }
+            }
+            // Trims a tick near either end against the rounded cap instead of
+            // letting it poke out past the bar.
+            .clipShape(Capsule())
+            // Drawn after the clip so the bubble isn't trimmed to the capsule, and
+            // anchored to the bar's leading edge rather than centred on the tick:
+            // the popup is only 360pt wide, so a bubble that tracks the tick runs
+            // off the right-hand side.
+            .overlay(alignment: .topLeading) {
+                if let pace = pace, isHovering {
+                    PaceTooltip(text: pace.tooltip)
+                        .offset(y: -24)
+                }
             }
         }
         .frame(height: 6)
+        // Hover, not .help(): the popover is never the key window (nothing calls
+        // NSApp.activate) and AppKit tooltips don't fire in an inactive one — the
+        // same reason PasteableNSTextView implements Cmd-V by hand. Tracked on the
+        // whole bar, since a 1.5pt tick is nothing to aim at.
+        .onHover { isHovering = $0 }
+    }
+}
+
+// Tooltip bubble for the pace marker.
+//
+// Solid backing rather than a material: over the popover's own translucent
+// backing a material reads as muddy. Sized to its text, which is safe because
+// the string is bounded — at its longest, "On pace: 100% by now · 6d 23h in"
+// still sits comfortably inside the bar.
+struct PaceTooltip: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.caption2)
+            .foregroundColor(Color.primary)
+            .fixedSize()
+            .padding(.horizontal, 7)
+            .padding(.vertical, 4)
+            .background(
+                RoundedRectangle(cornerRadius: 5)
+                    .fill(Color(nsColor: .controlBackgroundColor))
+                    .shadow(color: .black.opacity(0.28), radius: 3, y: 1)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 5)
+                    .stroke(Color.primary.opacity(0.12), lineWidth: 0.5)
+            )
+            .allowsHitTesting(false)
     }
 }
 
@@ -411,6 +480,7 @@ class UsageManager: ObservableObject {
     @Published var hasFetchedData: Bool = false
     @Published var isAccessibilityEnabled: Bool = false
     @Published var shortcutEnabled: Bool = true
+    @Published var paceMarkerEnabled: Bool = false
 
     private var statusItem: NSStatusItem?
     private var sessionCookie: String = ""
@@ -472,6 +542,9 @@ class UsageManager: ObservableObject {
         } else {
             shortcutEnabled = UserDefaults.standard.bool(forKey: "shortcut_enabled")
         }
+        // Off unless switched on: an upgrade shouldn't change how the bars look
+        // without being asked. bool(forKey:) already returns false when unset.
+        paceMarkerEnabled = UserDefaults.standard.bool(forKey: "pace_marker_enabled")
     }
 
     func saveSettings() {
@@ -479,6 +552,7 @@ class UsageManager: ObservableObject {
         UserDefaults.standard.set(statusNotificationsEnabled, forKey: "status_notifications_enabled")
         UserDefaults.standard.set(openAtLogin, forKey: "open_at_login")
         UserDefaults.standard.set(shortcutEnabled, forKey: "shortcut_enabled")
+        UserDefaults.standard.set(paceMarkerEnabled, forKey: "pace_marker_enabled")
         UserDefaults.standard.synchronize()
     }
 
@@ -928,6 +1002,36 @@ class UsageManager: ObservableObject {
         weeklyPercentage = Double(weeklyUsage) / Double(weeklyLimit)
         weeklySonnetPercentage = Double(weeklySonnetUsage) / Double(weeklySonnetLimit)
         weeklyFablePercentage = Double(weeklyFableUsage) / Double(weeklyFableLimit)
+    }
+}
+
+// MARK: - Pace
+
+// Fixed window lengths per limit type. Flat seconds, not calendar units:
+// resets_at is an absolute server timestamp, so subtracting 7*24h stays correct
+// across a DST boundary where a calendar "7 days" would land an hour off.
+enum PaceWindow {
+    static let session: TimeInterval = 5 * 3600
+    static let weekly: TimeInterval = 7 * 24 * 3600
+}
+
+struct Pace {
+    let expected: Double      // 0...1 — where the fill "should" be by now
+    let elapsed: TimeInterval
+
+    // The API reports only resets_at, never the window start — but since the
+    // window length is fixed by limit type, the start is derived exactly rather
+    // than estimated.
+    //
+    // Fails whenever there's nothing honest to draw: no data yet, the reset is
+    // already due (stale fetch — a marker pinned at 100% would assert something
+    // false), or the clock sits before the window even opened.
+    init?(resetsAt: Date?, window: TimeInterval, now: Date = Date()) {
+        guard let resetsAt = resetsAt, window > 0, now < resetsAt else { return nil }
+        let elapsed = now.timeIntervalSince(resetsAt.addingTimeInterval(-window))
+        guard elapsed >= 0 else { return nil }
+        self.expected = min(1, max(0, elapsed / window))
+        self.elapsed = elapsed
     }
 }
 
@@ -1654,7 +1758,8 @@ struct UsageView: View {
                 }
 
                 UsageBar(value: usageManager.sessionPercentage,
-                         color: colorForPercentage(usageManager.sessionPercentage))
+                         color: colorForPercentage(usageManager.sessionPercentage),
+                         pace: paceMarker(resetsAt: usageManager.sessionResetsAt, window: PaceWindow.session))
 
                 Text("\(Int(usageManager.sessionPercentage * 100))% used")
                     .font(.caption)
@@ -1675,7 +1780,8 @@ struct UsageView: View {
                 }
 
                 UsageBar(value: usageManager.weeklyPercentage,
-                         color: colorForPercentage(usageManager.weeklyPercentage))
+                         color: colorForPercentage(usageManager.weeklyPercentage),
+                         pace: paceMarker(resetsAt: usageManager.weeklyResetsAt, window: PaceWindow.weekly))
 
                 Text("\(Int(usageManager.weeklyPercentage * 100))% used")
                     .font(.caption)
@@ -1697,7 +1803,8 @@ struct UsageView: View {
                     }
 
                     UsageBar(value: usageManager.weeklySonnetPercentage,
-                             color: colorForPercentage(usageManager.weeklySonnetPercentage))
+                             color: colorForPercentage(usageManager.weeklySonnetPercentage),
+                             pace: paceMarker(resetsAt: usageManager.weeklySonnetResetsAt, window: PaceWindow.weekly))
 
                     Text("\(Int(usageManager.weeklySonnetPercentage * 100))% used")
                         .font(.caption)
@@ -1721,7 +1828,8 @@ struct UsageView: View {
                     }
 
                     UsageBar(value: usageManager.weeklyFablePercentage,
-                             color: colorForPercentage(usageManager.weeklyFablePercentage))
+                             color: colorForPercentage(usageManager.weeklyFablePercentage),
+                             pace: paceMarker(resetsAt: usageManager.weeklyFableResetsAt, window: PaceWindow.weekly))
 
                     Text("\(Int(usageManager.weeklyFablePercentage * 100))% used")
                         .font(.caption)
@@ -2182,6 +2290,26 @@ struct UsageView: View {
 
                     Divider()
 
+                    Toggle(isOn: Binding(
+                        get: { usageManager.paceMarkerEnabled },
+                        set: { newValue in
+                            usageManager.paceMarkerEnabled = newValue
+                            usageManager.saveSettings()
+                        }
+                    )) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Show Pace Marker")
+                                .font(.caption)
+                            Text("Mark where usage should be by now, based on how far into the reset window you are")
+                                .font(.caption2)
+                                .foregroundColor(Color.secondaryText)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .toggleStyle(.checkbox)
+
+                    Divider()
+
                     // Appearance sits last on purpose: opening Settings auto-scrolls
                     // to the anchor below, so this lands in view.
                     VStack(alignment: .leading, spacing: 4) {
@@ -2239,6 +2367,31 @@ struct UsageView: View {
             formatter.dateStyle = .none
             return "at \(formatter.string(from: date))"
         }
+    }
+
+    // nil whenever no honest marker can be drawn: the setting is off, or the
+    // window data can't support one (see Pace.init).
+    //
+    // The row label already names the window ("Weekly (7 day)"), so the tooltip
+    // doesn't repeat it — a longer string overflows the 360pt popup.
+    func paceMarker(resetsAt: Date?, window: TimeInterval) -> PaceMarker? {
+        guard usageManager.paceMarkerEnabled,
+              let pace = Pace(resetsAt: resetsAt, window: window) else { return nil }
+        let percent = Int((pace.expected * 100).rounded())
+        return PaceMarker(
+            expected: pace.expected,
+            tooltip: "On pace: \(percent)% by now · \(formatElapsed(pace.elapsed)) in"
+        )
+    }
+
+    func formatElapsed(_ interval: TimeInterval) -> String {
+        let totalMinutes = max(0, Int(interval / 60))
+        let days = totalMinutes / 1440
+        let hours = (totalMinutes % 1440) / 60
+        let minutes = totalMinutes % 60
+        if days > 0 { return "\(days)d \(hours)h" }
+        if hours > 0 { return "\(hours)h \(minutes)m" }
+        return "\(minutes)m"
     }
 
     func colorForPercentage(_ percentage: Double) -> Color {
