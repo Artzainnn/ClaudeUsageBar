@@ -412,6 +412,8 @@ class UsageManager: ObservableObject {
     @Published var isAccessibilityEnabled: Bool = false
     @Published var shortcutEnabled: Bool = true
 
+    @Published var organizationId: String = ""
+
     private var statusItem: NSStatusItem?
     private var sessionCookie: String = ""
     private weak var delegate: AppDelegate?
@@ -421,6 +423,7 @@ class UsageManager: ObservableObject {
         self.statusItem = statusItem
         self.delegate = delegate
         loadSessionCookie()
+        loadOrganizationId()
         loadSettings()
         checkAccessibilityStatus()
     }
@@ -433,6 +436,22 @@ class UsageManager: ObservableObject {
         if let savedCookie = UserDefaults.standard.string(forKey: "claude_session_cookie") {
             sessionCookie = savedCookie
         }
+    }
+
+    func loadOrganizationId() {
+        organizationId = UserDefaults.standard.string(forKey: "claude_org_id") ?? ""
+    }
+
+    func saveOrganizationId(_ orgId: String) {
+        let trimmed = orgId.trimmingCharacters(in: .whitespacesAndNewlines)
+        organizationId = trimmed
+        if trimmed.isEmpty {
+            UserDefaults.standard.removeObject(forKey: "claude_org_id")
+        } else {
+            UserDefaults.standard.set(trimmed, forKey: "claude_org_id")
+        }
+        UserDefaults.standard.synchronize()
+        NSLog("ClaudeUsage: Org ID \(trimmed.isEmpty ? "cleared" : "saved (\(trimmed))")")
     }
 
     func loadSettings() {
@@ -510,9 +529,11 @@ class UsageManager: ObservableObject {
     }
 
     func clearSessionCookie() {
-        NSLog("ClaudeUsage: Clearing cookie")
+        NSLog("ClaudeUsage: Clearing cookie + org ID")
         sessionCookie = ""
+        organizationId = ""
         UserDefaults.standard.removeObject(forKey: "claude_session_cookie")
+        UserDefaults.standard.removeObject(forKey: "claude_org_id")
         UserDefaults.standard.synchronize()
 
         // Reset all data
@@ -593,16 +614,23 @@ class UsageManager: ObservableObject {
         isLoading = true
         errorMessage = nil
 
-        // Extract org ID from cookie
+        // Manual override (from UI) wins; otherwise fall back to auto-detect.
+        let manualOrgId = organizationId.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !manualOrgId.isEmpty {
+            NSLog("📋 Using manually-set org ID: \(manualOrgId)")
+            fetchUsageWithOrgId(manualOrgId)
+            return
+        }
+
+        NSLog("📋 No manual org ID — attempting auto-detect")
         fetchOrganizationId { [weak self] orgId in
             guard let self = self, let orgId = orgId else {
                 DispatchQueue.main.async {
-                    self?.errorMessage = "Could not get org ID from cookie"
+                    self?.errorMessage = "Could not auto-detect org ID — set it manually in the cookie panel"
                     self?.isLoading = false
                 }
                 return
             }
-
             self.fetchUsageWithOrgId(orgId)
             self.fetchExtraUsage(orgId)
             self.fetchFreeCredits(orgId)
@@ -1348,6 +1376,12 @@ class CustomTextField: NSTextField {
     var onTextChange: ((String) -> Void)?
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        // Only handle shortcuts when THIS field is being edited; otherwise the
+        // event must continue down the responder chain so other focused fields
+        // (e.g. the cookie text view) can handle it themselves.
+        guard self.currentEditor() != nil else {
+            return super.performKeyEquivalent(with: event)
+        }
         if event.type == .keyDown {
             if (event.modifierFlags.contains(.command)) {
                 switch event.charactersIgnoringModifiers {
@@ -1388,6 +1422,10 @@ class CustomTextField: NSTextField {
 // Custom TextView that ensures keyboard commands work
 class PasteableNSTextView: NSTextView {
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        // Only handle shortcuts when this text view is the first responder.
+        guard self.window?.firstResponder === self else {
+            return super.performKeyEquivalent(with: event)
+        }
         if event.modifierFlags.contains(.command) {
             switch event.charactersIgnoringModifiers {
             case "v": // Paste
@@ -1476,6 +1514,55 @@ struct PasteableTextField: NSViewRepresentable {
     }
 }
 
+// Single-line text field with proper Cmd+V/C/X/A support.
+// Stock SwiftUI TextField doesn't get these in LSUIElement apps because
+// there's no main menu Edit > Paste item to bind the shortcut to.
+struct PasteableSingleLineTextField: NSViewRepresentable {
+    @Binding var text: String
+    var placeholder: String
+
+    func makeNSView(context: Context) -> CustomTextField {
+        let field = CustomTextField()
+        field.placeholderString = placeholder
+        field.isBordered = true
+        field.bezelStyle = .roundedBezel
+        field.isEditable = true
+        field.isSelectable = true
+        field.usesSingleLineMode = true
+        field.cell?.wraps = false
+        field.cell?.isScrollable = true
+        field.font = NSFont.systemFont(ofSize: 11)
+        field.delegate = context.coordinator
+        field.onTextChange = { newValue in
+            // Drive the SwiftUI binding when paste handler mutates stringValue directly
+            context.coordinator.pushToBinding(newValue)
+        }
+        return field
+    }
+
+    func updateNSView(_ nsView: CustomTextField, context: Context) {
+        if nsView.stringValue != text {
+            nsView.stringValue = text
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    class Coordinator: NSObject, NSTextFieldDelegate {
+        var parent: PasteableSingleLineTextField
+        init(_ parent: PasteableSingleLineTextField) { self.parent = parent }
+
+        func controlTextDidChange(_ notification: Notification) {
+            guard let field = notification.object as? NSTextField else { return }
+            parent.text = field.stringValue
+        }
+
+        func pushToBinding(_ value: String) {
+            DispatchQueue.main.async { self.parent.text = value }
+        }
+    }
+}
+
 private struct ContentHeightKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
@@ -1488,6 +1575,7 @@ struct UsageView: View {
     @ObservedObject var statusManager: StatusManager
     @ObservedObject var updateManager: UpdateManager
     @State private var sessionCookieInput: String = ""
+    @State private var orgIdInput: String = ""
     @State private var showingCookieInput: Bool = false
     @State private var showingSettings: Bool = false
     @State private var showingStatusDetails: Bool = false
@@ -1527,6 +1615,7 @@ struct UsageView: View {
                 if let savedCookie = UserDefaults.standard.string(forKey: "claude_session_cookie") {
                     sessionCookieInput = String(savedCookie.prefix(20)) + "..."
                 }
+                orgIdInput = usageManager.organizationId
                 usageManager.updatePercentages()
             }
             .onChange(of: showingSettings) { isOpen in
@@ -1992,9 +2081,18 @@ struct UsageView: View {
                         Text("4. Refresh page, click 'usage' request")
                         Text("5. Find 'Cookie' in Request Headers")
                         Text("6. Copy full cookie value\n   (starts with anthropic-device-id=...)")
+                        Text("7. Org ID is auto-detected; override below only if\n   auto-detect fails (UUID in /organizations/<id>/usage)")
                     }
                     .font(.caption2)
                     .foregroundColor(Color.secondaryText)
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Organization ID (optional — leave blank to auto-detect):")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                        PasteableSingleLineTextField(text: $orgIdInput, placeholder: "e.g. 1a2b3c4d-5e6f-7890-abcd-ef1234567890")
+                            .frame(height: 22)
+                    }
 
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Paste full cookie string:")
@@ -2006,22 +2104,27 @@ struct UsageView: View {
                                 .cornerRadius(4)
 
                             HStack(spacing: 8) {
-                                Button("Save Cookie & Fetch") {
-                                    NSLog("ClaudeUsage: Save clicked, input length: \(sessionCookieInput.count)")
+                                Button("Save & Fetch") {
+                                    NSLog("ClaudeUsage: Save clicked, cookie length: \(sessionCookieInput.count), orgId length: \(orgIdInput.count)")
+                                    let trimmedOrg = orgIdInput.trimmingCharacters(in: .whitespacesAndNewlines)
                                     if sessionCookieInput.isEmpty {
                                         usageManager.errorMessage = "Cookie field is empty!"
                                     } else {
                                         usageManager.saveSessionCookie(sessionCookieInput)
+                                        usageManager.saveOrganizationId(trimmedOrg) // empty = auto-detect
                                         usageManager.fetchUsage()
-                                        usageManager.errorMessage = "Cookie saved, fetching..."
+                                        usageManager.errorMessage = trimmedOrg.isEmpty
+                                            ? "Saved, auto-detecting org ID..."
+                                            : "Saved, fetching..."
                                     }
                                 }
                                 .buttonStyle(.borderedProminent)
                                 .controlSize(.small)
 
                                 if usageManager.hasFetchedData {
-                                    Button("Clear Cookie") {
+                                    Button("Clear") {
                                         sessionCookieInput = ""
+                                        orgIdInput = ""
                                         usageManager.clearSessionCookie()
                                     }
                                     .buttonStyle(.bordered)
