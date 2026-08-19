@@ -12,6 +12,12 @@ extension Color {
             ? .secondaryLabelColor
             : NSColor(white: 0.24, alpha: 1.0) // opaque: vibrancy washes out alpha grays
     })
+
+    // One state palette for bars, percent labels, status dots and the menu bar
+    // icon, so the popover and the status item read as a single system.
+    static let usageGreen = Color(red: 0.13, green: 0.77, blue: 0.37)
+    static let usageAmber = Color(red: 1.0, green: 0.62, blue: 0.04)
+    static let usageRed   = Color(red: 1.0, green: 0.27, blue: 0.23)
 }
 
 // Deterministic usage bar: the native linear ProgressView ignores .tint() in
@@ -22,14 +28,56 @@ struct UsageBar: View {
 
     var body: some View {
         GeometryReader { geo in
+            let width = max(0, min(1, value)) * geo.size.width
             ZStack(alignment: .leading) {
-                Capsule().fill(Color.primary.opacity(0.12))
-                Capsule()
-                    .fill(color)
-                    .frame(width: max(0, min(1, value)) * geo.size.width)
+                Capsule().fill(Color.primary.opacity(0.1))
+                if value > 0 {
+                    // Floor at the capsule diameter so tiny values still render round.
+                    Capsule()
+                        .fill(color)
+                        .frame(width: max(width, 5))
+                }
             }
         }
-        .frame(height: 6)
+        .frame(height: 5)
+        .animation(.easeOut(duration: 0.25), value: value)
+    }
+}
+
+// One metric in the popover: label + reset info on a single line, percent
+// right-aligned, bar underneath. The percent stays neutral until the metric
+// is worth noticing (70%+), then picks up the bar's warning color.
+struct UsageMetricRow: View {
+    let label: String
+    let detail: String?      // quiet inline context, e.g. "resets 17:20"
+    let value: Double        // 0...1
+    let valueLabel: String
+
+    private var barColor: Color {
+        if value < 0.7 { return .usageGreen }
+        if value < 0.9 { return .usageAmber }
+        return .usageRed
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline, spacing: 5) {
+                Text(label)
+                    .font(.system(size: 12, weight: .medium))
+                if let detail = detail {
+                    Text("· \(detail)")
+                        .font(.system(size: 11))
+                        .foregroundColor(Color.secondaryText)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                Spacer(minLength: 8)
+                Text(valueLabel)
+                    .font(.system(size: 12, weight: .semibold).monospacedDigit())
+                    .foregroundColor(value < 0.7 ? .primary : barColor)
+            }
+            UsageBar(value: value, color: barColor)
+        }
     }
 }
 
@@ -70,7 +118,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Create popover
         popover = NSPopover()
         // Initial guess; SwiftUI's intrinsic size (capped at 600) will drive the actual size.
-        popover.contentSize = NSSize(width: 360, height: 320)
+        popover.contentSize = NSSize(width: 340, height: 320)
         popover.behavior = .transient
         popover.contentViewController = NSHostingController(rootView: UsageView(
             usageManager: usageManager,
@@ -301,14 +349,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func updateStatusIcon(percentage: Int) {
         guard let button = statusItem.button else { return }
 
-        // Determine color based on percentage
+        // Determine color based on percentage (same palette as the popover bars)
         let color: NSColor
         if percentage < 70 {
             color = NSColor(red: 0.13, green: 0.77, blue: 0.37, alpha: 1.0) // Green
         } else if percentage < 90 {
-            color = NSColor(red: 1.0, green: 0.8, blue: 0.0, alpha: 1.0) // Yellow
+            color = NSColor(red: 1.0, green: 0.62, blue: 0.04, alpha: 1.0) // Amber
         } else {
-            color = NSColor(red: 1.0, green: 0.23, blue: 0.19, alpha: 1.0) // Red
+            color = NSColor(red: 1.0, green: 0.27, blue: 0.23, alpha: 1.0) // Red
         }
 
         // Create spark icon with color
@@ -1501,14 +1549,14 @@ struct UsageView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 content
-                    .padding()
+                    .padding(16)
                     .background(
                         GeometryReader { geo in
                             Color.clear.preference(key: ContentHeightKey.self, value: geo.size.height)
                         }
                     )
             }
-            .frame(width: 360, height: min(max(measuredHeight, 100), maxPopupHeight))
+            .frame(width: 340, height: min(max(measuredHeight, 100), maxPopupHeight))
             // Dark: light scrim over the native material — between fully native
             // (too transparent) and the v1.3.2 0.62 scrim (read as "too dark").
             // TEST VALUE on ClaudeUsageBar only; CodexUsageBar stays fully native.
@@ -1542,670 +1590,47 @@ struct UsageView: View {
     }
 
     var content: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Claude Usage")
-                .font(.headline)
-                .padding(.bottom, 4)
+        VStack(alignment: .leading, spacing: 14) {
+            header
 
             // Free-form message banner (author-controlled). Takes priority over
             // the version-update banner when both are present.
             if let ann = updateManager.announcement {
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(spacing: 6) {
-                        if let heading = ann.heading, !heading.isEmpty {
-                            Text(heading)
-                                .font(.caption)
-                                .fontWeight(.semibold)
-                        }
-                        Spacer()
-                        Button(action: { updateManager.dismissCurrent() }) {
-                            Image(systemName: "xmark")
-                                .font(.system(size: 9, weight: .semibold))
-                                .foregroundColor(Color.secondaryText)
-                        }
-                        .buttonStyle(.borderless)
-                    }
-                    if !ann.title.isEmpty {
-                        Text(ann.title)
-                            .font(.caption)
-                    }
-                    if !ann.body.isEmpty {
-                        Text(ann.body)
-                            .font(.caption2)
-                            .foregroundColor(Color.secondaryText)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    if !ann.buttons.isEmpty {
-                        HStack(spacing: 6) {
-                            ForEach(ann.buttons.indices, id: \.self) { i in
-                                bannerButton(ann.buttons[i])
-                            }
-                        }
-                    }
-                }
-                .padding(8)
-                .background(Color.accentColor.opacity(0.12))
-                .cornerRadius(6)
+                announcementBanner(ann)
             }
 
             // App update banner (version-based). Hidden while a message banner shows.
             if updateManager.announcement == nil,
                let update = updateManager.available, !updateManager.isCurrentDismissed {
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(spacing: 6) {
-                        Text("⬆️")
-                        Text("Version \(update.version) available")
-                            .font(.caption)
-                            .fontWeight(.semibold)
-                        Spacer()
-                        Button(action: { updateManager.dismissCurrent() }) {
-                            Image(systemName: "xmark")
-                                .font(.system(size: 9, weight: .semibold))
-                                .foregroundColor(Color.secondaryText)
-                        }
-                        .buttonStyle(.borderless)
-                    }
-                    Text(update.title)
-                        .font(.caption)
-                    Text(update.body)
-                        .font(.caption2)
-                        .foregroundColor(Color.secondaryText)
-                        .fixedSize(horizontal: false, vertical: true)
-                    if !update.buttons.isEmpty {
-                        HStack(spacing: 6) {
-                            ForEach(update.buttons.indices, id: \.self) { i in
-                                bannerButton(update.buttons[i])
-                            }
-                        }
-                    }
-                }
-                .padding(8)
-                .background(Color.accentColor.opacity(0.12))
-                .cornerRadius(6)
+                updateBanner(update)
             }
 
             if let error = usageManager.errorMessage {
                 Text(error)
                     .font(.caption)
                     .foregroundColor(.orange)
-                    .padding(.bottom, 8)
             }
 
-            // Only show usage if data has been fetched
-            if !usageManager.hasFetchedData {
-                Text("👋 Welcome! Set your session cookie below to get started.")
-                    .font(.subheadline)
-                    .foregroundColor(Color.secondaryText)
-                    .padding(.vertical, 8)
-            }
-
-            // Session Usage
             if usageManager.hasFetchedData {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text("Session (5 hour)")
-                        .font(.subheadline)
-                    Spacer()
-                    if let resetTime = usageManager.sessionResetsAt {
-                        Text("Resets \(formatResetTime(resetTime))")
-                            .font(.caption)
-                            .foregroundColor(Color.secondaryText)
-                    }
-                }
-
-                UsageBar(value: usageManager.sessionPercentage,
-                         color: colorForPercentage(usageManager.sessionPercentage))
-
-                Text("\(Int(usageManager.sessionPercentage * 100))% used")
-                    .font(.caption)
-                    .foregroundColor(Color.secondaryText)
-            }
-
-            // Weekly Usage
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text("Weekly (7 day)")
-                        .font(.subheadline)
-                    Spacer()
-                    if let resetTime = usageManager.weeklyResetsAt {
-                        Text("Resets \(formatResetTime(resetTime, includeDate: true))")
-                            .font(.caption)
-                            .foregroundColor(Color.secondaryText)
-                    }
-                }
-
-                UsageBar(value: usageManager.weeklyPercentage,
-                         color: colorForPercentage(usageManager.weeklyPercentage))
-
-                Text("\(Int(usageManager.weeklyPercentage * 100))% used")
-                    .font(.caption)
-                    .foregroundColor(Color.secondaryText)
-            }
-
-            // Weekly Sonnet Usage (only show if available)
-            if usageManager.hasWeeklySonnet && usageManager.hasFetchedData {
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text("Weekly Sonnet (7 day)")
-                            .font(.subheadline)
-                        Spacer()
-                        if let resetTime = usageManager.weeklySonnetResetsAt {
-                            Text("Resets \(formatResetTime(resetTime, includeDate: true))")
-                                .font(.caption)
-                                .foregroundColor(Color.secondaryText)
-                        }
-                    }
-
-                    UsageBar(value: usageManager.weeklySonnetPercentage,
-                             color: colorForPercentage(usageManager.weeklySonnetPercentage))
-
-                    Text("\(Int(usageManager.weeklySonnetPercentage * 100))% used")
-                        .font(.caption)
-                        .foregroundColor(Color.secondaryText)
-                }
-            }
-
-            // Weekly Fable Usage — only surfaced once usage is above 1%
-            // (new model, counted separately; hidden while idle to avoid clutter).
-            if usageManager.hasWeeklyFable && usageManager.hasFetchedData && usageManager.weeklyFableUsage >= 1 {
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text("Weekly Fable (7 day)")
-                            .font(.subheadline)
-                        Spacer()
-                        if let resetTime = usageManager.weeklyFableResetsAt {
-                            Text("Resets \(formatResetTime(resetTime, includeDate: true))")
-                                .font(.caption)
-                                .foregroundColor(Color.secondaryText)
-                        }
-                    }
-
-                    UsageBar(value: usageManager.weeklyFablePercentage,
-                             color: colorForPercentage(usageManager.weeklyFablePercentage))
-
-                    Text("\(Int(usageManager.weeklyFablePercentage * 100))% used")
-                        .font(.caption)
-                        .foregroundColor(Color.secondaryText)
-                }
-            }
-
-            // Usage credits (pay-as-you-go). Only shown once credits are actually
-            // used; links out to manage credits on claude.ai.
-            if usageManager.hasCreditUsage || usageManager.freeCreditsMinor > 0 {
-                let spentMinor = usageManager.extraSpentMinor
-                let limitMinor = usageManager.extraLimitMinor
-                let pct = limitMinor > 0 ? Double(spentMinor) / Double(limitMinor) : 0
-                let pctInt = Int((pct * 100).rounded())
-                // Show the exact % up to the limit; once over, just say "over limit".
-                let pctLabel = pctInt > 100 ? "over limit" : "\(pctInt)%"
-                let fmt: (Int) -> String = { minor in
-                    let v = Double(minor) / 100.0
-                    return usageManager.creditCurrency == "USD"
-                        ? String(format: "$%.2f", v)
-                        : String(format: "%@ %.2f", usageManager.creditCurrency, v)
-                }
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text("Extra usage")
-                            .font(.subheadline)
-                        Spacer()
-                        Button(action: {
-                            if let url = URL(string: "https://claude.ai/new#settings/usage") {
-                                NSWorkspace.shared.open(url)
-                            }
-                        }) {
-                            Text("Manage →")
-                                .font(.caption.weight(.semibold))
-                                .foregroundColor(.accentColor)
-                        }
-                        .buttonStyle(.borderless)
-                    }
-
-                    // Reset date, shortened (e.g. "Resets Aug 1") so it fits inline.
-                    let shortReset: String? = usageManager.extraResetsAt.map { d in
-                        let f = DateFormatter(); f.dateFormat = "MMM d"
-                        return "Resets \(f.string(from: d))"
-                    }
-
-                    // Spend vs monthly limit — only when there's actual spend.
-                    if usageManager.hasCreditUsage {
-                        if limitMinor > 0 {
-                            UsageBar(value: min(pct, 1.0),
-                                     color: colorForPercentage(pct))
-                        }
-                        HStack {
-                            Text(limitMinor > 0
-                                 ? "\(fmt(spentMinor)) of \(fmt(limitMinor)) · \(pctLabel)"
-                                 : "\(fmt(spentMinor)) spent")
-                                .font(.caption)
-                                .foregroundColor(Color.secondaryText)
-                            Spacer()
-                            if let r = shortReset {
-                                Text(r)
-                                    .font(.caption)
-                                    .foregroundColor(Color.secondaryText)
-                            }
-                        }
-                    }
-
-                    if usageManager.freeCreditsMinor > 0 {
-                        Text("\(fmt(usageManager.freeCreditsMinor)) free credits left")
-                            .font(.caption2)
-                            .foregroundColor(Color.secondaryText)
-                            .opacity(0.85)
-                    }
-                }
-            }
-
-            // Discreet reassurance line naming whichever of Fable / extra usage
-            // is not being consumed (nothing shown when both are active).
-            if usageManager.hasFetchedData {
-                let fableActive = usageManager.hasWeeklyFable && usageManager.weeklyFableUsage >= 1
-                let extraActive = usageManager.hasCreditUsage || usageManager.freeCreditsMinor > 0
-                if !fableActive || !extraActive {
-                    Text(
-                        !fableActive && !extraActive ? "No Fable or extra usage"
-                        : !extraActive ? "No extra usage"
-                        : "No Fable usage"
-                    )
-                    .font(.caption2)
-                    .foregroundColor(Color.secondaryText)
-                    .opacity(0.6)
-                }
-            }
+                metrics
+            } else {
+                emptyState
             }
 
             if statusManager.hasFetched {
                 Divider()
+                statusSection
             }
 
-            // Anthropic service status (compact; expandable on issue)
-            if statusManager.hasFetched {
-                let effective = statusManager.effectiveIndicator
-                let filteredIncidents = statusManager.filteredIncidents
-                let filteredAffected = statusManager.filteredAffectedComponents
-                let hasIssue = effective != "none"
-                    && (!filteredIncidents.isEmpty || !filteredAffected.isEmpty)
-
-                VStack(alignment: .leading, spacing: 8) {
-                    // Compact header row
-                    HStack(alignment: .top, spacing: 6) {
-                        Circle()
-                            .fill(statusColor(for: effective))
-                            .frame(width: 8, height: 8)
-                            .padding(.top, 4)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(effective == "none"
-                                 ? "All Claude services operational"
-                                 : statusManager.statusDescription)
-                                .font(.caption)
-                                .foregroundColor(Color.secondaryText)
-                                .fixedSize(horizontal: false, vertical: true)
-                            Text(statusContextLine(for: statusManager))
-                                .font(.system(size: 10))
-                                .foregroundColor(Color.secondaryText)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        Spacer()
-                        if hasIssue {
-                            Button(action: { showingStatusDetails.toggle() }) {
-                                HStack(spacing: 2) {
-                                    Text(showingStatusDetails ? "Hide" : "Details")
-                                    Image(systemName: showingStatusDetails ? "chevron.up" : "chevron.down")
-                                        .font(.system(size: 8))
-                                }
-                                .font(.caption2)
-                            }
-                            .buttonStyle(.borderless)
-                        }
-                    }
-
-                    // Expanded panel
-                    if hasIssue && showingStatusDetails {
-                        VStack(alignment: .leading, spacing: 12) {
-                            ForEach(filteredIncidents) { incident in
-                                VStack(alignment: .leading, spacing: 6) {
-                                    // Title
-                                    Text(incident.name)
-                                        .font(.system(size: 12, weight: .semibold))
-                                        .fixedSize(horizontal: false, vertical: true)
-
-                                    // Status badge + updated time
-                                    HStack(spacing: 8) {
-                                        Text(incident.status.uppercased())
-                                            .font(.system(size: 9, weight: .bold))
-                                            .foregroundColor(.white)
-                                            .padding(.horizontal, 6)
-                                            .padding(.vertical, 2)
-                                            .background(badgeColor(for: incident.status))
-                                            .cornerRadius(3)
-                                        if let updated = incident.updatedAt {
-                                            Text("Updated \(relativeTime(updated))")
-                                                .font(.caption2)
-                                                .foregroundColor(Color.secondaryText)
-                                        }
-                                    }
-
-                                    // Body
-                                    if !incident.latestUpdate.isEmpty {
-                                        Text(incident.latestUpdate)
-                                            .font(.caption)
-                                            .foregroundColor(.primary)
-                                            .fixedSize(horizontal: false, vertical: true)
-                                            .padding(.top, 2)
-                                    }
-                                }
-                            }
-
-                            // Affected components (when no formal incident)
-                            if filteredIncidents.isEmpty && !filteredAffected.isEmpty {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text("Affected services")
-                                        .font(.caption2)
-                                        .fontWeight(.semibold)
-                                        .foregroundColor(Color.secondaryText)
-                                    ForEach(filteredAffected) { c in
-                                        HStack(spacing: 6) {
-                                            Circle()
-                                                .fill(Color.orange)
-                                                .frame(width: 5, height: 5)
-                                            Text(c.name).font(.caption2)
-                                            Spacer()
-                                            Text(componentLabel(c.status))
-                                                .font(.caption2)
-                                                .foregroundColor(Color.secondaryText)
-                                        }
-                                    }
-                                }
-                            }
-
-                            Divider()
-
-                            HStack {
-                                if let lastCheck = statusManager.lastUpdated {
-                                    Text("Checked \(relativeTime(lastCheck))")
-                                        .font(.caption2)
-                                        .foregroundColor(Color.secondaryText)
-                                }
-                                Spacer()
-                                Button(action: {
-                                    NSWorkspace.shared.open(URL(string: "https://status.claude.com")!)
-                                }) {
-                                    Text("Open status page →")
-                                        .font(.caption2)
-                                }
-                                .buttonStyle(.borderless)
-                            }
-                        }
-                        .padding(10)
-                        .background(Color.orange.opacity(0.10))
-                        .cornerRadius(6)
-                    }
-                }
-            }
-
-            if usageManager.hasFetchedData {
             Divider()
-
-            HStack {
-                Text("Last updated: \(formatTime(usageManager.lastUpdated))")
-                    .font(.caption)
-                    .foregroundColor(Color.secondaryText)
-                Spacer()
-                Button("Refresh") {
-                    usageManager.fetchUsage()
-                    statusManager.fetch()
-                    updateManager.fetch()
-                }
-                .buttonStyle(.borderless)
-                .font(.caption)
-            }
-            }
-
-            Button(showingCookieInput ? "Hide Cookie" : "Set Session Cookie") {
-                showingCookieInput.toggle()
-            }
-            .buttonStyle(.borderless)
-            .font(.caption)
+            footer
 
             if showingCookieInput {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Text("How to get your session cookie:")
-                            .font(.caption)
-                            .fontWeight(.semibold)
-                        Spacer()
-                        Button(action: {
-                            NSWorkspace.shared.open(URL(string: "https://github.com/Artzainnn/ClaudeUsageBar/blob/main/setup-guide.png")!)
-                        }) {
-                            Text("View tutorial →")
-                                .font(.caption2)
-                                .foregroundColor(.blue)
-                        }
-                        .buttonStyle(.borderless)
-                    }
-
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("1. Go to Settings > Usage on claude.ai")
-                        Text("2. Press F12 (or Cmd+Option+I)")
-                        Text("3. Go to Network tab")
-                        Text("4. Refresh page, click 'usage' request")
-                        Text("5. Find 'Cookie' in Request Headers")
-                        Text("6. Copy full cookie value\n   (starts with anthropic-device-id=...)")
-                    }
-                    .font(.caption2)
-                    .foregroundColor(Color.secondaryText)
-
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Paste full cookie string:")
-                            .font(.caption2)
-                            .foregroundColor(Color.secondaryText)
-                        VStack(spacing: 4) {
-                            PasteableTextField(text: $sessionCookieInput, placeholder: "Paste cookie here...")
-                                .frame(height: 60)
-                                .cornerRadius(4)
-
-                            HStack(spacing: 8) {
-                                Button("Save Cookie & Fetch") {
-                                    NSLog("ClaudeUsage: Save clicked, input length: \(sessionCookieInput.count)")
-                                    if sessionCookieInput.isEmpty {
-                                        usageManager.errorMessage = "Cookie field is empty!"
-                                    } else {
-                                        usageManager.saveSessionCookie(sessionCookieInput)
-                                        usageManager.fetchUsage()
-                                        usageManager.errorMessage = "Cookie saved, fetching..."
-                                    }
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .controlSize(.small)
-
-                                if usageManager.hasFetchedData {
-                                    Button("Clear Cookie") {
-                                        sessionCookieInput = ""
-                                        usageManager.clearSessionCookie()
-                                    }
-                                    .buttonStyle(.bordered)
-                                    .controlSize(.small)
-                                }
-                            }
-                        }
-                    }
-                }
-                .padding(8)
-                .background(Color.secondary.opacity(0.1))
-                .cornerRadius(6)
+                cookiePanel
             }
-
-            // Support Section
-            Button(action: {
-                NSWorkspace.shared.open(URL(string: "https://donate.stripe.com/3cIcN5b5H7Q8ay8bIDfIs02")!)
-            }) {
-                HStack(spacing: 4) {
-                    Text("☕")
-                    Text("Buy Dev a Coffee")
-                }
-            }
-            .buttonStyle(.borderless)
-            .font(.caption)
-            .foregroundColor(.orange)
-
-            // Settings Section
-            Button(showingSettings ? "Hide Settings" : "Settings") {
-                showingSettings.toggle()
-            }
-            .buttonStyle(.borderless)
-            .font(.caption)
 
             if showingSettings {
-                VStack(alignment: .leading, spacing: 12) {
-                    Toggle(isOn: Binding(
-                        get: { usageManager.openAtLogin },
-                        set: { newValue in
-                            usageManager.openAtLogin = newValue
-                            usageManager.applyLoginItem(newValue)
-                            usageManager.saveSettings()
-                        }
-                    )) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Open at Login")
-                                .font(.caption)
-                            Text("Launch app automatically when you log in")
-                                .font(.caption2)
-                                .foregroundColor(Color.secondaryText)
-                        }
-                    }
-                    .toggleStyle(.checkbox)
-
-                    VStack(alignment: .leading, spacing: 8) {
-                        Toggle(isOn: Binding(
-                            get: { usageManager.usageNotificationsEnabled },
-                            set: { newValue in
-                                usageManager.usageNotificationsEnabled = newValue
-                                usageManager.saveSettings()
-                            }
-                        )) {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Enable Usage Notifications")
-                                    .font(.caption)
-                                Text("Get alerts at 25%, 50%, 75%,\nand 90% session usage")
-                                    .font(.caption2)
-                                    .foregroundColor(Color.secondaryText)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                        }
-                        .toggleStyle(.checkbox)
-
-                        Toggle(isOn: Binding(
-                            get: { usageManager.statusNotificationsEnabled },
-                            set: { newValue in
-                                usageManager.statusNotificationsEnabled = newValue
-                                usageManager.saveSettings()
-                            }
-                        )) {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Enable Status Notifications")
-                                    .font(.caption)
-                                Text("Get alerts when tracked Claude services have an outage")
-                                    .font(.caption2)
-                                    .foregroundColor(Color.secondaryText)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                        }
-                        .toggleStyle(.checkbox)
-
-                        Button("Test Notification") {
-                            usageManager.sendTestNotification()
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                    }
-
-                    Divider()
-
-                    VStack(alignment: .leading, spacing: 8) {
-                        Toggle(isOn: Binding(
-                            get: { usageManager.shortcutEnabled },
-                            set: { newValue in
-                                usageManager.shortcutEnabled = newValue
-                                usageManager.saveSettings()
-                                if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
-                                    appDelegate.setShortcutEnabled(newValue)
-                                }
-                            }
-                        )) {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Keyboard Shortcut (⌘U)")
-                                    .font(.caption)
-                                Text("Toggle popup from anywhere.\nDisable if it conflicts with other apps.")
-                                    .font(.caption2)
-                                    .foregroundColor(Color.secondaryText)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                        }
-                        .toggleStyle(.switch)
-
-                        if usageManager.shortcutEnabled && !usageManager.isAccessibilityEnabled {
-                            Button("Grant Accessibility Permission") {
-                                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .controlSize(.small)
-
-                            Text("Accessibility permission may be needed\nfor the shortcut to work in all apps")
-                                .font(.caption2)
-                                .foregroundColor(Color.secondaryText)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-
-                    Divider()
-
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Status alerts: services to track")
-                            .font(.caption)
-                            .fontWeight(.semibold)
-                        Text("Only tick the Claude services you use. Status issues with unticked services won't be shown or trigger alerts.")
-                            .font(.caption2)
-                            .foregroundColor(Color.secondaryText)
-                            .fixedSize(horizontal: false, vertical: true)
-                        ForEach(statusManager.allComponents) { component in
-                            Toggle(isOn: Binding(
-                                get: { statusManager.isTracked(component.id) },
-                                set: { _ in statusManager.toggleComponent(component.id) }
-                            )) {
-                                Text(component.name)
-                                    .font(.caption2)
-                            }
-                            .toggleStyle(.checkbox)
-                        }
-                    }
-
-                    Divider()
-
-                    // Appearance sits last on purpose: opening Settings auto-scrolls
-                    // to the anchor below, so this lands in view.
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Appearance")
-                            .font(.caption)
-                        Picker("Appearance", selection: $appearanceMode) {
-                            Text("System").tag("system")
-                            Text("Dark").tag("dark")
-                            Text("Light").tag("light")
-                        }
-                        .pickerStyle(.segmented)
-                        .labelsHidden()
-                        .onChange(of: appearanceMode) { _ in
-                            (NSApplication.shared.delegate as? AppDelegate)?.applyAppearancePreference()
-                        }
-                        Text("Match macOS, or keep the classic dark look")
-                            .font(.caption2)
-                            .foregroundColor(Color.secondaryText)
-                    }
-
-                }
-                .padding(8)
-                .background(Color.secondary.opacity(0.1))
-                .cornerRadius(6)
+                settingsPanel
 
                 // Anchor for scroll-to-bottom when Settings opens
                 Color.clear
@@ -2215,103 +1640,644 @@ struct UsageView: View {
         }
     }
 
-    func formatNumber(_ number: Int) -> String {
-        let formatter = NumberFormatter()
-        formatter.numberStyle = .decimal
-        return formatter.string(from: NSNumber(value: number)) ?? "\(number)"
-    }
+    // MARK: - Header
 
-    func formatTime(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.timeStyle = .short
-        return formatter.string(from: date)
-    }
-
-    func formatResetTime(_ date: Date, includeDate: Bool = false) -> String {
-        let formatter = DateFormatter()
-
-        if includeDate {
-            // Format: "on 31 Jan 2026 at 7:59 AM"
-            formatter.dateFormat = "d MMM yyyy 'at' h:mm a"
-            return "on \(formatter.string(from: date))"
-        } else {
-            formatter.timeStyle = .short
-            formatter.dateStyle = .none
-            return "at \(formatter.string(from: date))"
-        }
-    }
-
-    func colorForPercentage(_ percentage: Double) -> Color {
-        if percentage < 0.7 {
-            return .green
-        } else if percentage < 0.9 {
-            return .orange
-        } else {
-            return .red
-        }
-    }
-
-    func statusColor(for indicator: String) -> Color {
-        switch indicator {
-        case "none":     return .green
-        case "minor":    return .yellow
-        case "major":    return .orange
-        case "critical": return .red
-        default:         return .gray
-        }
-    }
-
-    func statusLabel(for indicator: String, description: String) -> String {
-        if indicator == "none" {
-            return "Claude: all systems operational"
-        }
-        return "Claude: \(description)"
-    }
-
-    func relativeTime(_ date: Date) -> String {
-        let elapsed = Int(Date().timeIntervalSince(date))
-        if elapsed < 60 { return "just now" }
-        if elapsed < 3600 {
-            let m = elapsed / 60
-            return "\(m) min\(m == 1 ? "" : "s") ago"
-        }
-        if elapsed < 86_400 {
-            let h = elapsed / 3600
-            return "\(h) hour\(h == 1 ? "" : "s") ago"
-        }
-        let d = elapsed / 86_400
-        return "\(d) day\(d == 1 ? "" : "s") ago"
-    }
-
-    func statusContextLine(for sm: StatusManager) -> String {
-        let tracked = sm.allComponents.filter { sm.selectedComponentIds.contains($0.id) }
-        let trackedNames = tracked.prefix(4).map { shortName($0.name) }.joined(separator: ", ")
-        let extra = tracked.count > 4 ? " +\(tracked.count - 4)" : ""
-        let trackedSummary = tracked.isEmpty ? "No services tracked" : "Tracks \(trackedNames)\(extra)"
-
-        if sm.effectiveIndicator == "none" {
-            if let lastCheck = sm.lastUpdated {
-                return "\(trackedSummary) · checked \(relativeTime(lastCheck))"
+    var header: some View {
+        HStack(spacing: 8) {
+            Text("Claude Usage")
+                .font(.headline)
+            Spacer()
+            if usageManager.hasFetchedData {
+                Text(formatTime(usageManager.lastUpdated))
+                    .font(.caption)
+                    .foregroundColor(Color.secondaryText)
+                    .help("Last updated \(formatTime(usageManager.lastUpdated))")
             }
-            return trackedSummary
+            if usageManager.isLoading {
+                ProgressView()
+                    .scaleEffect(0.45)
+                    .frame(width: 16, height: 16)
+            } else {
+                Button(action: {
+                    usageManager.fetchUsage()
+                    statusManager.fetch()
+                    updateManager.fetch()
+                }) {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(Color.secondaryText)
+                        .frame(width: 16, height: 16)
+                }
+                .buttonStyle(.borderless)
+                .help("Refresh")
+            }
         }
-        let affected = sm.filteredAffectedComponents
-        if !affected.isEmpty {
-            let names = affected.prefix(3).map { shortName($0.name) }.joined(separator: ", ")
-            let more = affected.count > 3 ? " +\(affected.count - 3)" : ""
-            return "Affects: \(names)\(more)"
-        }
-        if let lastCheck = sm.lastUpdated {
-            return "Checked \(relativeTime(lastCheck))"
-        }
-        return ""
     }
 
-    func shortName(_ raw: String) -> String {
-        if let paren = raw.range(of: " (") {
-            return String(raw[..<paren.lowerBound])
+    // MARK: - Usage metrics
+
+    @ViewBuilder
+    var metrics: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            UsageMetricRow(
+                label: "Session",
+                detail: usageManager.sessionResetsAt.map { resetPhrase($0) },
+                value: usageManager.sessionPercentage,
+                valueLabel: "\(Int(usageManager.sessionPercentage * 100))%"
+            )
+            .help("Rolling 5-hour session limit")
+
+            UsageMetricRow(
+                label: "Weekly",
+                detail: usageManager.weeklyResetsAt.map { resetPhrase($0, includeDate: true) },
+                value: usageManager.weeklyPercentage,
+                valueLabel: "\(Int(usageManager.weeklyPercentage * 100))%"
+            )
+            .help("Rolling 7-day limit, all models")
+
+            if usageManager.hasWeeklySonnet {
+                UsageMetricRow(
+                    label: "Sonnet",
+                    detail: usageManager.weeklySonnetResetsAt.map { resetPhrase($0, includeDate: true) },
+                    value: usageManager.weeklySonnetPercentage,
+                    valueLabel: "\(Int(usageManager.weeklySonnetPercentage * 100))%"
+                )
+                .help("Rolling 7-day Sonnet limit")
+            }
+
+            // Fable is counted separately; hidden while idle to avoid clutter.
+            if usageManager.hasWeeklyFable && usageManager.weeklyFableUsage >= 1 {
+                UsageMetricRow(
+                    label: "Fable",
+                    detail: usageManager.weeklyFableResetsAt.map { resetPhrase($0, includeDate: true) },
+                    value: usageManager.weeklyFablePercentage,
+                    valueLabel: "\(Int(usageManager.weeklyFablePercentage * 100))%"
+                )
+                .help("Rolling 7-day Fable limit")
+            }
+
+            // Extra usage (pay-as-you-go). Only shown once credits are involved.
+            if usageManager.hasCreditUsage || usageManager.freeCreditsMinor > 0 {
+                extraUsage
+            }
         }
-        return raw
+    }
+
+    @ViewBuilder
+    var extraUsage: some View {
+        let spentMinor = usageManager.extraSpentMinor
+        let limitMinor = usageManager.extraLimitMinor
+        let pct = limitMinor > 0 ? Double(spentMinor) / Double(limitMinor) : 0
+
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline, spacing: 5) {
+                Text("Extra usage")
+                    .font(.system(size: 12, weight: .medium))
+                if let reset = usageManager.extraResetsAt {
+                    Text("· resets \(shortDate(reset))")
+                        .font(.system(size: 11))
+                        .foregroundColor(Color.secondaryText)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 8)
+                if usageManager.hasCreditUsage {
+                    Text(limitMinor > 0
+                         ? "\(money(spentMinor)) of \(money(limitMinor))"
+                         : "\(money(spentMinor)) spent")
+                        .font(.system(size: 12, weight: .semibold).monospacedDigit())
+                        .foregroundColor(pct < 0.7 ? .primary : colorForPercentage(pct))
+                }
+            }
+
+            if usageManager.hasCreditUsage && limitMinor > 0 {
+                UsageBar(value: min(pct, 1.0), color: colorForPercentage(pct))
+            }
+
+            HStack {
+                if usageManager.freeCreditsMinor > 0 {
+                    Text("\(money(usageManager.freeCreditsMinor)) free credits left")
+                        .font(.caption2)
+                        .foregroundColor(Color.secondaryText)
+                }
+                Spacer()
+                Button(action: {
+                    if let url = URL(string: "https://claude.ai/new#settings/usage") {
+                        NSWorkspace.shared.open(url)
+                    }
+                }) {
+                    Text("Manage →")
+                        .font(.caption2)
+                        .foregroundColor(.accentColor)
+                }
+                .buttonStyle(.borderless)
+            }
+        }
+    }
+
+    // MARK: - Empty state
+
+    var emptyState: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "sparkles")
+                .font(.system(size: 26))
+                .foregroundColor(Color.secondaryText.opacity(0.7))
+            Text("Connect your Claude account")
+                .font(.system(size: 13, weight: .semibold))
+            Text("Paste your claude.ai session cookie to see your session and weekly limits here.")
+                .font(.caption)
+                .foregroundColor(Color.secondaryText)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+            if !showingCookieInput {
+                Button("Get started") {
+                    showingCookieInput = true
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .padding(.top, 2)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 10)
+    }
+
+    // MARK: - Service status
+
+    @ViewBuilder
+    var statusSection: some View {
+        let effective = statusManager.effectiveIndicator
+        let filteredIncidents = statusManager.filteredIncidents
+        let filteredAffected = statusManager.filteredAffectedComponents
+        let hasIssue = effective != "none"
+            && (!filteredIncidents.isEmpty || !filteredAffected.isEmpty)
+
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 7) {
+                Circle()
+                    .fill(statusColor(for: effective))
+                    .frame(width: 7, height: 7)
+                    .padding(.top, 3)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(effective == "none"
+                         ? "All Claude services operational"
+                         : statusManager.statusDescription)
+                        .font(.caption)
+                        .foregroundColor(effective == "none" ? Color.secondaryText : .primary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if hasIssue && !filteredAffected.isEmpty {
+                        let names = filteredAffected.prefix(3).map { shortName($0.name) }.joined(separator: ", ")
+                        let more = filteredAffected.count > 3 ? " +\(filteredAffected.count - 3)" : ""
+                        Text("Affects: \(names)\(more)")
+                            .font(.system(size: 10))
+                            .foregroundColor(Color.secondaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                Spacer(minLength: 8)
+                if hasIssue {
+                    Button(action: { showingStatusDetails.toggle() }) {
+                        HStack(spacing: 2) {
+                            Text(showingStatusDetails ? "Hide" : "Details")
+                            Image(systemName: showingStatusDetails ? "chevron.up" : "chevron.down")
+                                .font(.system(size: 8))
+                        }
+                        .font(.caption2)
+                    }
+                    .buttonStyle(.borderless)
+                } else if let lastCheck = statusManager.lastUpdated {
+                    Text(relativeTime(lastCheck))
+                        .font(.caption2)
+                        .foregroundColor(Color.secondaryText)
+                }
+            }
+            .help(trackedServicesSummary)
+
+            // Expanded panel
+            if hasIssue && showingStatusDetails {
+                VStack(alignment: .leading, spacing: 12) {
+                    ForEach(filteredIncidents) { incident in
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(incident.name)
+                                .font(.system(size: 12, weight: .semibold))
+                                .fixedSize(horizontal: false, vertical: true)
+
+                            HStack(spacing: 8) {
+                                Text(incident.status.uppercased())
+                                    .font(.system(size: 9, weight: .bold))
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(badgeColor(for: incident.status))
+                                    .cornerRadius(3)
+                                if let updated = incident.updatedAt {
+                                    Text("Updated \(relativeTime(updated))")
+                                        .font(.caption2)
+                                        .foregroundColor(Color.secondaryText)
+                                }
+                            }
+
+                            if !incident.latestUpdate.isEmpty {
+                                Text(incident.latestUpdate)
+                                    .font(.caption)
+                                    .foregroundColor(.primary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .padding(.top, 2)
+                            }
+                        }
+                    }
+
+                    // Affected components (when no formal incident)
+                    if filteredIncidents.isEmpty && !filteredAffected.isEmpty {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Affected services")
+                                .font(.caption2)
+                                .fontWeight(.semibold)
+                                .foregroundColor(Color.secondaryText)
+                            ForEach(filteredAffected) { c in
+                                HStack(spacing: 6) {
+                                    Circle()
+                                        .fill(Color.usageAmber)
+                                        .frame(width: 5, height: 5)
+                                    Text(c.name).font(.caption2)
+                                    Spacer()
+                                    Text(componentLabel(c.status))
+                                        .font(.caption2)
+                                        .foregroundColor(Color.secondaryText)
+                                }
+                            }
+                        }
+                    }
+
+                    Divider()
+
+                    HStack {
+                        if let lastCheck = statusManager.lastUpdated {
+                            Text("Checked \(relativeTime(lastCheck))")
+                                .font(.caption2)
+                                .foregroundColor(Color.secondaryText)
+                        }
+                        Spacer()
+                        Button(action: {
+                            NSWorkspace.shared.open(URL(string: "https://status.claude.com")!)
+                        }) {
+                            Text("Open status page →")
+                                .font(.caption2)
+                        }
+                        .buttonStyle(.borderless)
+                    }
+                }
+                .padding(10)
+                .background(Color.usageAmber.opacity(0.1))
+                .cornerRadius(8)
+            }
+        }
+    }
+
+    var trackedServicesSummary: String {
+        let tracked = statusManager.allComponents.filter { statusManager.selectedComponentIds.contains($0.id) }
+        let names = tracked.map { shortName($0.name) }.joined(separator: ", ")
+        let summary = tracked.isEmpty ? "No services tracked" : "Tracking: \(names)"
+        if let lastCheck = statusManager.lastUpdated {
+            return "\(summary) · checked \(relativeTime(lastCheck))"
+        }
+        return summary
+    }
+
+    // MARK: - Footer
+
+    var footer: some View {
+        HStack(spacing: 16) {
+            footerToggle("gearshape", "Settings", active: showingSettings) {
+                showingSettings.toggle()
+            }
+            footerToggle("key", "Cookie", active: showingCookieInput) {
+                showingCookieInput.toggle()
+            }
+            Spacer()
+            Button(action: {
+                NSWorkspace.shared.open(URL(string: "https://donate.stripe.com/3cIcN5b5H7Q8ay8bIDfIs02")!)
+            }) {
+                HStack(spacing: 4) {
+                    Text("☕")
+                        .font(.system(size: 10))
+                    Text("Support")
+                        .font(.caption)
+                }
+                .foregroundColor(Color.secondaryText)
+            }
+            .buttonStyle(.borderless)
+            .help("Buy the developer a coffee")
+        }
+    }
+
+    func footerToggle(_ icon: String, _ title: String, active: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                Image(systemName: icon)
+                    .font(.system(size: 10, weight: .medium))
+                Text(title)
+                    .font(.caption)
+            }
+            .foregroundColor(active ? .accentColor : Color.secondaryText)
+        }
+        .buttonStyle(.borderless)
+    }
+
+    // MARK: - Cookie panel
+
+    var cookiePanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Get your session cookie")
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                Spacer()
+                Button(action: {
+                    NSWorkspace.shared.open(URL(string: "https://github.com/Artzainnn/ClaudeUsageBar/blob/main/setup-guide.png")!)
+                }) {
+                    Text("Tutorial →")
+                        .font(.caption2)
+                }
+                .buttonStyle(.borderless)
+            }
+
+            VStack(alignment: .leading, spacing: 5) {
+                cookieStep(1, "Open claude.ai → Settings → Usage")
+                cookieStep(2, "Open DevTools (F12 or ⌘⌥I) → Network tab")
+                cookieStep(3, "Reload the page, then click the \u{201C}usage\u{201D} request")
+                cookieStep(4, "Copy the full \u{201C}Cookie\u{201D} value from Request Headers (starts with anthropic-device-id=)")
+            }
+
+            PasteableTextField(text: $sessionCookieInput, placeholder: "Paste cookie here...")
+                .frame(height: 56)
+                .cornerRadius(5)
+
+            HStack(spacing: 8) {
+                Button("Save & Fetch") {
+                    NSLog("ClaudeUsage: Save clicked, input length: \(sessionCookieInput.count)")
+                    if sessionCookieInput.isEmpty {
+                        usageManager.errorMessage = "Cookie field is empty!"
+                    } else {
+                        usageManager.saveSessionCookie(sessionCookieInput)
+                        usageManager.fetchUsage()
+                        usageManager.errorMessage = "Cookie saved, fetching..."
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+
+                if usageManager.hasFetchedData {
+                    Button("Clear") {
+                        sessionCookieInput = ""
+                        usageManager.clearSessionCookie()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            }
+        }
+        .padding(10)
+        .background(Color.primary.opacity(0.05))
+        .cornerRadius(8)
+    }
+
+    func cookieStep(_ number: Int, _ text: String) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Text("\(number)")
+                .font(.system(size: 10, weight: .semibold).monospacedDigit())
+                .foregroundColor(Color.secondaryText)
+                .frame(width: 10, alignment: .trailing)
+            Text(text)
+                .font(.caption2)
+                .foregroundColor(Color.secondaryText)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    // MARK: - Settings panel
+
+    var settingsPanel: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Toggle(isOn: Binding(
+                get: { usageManager.openAtLogin },
+                set: { newValue in
+                    usageManager.openAtLogin = newValue
+                    usageManager.applyLoginItem(newValue)
+                    usageManager.saveSettings()
+                }
+            )) {
+                Text("Open at login")
+                    .font(.caption)
+            }
+            .toggleStyle(.checkbox)
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Notifications")
+                    .font(.caption)
+                    .fontWeight(.semibold)
+
+                Toggle(isOn: Binding(
+                    get: { usageManager.usageNotificationsEnabled },
+                    set: { newValue in
+                        usageManager.usageNotificationsEnabled = newValue
+                        usageManager.saveSettings()
+                    }
+                )) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Usage alerts")
+                            .font(.caption)
+                        Text("At 25, 50, 75 and 90% of session usage")
+                            .font(.caption2)
+                            .foregroundColor(Color.secondaryText)
+                    }
+                }
+                .toggleStyle(.checkbox)
+
+                Toggle(isOn: Binding(
+                    get: { usageManager.statusNotificationsEnabled },
+                    set: { newValue in
+                        usageManager.statusNotificationsEnabled = newValue
+                        usageManager.saveSettings()
+                    }
+                )) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Status alerts")
+                            .font(.caption)
+                        Text("When a tracked Claude service has an outage")
+                            .font(.caption2)
+                            .foregroundColor(Color.secondaryText)
+                    }
+                }
+                .toggleStyle(.checkbox)
+
+                Button("Test notification") {
+                    usageManager.sendTestNotification()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 8) {
+                Toggle(isOn: Binding(
+                    get: { usageManager.shortcutEnabled },
+                    set: { newValue in
+                        usageManager.shortcutEnabled = newValue
+                        usageManager.saveSettings()
+                        if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
+                            appDelegate.setShortcutEnabled(newValue)
+                        }
+                    }
+                )) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Keyboard shortcut ⌘U")
+                            .font(.caption)
+                        Text("Toggle this popup from anywhere")
+                            .font(.caption2)
+                            .foregroundColor(Color.secondaryText)
+                    }
+                }
+                .toggleStyle(.checkbox)
+
+                if usageManager.shortcutEnabled && !usageManager.isAccessibilityEnabled {
+                    Button("Grant Accessibility permission") {
+                        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+
+                    Text("May be required for the shortcut to work in all apps")
+                        .font(.caption2)
+                        .foregroundColor(Color.secondaryText)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Tracked services")
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                Text("Status issues with unticked services aren't shown and don't alert.")
+                    .font(.caption2)
+                    .foregroundColor(Color.secondaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+                ForEach(statusManager.allComponents) { component in
+                    Toggle(isOn: Binding(
+                        get: { statusManager.isTracked(component.id) },
+                        set: { _ in statusManager.toggleComponent(component.id) }
+                    )) {
+                        Text(component.name)
+                            .font(.caption2)
+                    }
+                    .toggleStyle(.checkbox)
+                }
+            }
+
+            Divider()
+
+            // Appearance sits last on purpose: opening Settings auto-scrolls
+            // to the anchor below, so this lands in view.
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Appearance")
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                Picker("Appearance", selection: $appearanceMode) {
+                    Text("System").tag("system")
+                    Text("Dark").tag("dark")
+                    Text("Light").tag("light")
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .onChange(of: appearanceMode) { _ in
+                    (NSApplication.shared.delegate as? AppDelegate)?.applyAppearancePreference()
+                }
+            }
+        }
+        .padding(10)
+        .background(Color.primary.opacity(0.05))
+        .cornerRadius(8)
+    }
+
+    // MARK: - Banners
+
+    func announcementBanner(_ ann: Announcement) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                if let heading = ann.heading, !heading.isEmpty {
+                    Text(heading)
+                        .font(.caption)
+                        .fontWeight(.semibold)
+                }
+                Spacer()
+                Button(action: { updateManager.dismissCurrent() }) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(Color.secondaryText)
+                }
+                .buttonStyle(.borderless)
+            }
+            if !ann.title.isEmpty {
+                Text(ann.title)
+                    .font(.caption)
+            }
+            if !ann.body.isEmpty {
+                Text(ann.body)
+                    .font(.caption2)
+                    .foregroundColor(Color.secondaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if !ann.buttons.isEmpty {
+                HStack(spacing: 6) {
+                    ForEach(ann.buttons.indices, id: \.self) { i in
+                        bannerButton(ann.buttons[i])
+                    }
+                }
+            }
+        }
+        .padding(10)
+        .background(Color.accentColor.opacity(0.12))
+        .cornerRadius(8)
+    }
+
+    func updateBanner(_ update: AvailableUpdate) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "arrow.up.circle.fill")
+                    .font(.system(size: 11))
+                    .foregroundColor(.accentColor)
+                Text("Version \(update.version) available")
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                Spacer()
+                Button(action: { updateManager.dismissCurrent() }) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(Color.secondaryText)
+                }
+                .buttonStyle(.borderless)
+            }
+            Text(update.title)
+                .font(.caption)
+            Text(update.body)
+                .font(.caption2)
+                .foregroundColor(Color.secondaryText)
+                .fixedSize(horizontal: false, vertical: true)
+            if !update.buttons.isEmpty {
+                HStack(spacing: 6) {
+                    ForEach(update.buttons.indices, id: \.self) { i in
+                        bannerButton(update.buttons[i])
+                    }
+                }
+            }
+        }
+        .padding(10)
+        .background(Color.accentColor.opacity(0.12))
+        .cornerRadius(8)
     }
 
     @ViewBuilder
@@ -2335,12 +2301,84 @@ struct UsageView: View {
         }
     }
 
+    // MARK: - Formatting helpers
+
+    func formatTime(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
+    }
+
+    // "resets 17:20" for the session window; "resets 20 Aug, 17:20" for weekly
+    // windows. Time honors the user's 12/24-hour setting; the year is dropped.
+    func resetPhrase(_ date: Date, includeDate: Bool = false) -> String {
+        let time = DateFormatter()
+        time.timeStyle = .short
+        if includeDate {
+            let day = DateFormatter()
+            day.dateFormat = "d MMM"
+            return "resets \(day.string(from: date)), \(time.string(from: date))"
+        }
+        return "resets \(time.string(from: date))"
+    }
+
+    func shortDate(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "d MMM"
+        return f.string(from: date)
+    }
+
+    func money(_ minor: Int) -> String {
+        let v = Double(minor) / 100.0
+        return usageManager.creditCurrency == "USD"
+            ? String(format: "$%.2f", v)
+            : String(format: "%@ %.2f", usageManager.creditCurrency, v)
+    }
+
+    func colorForPercentage(_ percentage: Double) -> Color {
+        if percentage < 0.7 { return .usageGreen }
+        if percentage < 0.9 { return .usageAmber }
+        return .usageRed
+    }
+
+    func statusColor(for indicator: String) -> Color {
+        switch indicator {
+        case "none":     return .usageGreen
+        case "minor":    return .yellow
+        case "major":    return .usageAmber
+        case "critical": return .usageRed
+        default:         return .gray
+        }
+    }
+
+    func relativeTime(_ date: Date) -> String {
+        let elapsed = Int(Date().timeIntervalSince(date))
+        if elapsed < 60 { return "just now" }
+        if elapsed < 3600 {
+            let m = elapsed / 60
+            return "\(m) min\(m == 1 ? "" : "s") ago"
+        }
+        if elapsed < 86_400 {
+            let h = elapsed / 3600
+            return "\(h) hour\(h == 1 ? "" : "s") ago"
+        }
+        let d = elapsed / 86_400
+        return "\(d) day\(d == 1 ? "" : "s") ago"
+    }
+
+    func shortName(_ raw: String) -> String {
+        if let paren = raw.range(of: " (") {
+            return String(raw[..<paren.lowerBound])
+        }
+        return raw
+    }
+
     func badgeColor(for status: String) -> Color {
         switch status {
-        case "investigating": return Color.red.opacity(0.8)
-        case "identified":    return Color.orange
+        case "investigating": return Color.usageRed.opacity(0.8)
+        case "identified":    return Color.usageAmber
         case "monitoring":    return Color.blue
-        case "resolved":      return Color.green
+        case "resolved":      return Color.usageGreen
         default:              return Color.gray
         }
     }

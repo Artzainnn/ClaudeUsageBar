@@ -75,9 +75,9 @@ When you first launch ClaudeUsageBar, you'll see a welcome message. Follow these
 
 ### Adding Cookie to App
 
-1. Click **"Set Session Cookie"** in the app
+1. Click **"Cookie"** in the app footer
 2. Paste your cookie (Cmd+V works!)
-3. Click **"Save Cookie & Fetch"**
+3. Click **"Save & Fetch"**
 4. Your usage will appear immediately! 🎉
 
 ## ⚙️ Settings
@@ -92,7 +92,7 @@ Access settings by clicking the gear icon in the popup:
 ### Keyboard Shortcut (Cmd+U)
 - Toggle popup from anywhere on your Mac
 - Requires Accessibility permission
-- Click "Enable Keyboard Shortcut" to grant permission
+- Click "Grant Accessibility permission" to allow it
 
 ### Launch at Login
 - Start ClaudeUsageBar automatically when you log in
@@ -135,13 +135,13 @@ rm -rf build
 
 ### "No data yet" showing
 - Make sure you've pasted your session cookie
-- Click "Save Cookie & Fetch"
+- Click "Save & Fetch"
 - Verify you copied the full cookie string
 
 ### Cookie expired
 - Session cookies expire periodically
 - Get a new cookie from claude.ai
-- Click "Clear Cookie" then re-add it
+- Click "Clear" then re-add it
 
 ### Notifications not working
 - Click "Test Notification" in Settings
