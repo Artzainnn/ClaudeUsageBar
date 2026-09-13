@@ -43,6 +43,9 @@
       /* Twin brand (CodexUsageBar) for the cross-promo banner */
       --codex-green: #10a37f;
       --codex-green-dark: #0c8266;
+      /* Building It My Way accent, for the founder-journey banner */
+      --bimw-orange: #ef5a23;
+      --bimw-orange-dark: #cb5a22;
       --bg-dark: #0d0d0f;
       --bg-card: #18181b;
       --bg-card-hover: #1f1f23;
@@ -229,7 +232,7 @@
       justify-content: center;
       gap: 8px;
       padding: 0 16px;
-      background: linear-gradient(90deg, var(--codex-green), var(--codex-green-dark));
+      background: linear-gradient(90deg, var(--bimw-orange), var(--bimw-orange-dark));
       color: #ffffff;
       font-size: 13.5px;
       font-weight: 600;
@@ -1150,10 +1153,10 @@
 </head>
 <body style="background-color: #0d0d0f;">
 
-  <!-- Cross-promo banner -->
-  <a href="https://codexusagebar.com?utm_source=claudeusagebar&utm_medium=website&utm_campaign=cross_promo" target="_blank" class="announce-bar" data-fast-goal="cross_promo">
-    <span class="announce-bar-tag">ALSO</span>
-    Using Codex too? Get CodexUsageBar<span class="announce-bar-cta"> <span class="announce-bar-sep">&bull;</span> Free</span>
+  <!-- Founder-journey banner (links through /founder for tracking + one destination) -->
+  <a href="/founder" target="_blank" class="announce-bar" data-fast-goal="founder_banner">
+    <span class="announce-bar-tag">WATCH</span>
+    Building It My Way: the founder journey, on camera<span class="announce-bar-cta"> <span class="announce-bar-sep">&bull;</span> Watch Episode 1</span>
   </a>
   <div class="ambient"></div>
 
