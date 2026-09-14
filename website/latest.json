@@ -12,5 +12,23 @@
       "label": "Later",
       "action": "dismiss"
     }
-  ]
+  ],
+  "message": {
+    "id": "founder-ep1",
+    "heading": "FROM THE FOUNDER",
+    "title": "🎥 Watch the story behind this app",
+    "body": "Behind the scenes of ClaudeUsageBar, by its founder: the journey of building this app and a few others from Singapore, on camera.",
+    "buttons": [
+      {
+        "label": "Watch on YouTube",
+        "url": "https://claudeusagebar.com/founder",
+        "style": "primary"
+      }
+    ],
+    "notify": true,
+    "notification": {
+      "title": "From the founder of ClaudeUsageBar",
+      "body": "Behind the scenes of this app and my founder journey in Singapore."
+    }
+  }
 }
