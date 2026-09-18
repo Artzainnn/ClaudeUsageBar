@@ -7,6 +7,7 @@ A lightweight macOS menu bar app that displays your Claude.ai session and weekly
 ## ✨ Features
 
 - 🟢 **Real-time Usage Tracking**: Monitor session (5-hour) and weekly (7-day) usage
+- 👥 **Multiple Accounts**: Add several Claude accounts and switch the active one from the popover or menu bar
 - 🎨 **Color-Coded Menu Bar Icon**: Visual indication of usage levels (green/yellow/red)
 - 🔔 **Smart Notifications**: Alerts at 25%, 50%, 75%, and 90% usage thresholds
 - ⚡ **Auto-Refresh**: Updates every 5 minutes automatically
@@ -79,6 +80,22 @@ When you first launch ClaudeUsageBar, you'll see a welcome message. Follow these
 2. Paste your cookie (Cmd+V works!)
 3. Click **"Save Cookie & Fetch"**
 4. Your usage will appear immediately! 🎉
+
+### Using Multiple Accounts
+
+You can track more than one Claude account:
+
+1. Click **"Manage Accounts"** in the app
+2. Click **"Add another account"**, optionally give it a name (e.g. *Work*, *Personal*)
+3. Paste that account's cookie and click **"Add Account & Fetch"**
+
+Switch the active account any time from the dropdown at the top of the popover,
+or from the **Account** submenu when you right-click the menu bar icon. New
+accounts are auto-named from their email when you leave the name blank, and each
+account keeps its own usage figures and notification thresholds.
+
+> **Tip:** sign in to each account in a separate browser or private window so
+> their cookies don't overwrite each other when you copy them.
 
 ## ⚙️ Settings
 
