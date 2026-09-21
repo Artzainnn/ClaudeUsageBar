@@ -1,7 +1,7 @@
 import SwiftUI
 import AppKit
-import WebKit
 import Carbon
+import Combine
 import ServiceManagement
 
 // Secondary text: system gray in dark; darker in light, where the vibrant
@@ -35,37 +35,44 @@ struct UsageBar: View {
 
 // Main entry point
 class AppDelegate: NSObject, NSApplicationDelegate {
-    var statusItem: NSStatusItem!
+    /// Keyed by account slot, so a click can name the account it came from and
+    /// so an account losing its cookie takes its own item away with it.
+    var statusItems: [Int: NSStatusItem] = [:]
     var popover: NSPopover!
-    var usageManager: UsageManager!
+    var store: AccountsStore!
     var statusManager: StatusManager!
     var updateManager: UpdateManager!
     var eventMonitor: Any?
     var hotKeyRef: EventHotKeyRef?
+    private var cancellables = Set<AnyCancellable>()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // NSUserNotification (deprecated but works without permissions for unsigned apps)
         NSLog("✅ App launched, notifications ready")
 
-        // Create status bar item with variable length for compact display
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-
-        if let button = statusItem.button {
-            // Create Claude logo as initial icon
-            updateStatusIcon(percentage: 0)
-            button.action = #selector(handleClick)
-            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
-            button.target = self
-
-            // Force the button to be visible
-            button.appearsDisabled = false
-            button.isEnabled = true
-        }
-
         // Initialize managers
-        usageManager = UsageManager(statusItem: statusItem, delegate: self)
+        store = AccountsStore()
         statusManager = StatusManager()
         updateManager = UpdateManager()
+
+        // One subscription covers both things that move the menu bar — a new
+        // reading and a cookie saved or cleared — because AccountsStore
+        // forwards every account's objectWillChange, and writing any @Published
+        // on an account (sessionUsage included) is what emits it.
+        //
+        // The hop is not a stylistic main-thread bounce, it is what makes this
+        // correct: objectWillChange fires in willSet, *before* the new value is
+        // stored, and nothing between here and there re-dispatches. Read
+        // synchronously, syncStatusItems would see the state as it was before
+        // the change — a freshly pasted cookie would leave store.configured
+        // still holding one account, so no second icon and no badges until some
+        // later, unrelated emission happened to paper over it.
+        store.objectWillChange
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.syncStatusItems() }
+            .store(in: &cancellables)
+
+        syncStatusItems()
 
         // Create popover
         popover = NSPopover()
@@ -73,7 +80,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         popover.contentSize = NSSize(width: 360, height: 320)
         popover.behavior = .transient
         popover.contentViewController = NSHostingController(rootView: UsageView(
-            usageManager: usageManager,
+            store: store,
             statusManager: statusManager,
             updateManager: updateManager
         ))
@@ -97,13 +104,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // Fetch initial data
-        usageManager.fetchUsage()
+        store.refreshAll()
         statusManager.fetch()
         updateManager.fetch()
 
         // Usage + Anthropic status are time-sensitive — poll every 5 min.
         Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { _ in
-            self.usageManager.fetchUsage()
+            self.store.refreshAll()
             self.statusManager.fetch()
         }
 
@@ -141,7 +148,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         checkAccessibilityPermissions()
 
         // Only register if user has the shortcut enabled
-        if usageManager.shortcutEnabled {
+        if store.accounts[0].shortcutEnabled {
             registerGlobalHotKey()
         }
     }
@@ -242,48 +249,81 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApplication.shared.terminate(nil)
     }
 
+    /// The ⌘U hotkey and the right-click menu both reach the popover through
+    /// here, and neither of them knows which icon to anchor to.
     @objc func togglePopover() {
+        togglePopover(anchoredTo: nil)
+    }
+
+    func togglePopover(anchoredTo slot: Int?) {
         if popover.isShown {
             closePopover()
         } else {
-            openPopover()
+            openPopover(anchoredTo: slot)
         }
     }
 
-    @objc func handleClick() {
+    @objc func handleClick(_ sender: NSStatusBarButton) {
         guard let event = NSApp.currentEvent else { return }
+        // Identity, not equality: which of the buttons we own sent this.
+        guard let slot = statusItems.first(where: { $0.value.button === sender })?.key else { return }
 
         if event.type == .rightMouseUp {
             // Right click - show menu
             let menu = NSMenu()
-            let toggleItem = NSMenuItem(title: "Toggle Usage (⌘U)", action: #selector(togglePopover), keyEquivalent: "u")
+            // Spelled out because togglePopover(anchoredTo:) now shares the
+            // name; #selector resolves by name before it filters by @objc.
+            let toggleItem = NSMenuItem(title: "Toggle Usage (⌘U)",
+                                        action: #selector(AppDelegate.togglePopover as (AppDelegate) -> () -> Void),
+                                        keyEquivalent: "u")
             toggleItem.keyEquivalentModifierMask = .command
             menu.addItem(toggleItem)
             menu.addItem(NSMenuItem.separator())
             menu.addItem(NSMenuItem(title: "Quit ClaudeUsageBar", action: #selector(quitApp), keyEquivalent: "q"))
-            statusItem.menu = menu
-            statusItem.button?.performClick(nil)
-            statusItem.menu = nil
+            // Attached and detached on the item that was clicked: left over on
+            // the wrong one, a later left click would drop the menu instead of
+            // opening the popover.
+            statusItems[slot]?.menu = menu
+            statusItems[slot]?.button?.performClick(nil)
+            statusItems[slot]?.menu = nil
         } else {
             // Left click - toggle popover
-            togglePopover()
+            togglePopover(anchoredTo: slot)
         }
     }
 
-    func openPopover() {
-        if let button = statusItem.button {
-            // Force UI refresh by updating percentages
-            DispatchQueue.main.async {
-                self.usageManager.updatePercentages()
+    func openPopover(anchoredTo slot: Int?) {
+        // ⌘U has no clicked icon to anchor to, so it falls back to the first
+        // one. With no items at all there is nothing to anchor to and nothing
+        // the user could have been looking at, so this is a no-op, not a crash.
+        guard let anchorSlot = slot ?? statusItems.keys.sorted().first,
+              let button = statusItems[anchorSlot]?.button else { return }
+
+        // Force UI refresh by updating percentages
+        DispatchQueue.main.async {
+            self.store.accounts.forEach { $0.updatePercentages() }
+        }
+
+        // Pin the content size before showing. NSPopover is positioned from the
+        // size it has at show() time, but an NSHostingController only reports
+        // its real height after a layout pass — so the popover was placed for
+        // the 320pt guess above, then grew to its true height afterwards. An
+        // NSWindow grows upward from its origin, so that growth pushed the top
+        // off the screen: measured at 1277 on an 1169pt display, clipping the
+        // title and the first usage bar.
+        if let contentView = popover.contentViewController?.view {
+            contentView.layoutSubtreeIfNeeded()
+            let fitting = contentView.fittingSize
+            if fitting.height > 1 {
+                popover.contentSize = NSSize(width: popover.contentSize.width, height: fitting.height)
             }
+        }
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
 
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-
-            // Add event monitor to detect clicks outside the popover
-            eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
-                if self?.popover.isShown == true {
-                    self?.closePopover()
-                }
+        // Add event monitor to detect clicks outside the popover
+        eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
+            if self?.popover.isShown == true {
+                self?.closePopover()
             }
         }
     }
@@ -298,73 +338,46 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func updateStatusIcon(percentage: Int) {
-        guard let button = statusItem.button else { return }
-
-        // Determine color based on percentage
-        let color: NSColor
-        if percentage < 70 {
-            color = NSColor(red: 0.13, green: 0.77, blue: 0.37, alpha: 1.0) // Green
-        } else if percentage < 90 {
-            color = NSColor(red: 1.0, green: 0.8, blue: 0.0, alpha: 1.0) // Yellow
-        } else {
-            color = NSColor(red: 1.0, green: 0.23, blue: 0.19, alpha: 1.0) // Red
-        }
-
-        // Create spark icon with color
-        let sparkIcon = createSparkIcon(color: color)
-
-        // Set image and title
-        button.image = sparkIcon
-        button.title = " \(percentage)%"
+    func updateIcon(for account: UsageManager) {
+        guard let button = statusItems[account.slot]?.button else { return }
+        button.image = menuBarIcon(percentage: account.sessionUsage,
+                                   badge: store.showsBadges ? account.slot : nil)
+        button.title = " \(account.sessionUsage)%"
     }
 
-    func createSparkIcon(color: NSColor) -> NSImage {
-        let size = NSSize(width: 16, height: 16)
-        let image = NSImage(size: size)
+    func syncStatusItems() {
+        // With no cookie yet there is nothing configured, but the app must not
+        // vanish from the menu bar — slot 1 stands in until a cookie arrives.
+        // It is the only icon on screen, so it gets no badge: a lone "1" would
+        // number a list of one.
+        let visible = store.configured.isEmpty ? [store.accounts[0]] : store.configured
+        let wanted = Set(visible.map { $0.slot })
 
-        image.lockFocus()
-
-        // SVG path: M8 1L9 6L13 3L10 7L15 8L10 9L13 13L9 10L8 15L7 10L3 13L6 9L1 8L6 7L3 3L7 6L8 1Z
-        let path = NSBezierPath()
-        path.move(to: NSPoint(x: 8, y: 1))
-        path.line(to: NSPoint(x: 9, y: 6))
-        path.line(to: NSPoint(x: 13, y: 3))
-        path.line(to: NSPoint(x: 10, y: 7))
-        path.line(to: NSPoint(x: 15, y: 8))
-        path.line(to: NSPoint(x: 10, y: 9))
-        path.line(to: NSPoint(x: 13, y: 13))
-        path.line(to: NSPoint(x: 9, y: 10))
-        path.line(to: NSPoint(x: 8, y: 15))
-        path.line(to: NSPoint(x: 7, y: 10))
-        path.line(to: NSPoint(x: 3, y: 13))
-        path.line(to: NSPoint(x: 6, y: 9))
-        path.line(to: NSPoint(x: 1, y: 8))
-        path.line(to: NSPoint(x: 6, y: 7))
-        path.line(to: NSPoint(x: 3, y: 3))
-        path.line(to: NSPoint(x: 7, y: 6))
-        path.close()
-
-        color.setFill()
-        path.fill()
-
-        image.unlockFocus()
-        image.isTemplate = false
-
-        return image
-    }
-}
-
-// NSColor extension for hex conversion
-extension NSColor {
-    var hexString: String {
-        guard let rgbColor = self.usingColorSpace(.deviceRGB) else {
-            return "#000000"
+        for (slot, item) in statusItems where !wanted.contains(slot) {
+            NSStatusBar.system.removeStatusItem(item)
+            statusItems[slot] = nil
         }
-        let r = Int(rgbColor.redComponent * 255)
-        let g = Int(rgbColor.greenComponent * 255)
-        let b = Int(rgbColor.blueComponent * 255)
-        return String(format: "#%02X%02X%02X", r, g, b)
+
+        for account in visible where statusItems[account.slot] == nil {
+            let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+            // Without an autosaveName macOS forgets where the user dragged each
+            // icon, and two items would shuffle position on every launch.
+            item.autosaveName = "cub-account-\(account.slot)"
+            if let button = item.button {
+                button.action = #selector(handleClick(_:))
+                button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+                button.target = self
+
+                // Force the button to be visible
+                button.appearsDisabled = false
+                button.isEnabled = true
+            }
+            statusItems[account.slot] = item
+        }
+
+        // The badge appears only with two accounts, so adding or removing one
+        // has to restyle the other as well.
+        for account in visible { updateIcon(for: account) }
     }
 }
 
@@ -377,557 +390,6 @@ struct Main {
         app.delegate = delegate
         app.setActivationPolicy(.accessory)
         app.run()
-    }
-}
-
-class UsageManager: ObservableObject {
-    @Published var sessionUsage: Int = 0
-    @Published var sessionLimit: Int = 100
-    @Published var weeklyUsage: Int = 0
-    @Published var weeklyLimit: Int = 100
-    @Published var weeklySonnetUsage: Int = 0
-    @Published var weeklySonnetLimit: Int = 100
-    @Published var weeklyFableUsage: Int = 0
-    @Published var weeklyFableLimit: Int = 100
-    // Extra usage spend (from /overage_spend_limit). Shown only when there's spend.
-    @Published var extraSpentMinor: Int = 0
-    @Published var extraLimitMinor: Int = 0
-    @Published var extraResetsAt: Date?
-    @Published var freeCreditsMinor: Int = 0   // remaining free/promo credits (/prepaid/credits)
-    @Published var creditCurrency: String = "USD"
-    @Published var hasCreditUsage: Bool = false
-    @Published var sessionResetsAt: Date?
-    @Published var weeklyResetsAt: Date?
-    @Published var weeklySonnetResetsAt: Date?
-    @Published var weeklyFableResetsAt: Date?
-    @Published var lastUpdated: Date = Date()
-    @Published var isLoading: Bool = false
-    @Published var errorMessage: String?
-    @Published var usageNotificationsEnabled: Bool = true
-    @Published var statusNotificationsEnabled: Bool = true
-    @Published var openAtLogin: Bool = false
-    @Published var hasWeeklySonnet: Bool = false
-    @Published var hasWeeklyFable: Bool = false
-    @Published var hasFetchedData: Bool = false
-    @Published var isAccessibilityEnabled: Bool = false
-    @Published var shortcutEnabled: Bool = true
-
-    private var statusItem: NSStatusItem?
-    private var sessionCookie: String = ""
-    private weak var delegate: AppDelegate?
-    private var lastNotifiedThreshold: Int = 0
-
-    init(statusItem: NSStatusItem?, delegate: AppDelegate? = nil) {
-        self.statusItem = statusItem
-        self.delegate = delegate
-        loadSessionCookie()
-        loadSettings()
-        checkAccessibilityStatus()
-    }
-
-    func checkAccessibilityStatus() {
-        isAccessibilityEnabled = AXIsProcessTrusted()
-    }
-
-    func loadSessionCookie() {
-        if let savedCookie = UserDefaults.standard.string(forKey: "claude_session_cookie") {
-            sessionCookie = savedCookie
-        }
-    }
-
-    func loadSettings() {
-        // Migrate from legacy single notifications_enabled flag (pre-v1.1) to split flags
-        let hasUsageKey  = UserDefaults.standard.object(forKey: "usage_notifications_enabled")  != nil
-        let hasStatusKey = UserDefaults.standard.object(forKey: "status_notifications_enabled") != nil
-
-        if !hasUsageKey || !hasStatusKey {
-            let legacyHasKey = UserDefaults.standard.object(forKey: "notifications_enabled") != nil
-            let legacyValue  = legacyHasKey ? UserDefaults.standard.bool(forKey: "notifications_enabled") : true
-            if !hasUsageKey {
-                usageNotificationsEnabled = legacyValue
-                UserDefaults.standard.set(legacyValue, forKey: "usage_notifications_enabled")
-            }
-            if !hasStatusKey {
-                statusNotificationsEnabled = legacyValue
-                UserDefaults.standard.set(legacyValue, forKey: "status_notifications_enabled")
-            }
-        }
-        if hasUsageKey {
-            usageNotificationsEnabled = UserDefaults.standard.bool(forKey: "usage_notifications_enabled")
-        }
-        if hasStatusKey {
-            statusNotificationsEnabled = UserDefaults.standard.bool(forKey: "status_notifications_enabled")
-        }
-
-        // Reflect the real system login-item state, not just a stored bool.
-        if #available(macOS 13.0, *) {
-            openAtLogin = (SMAppService.mainApp.status == .enabled)
-        } else {
-            openAtLogin = UserDefaults.standard.bool(forKey: "open_at_login")
-        }
-        lastNotifiedThreshold = UserDefaults.standard.integer(forKey: "last_notified_threshold")
-        // Default shortcut to enabled if not previously set
-        if UserDefaults.standard.object(forKey: "shortcut_enabled") == nil {
-            shortcutEnabled = true
-        } else {
-            shortcutEnabled = UserDefaults.standard.bool(forKey: "shortcut_enabled")
-        }
-    }
-
-    func saveSettings() {
-        UserDefaults.standard.set(usageNotificationsEnabled,  forKey: "usage_notifications_enabled")
-        UserDefaults.standard.set(statusNotificationsEnabled, forKey: "status_notifications_enabled")
-        UserDefaults.standard.set(openAtLogin, forKey: "open_at_login")
-        UserDefaults.standard.set(shortcutEnabled, forKey: "shortcut_enabled")
-        UserDefaults.standard.synchronize()
-    }
-
-    // Actually register/unregister the app as a macOS login item.
-    func applyLoginItem(_ enabled: Bool) {
-        guard #available(macOS 13.0, *) else { return }
-        do {
-            if enabled {
-                if SMAppService.mainApp.status != .enabled {
-                    try SMAppService.mainApp.register()
-                }
-            } else {
-                if SMAppService.mainApp.status == .enabled {
-                    try SMAppService.mainApp.unregister()
-                }
-            }
-            NSLog("🔑 Login item \(enabled ? "registered" : "unregistered")")
-        } catch {
-            NSLog("❌ Login item error: \(error.localizedDescription)")
-        }
-    }
-
-    func saveSessionCookie(_ cookie: String) {
-        NSLog("ClaudeUsage: Saving cookie, length: \(cookie.count)")
-        sessionCookie = cookie
-        UserDefaults.standard.set(cookie, forKey: "claude_session_cookie")
-        UserDefaults.standard.synchronize()
-        NSLog("ClaudeUsage: Cookie saved successfully")
-    }
-
-    func clearSessionCookie() {
-        NSLog("ClaudeUsage: Clearing cookie")
-        sessionCookie = ""
-        UserDefaults.standard.removeObject(forKey: "claude_session_cookie")
-        UserDefaults.standard.synchronize()
-
-        // Reset all data
-        sessionUsage = 0
-        weeklyUsage = 0
-        weeklySonnetUsage = 0
-        weeklyFableUsage = 0
-        sessionResetsAt = nil
-        weeklyResetsAt = nil
-        weeklySonnetResetsAt = nil
-        weeklyFableResetsAt = nil
-        extraSpentMinor = 0
-        extraLimitMinor = 0
-        extraResetsAt = nil
-        freeCreditsMinor = 0
-        hasCreditUsage = false
-        hasFetchedData = false
-        hasWeeklySonnet = false
-        hasWeeklyFable = false
-        errorMessage = nil
-        lastNotifiedThreshold = 0
-        UserDefaults.standard.set(0, forKey: "last_notified_threshold")
-
-        // Update status bar to show 0%
-        delegate?.updateStatusIcon(percentage: 0)
-
-        NSLog("ClaudeUsage: Cookie cleared, data reset")
-    }
-
-    func fetchOrganizationId(completion: @escaping (String?) -> Void) {
-        // Get org ID from the lastActiveOrg cookie value
-        let cookieParts = sessionCookie.components(separatedBy: ";")
-        for part in cookieParts {
-            let trimmed = part.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("lastActiveOrg=") {
-                let orgId = trimmed.replacingOccurrences(of: "lastActiveOrg=", with: "")
-                NSLog("📋 Found org ID in cookie: \(orgId)")
-                completion(orgId)
-                return
-            }
-        }
-
-        // If not in cookie, fetch from bootstrap
-        guard let url = URL(string: "https://claude.ai/api/bootstrap") else {
-            completion(nil)
-            return
-        }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.setValue("sessionKey=\(sessionCookie)", forHTTPHeaderField: "Cookie")
-
-        NSLog("📡 Fetching bootstrap to get org ID...")
-
-        URLSession.shared.dataTask(with: request) { data, response, error in
-            guard let data = data,
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let account = json["account"] as? [String: Any],
-                  let lastActiveOrgId = account["lastActiveOrgId"] as? String else {
-                NSLog("❌ Could not parse org ID from bootstrap")
-                completion(nil)
-                return
-            }
-            NSLog("✅ Got org ID from bootstrap: \(lastActiveOrgId)")
-            completion(lastActiveOrgId)
-        }.resume()
-    }
-
-    func fetchUsage() {
-        guard !sessionCookie.isEmpty else {
-            DispatchQueue.main.async {
-                self.errorMessage = "Session cookie not set"
-                self.updateStatusBar()
-            }
-            return
-        }
-
-        isLoading = true
-        errorMessage = nil
-
-        // Extract org ID from cookie
-        fetchOrganizationId { [weak self] orgId in
-            guard let self = self, let orgId = orgId else {
-                DispatchQueue.main.async {
-                    self?.errorMessage = "Could not get org ID from cookie"
-                    self?.isLoading = false
-                }
-                return
-            }
-
-            self.fetchUsageWithOrgId(orgId)
-            self.fetchExtraUsage(orgId)
-            self.fetchFreeCredits(orgId)
-        }
-    }
-
-    // Remaining free/promo credits (balance) from /prepaid/credits.
-    func fetchFreeCredits(_ orgId: String) {
-        guard let url = URL(string: "https://claude.ai/api/organizations/\(orgId)/prepaid/credits") else { return }
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.setValue(sessionCookie, forHTTPHeaderField: "Cookie")
-        request.setValue("*/*", forHTTPHeaderField: "Accept")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("https://claude.ai", forHTTPHeaderField: "Origin")
-        request.setValue("https://claude.ai", forHTTPHeaderField: "Referer")
-        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
-        request.setValue("claude.ai", forHTTPHeaderField: "authority")
-
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
-            DispatchQueue.main.async {
-                guard let self = self,
-                      let http = response as? HTTPURLResponse, http.statusCode == 200,
-                      let data = data,
-                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
-                // `amount` is the current balance; fall back to summing remaining tranches.
-                if let amount = json["amount"] as? Int {
-                    self.freeCreditsMinor = amount
-                } else {
-                    var remaining = 0
-                    for key in ["tranches", "promo_tranches"] {
-                        if let arr = json[key] as? [[String: Any]] {
-                            for t in arr { remaining += (t["remaining_amount_minor_units"] as? Int) ?? 0 }
-                        }
-                    }
-                    self.freeCreditsMinor = remaining
-                }
-                if let cur = json["currency"] as? String { self.creditCurrency = cur }
-                NSLog("🎁 Free credits left: \(self.freeCreditsMinor) \(self.creditCurrency)")
-            }
-        }.resume()
-    }
-
-    // Extra usage spend + monthly limit live on a separate endpoint (not /usage).
-    func fetchExtraUsage(_ orgId: String) {
-        guard let url = URL(string: "https://claude.ai/api/organizations/\(orgId)/overage_spend_limit") else { return }
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.setValue(sessionCookie, forHTTPHeaderField: "Cookie")
-        request.setValue("*/*", forHTTPHeaderField: "Accept")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("https://claude.ai", forHTTPHeaderField: "Origin")
-        request.setValue("https://claude.ai", forHTTPHeaderField: "Referer")
-        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
-        request.setValue("claude.ai", forHTTPHeaderField: "authority")
-
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
-            DispatchQueue.main.async {
-                guard let self = self,
-                      let http = response as? HTTPURLResponse, http.statusCode == 200,
-                      let data = data,
-                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
-
-                let spent = (json["used_credits"] as? Int) ?? 0
-                let limit = (json["monthly_credit_limit"] as? Int) ?? 0
-                self.extraSpentMinor = spent
-                self.extraLimitMinor = limit
-                self.creditCurrency = (json["currency"] as? String) ?? "USD"
-                if let resetStr = json["disabled_until"] as? String {
-                    let f = ISO8601DateFormatter()
-                    f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-                    self.extraResetsAt = f.date(from: resetStr) ?? ISO8601DateFormatter().date(from: resetStr)
-                }
-                self.hasCreditUsage = spent > 0
-                NSLog("💳 Extra usage: \(spent)/\(limit) \(self.creditCurrency)")
-            }
-        }.resume()
-    }
-
-    func fetchUsageWithOrgId(_ orgId: String) {
-        let urlString = "https://claude.ai/api/organizations/\(orgId)/usage"
-
-        guard let url = URL(string: urlString) else {
-            DispatchQueue.main.async {
-                self.errorMessage = "Invalid URL"
-                self.isLoading = false
-            }
-            return
-        }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-
-        // Use the full cookie string (user provides all cookies, not just sessionKey)
-        request.setValue(sessionCookie, forHTTPHeaderField: "Cookie")
-        request.setValue("*/*", forHTTPHeaderField: "Accept")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("https://claude.ai", forHTTPHeaderField: "Origin")
-        request.setValue("https://claude.ai", forHTTPHeaderField: "Referer")
-        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
-        request.setValue("claude.ai", forHTTPHeaderField: "authority")
-
-        NSLog("🔍 Fetching from: \(urlString)")
-
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
-            DispatchQueue.main.async {
-                self?.isLoading = false
-
-                if let error = error {
-                    NSLog("❌ Error: \(error.localizedDescription)")
-                    self?.errorMessage = "Network error"
-                    self?.updateStatusBar()
-                    return
-                }
-
-                guard let httpResponse = response as? HTTPURLResponse else {
-                    self?.errorMessage = "Invalid response"
-                    self?.updateStatusBar()
-                    return
-                }
-
-                NSLog("📡 Status: \(httpResponse.statusCode)")
-
-                if let data = data, let responseString = String(data: data, encoding: .utf8) {
-                    NSLog("📦 Response: \(responseString)")
-                }
-
-                if httpResponse.statusCode == 200, let data = data {
-                    self?.parseUsageData(data)
-                } else {
-                    self?.errorMessage = "HTTP \(httpResponse.statusCode)"
-                }
-
-                self?.updateStatusBar()
-            }
-        }.resume()
-    }
-
-    func parseUsageData(_ data: Data) {
-        do {
-            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                errorMessage = "Invalid JSON"
-                return
-            }
-
-            NSLog("📊 Parsing usage data...")
-
-            let iso8601Formatter = ISO8601DateFormatter()
-            iso8601Formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-
-            // Parse the actual claude.ai response format
-            if let fiveHour = json["five_hour"] as? [String: Any] {
-                if let sessionUtil = fiveHour["utilization"] as? Double {
-                    sessionUsage = Int(sessionUtil)
-                    sessionLimit = 100
-                }
-                if let resetsAtString = fiveHour["resets_at"] as? String {
-                    NSLog("🕐 Session resets_at string: \(resetsAtString)")
-                    if let resetsAt = iso8601Formatter.date(from: resetsAtString) {
-                        sessionResetsAt = resetsAt
-                        NSLog("✅ Parsed session reset time: \(resetsAt)")
-                    } else {
-                        NSLog("❌ Failed to parse session reset time")
-                    }
-                }
-            }
-
-            if let sevenDay = json["seven_day"] as? [String: Any] {
-                if let weeklyUtil = sevenDay["utilization"] as? Double {
-                    weeklyUsage = Int(weeklyUtil)
-                    weeklyLimit = 100
-                }
-                if let resetsAtString = sevenDay["resets_at"] as? String {
-                    NSLog("🕐 Weekly resets_at string: \(resetsAtString)")
-                    if let resetsAt = iso8601Formatter.date(from: resetsAtString) {
-                        weeklyResetsAt = resetsAt
-                        NSLog("✅ Parsed weekly reset time: \(resetsAt)")
-                    } else {
-                        NSLog("❌ Failed to parse weekly reset time")
-                    }
-                }
-            }
-
-            // Check for seven_day_sonnet (Pro plan feature)
-            if let sevenDaySonnet = json["seven_day_sonnet"] as? [String: Any] {
-                hasWeeklySonnet = true
-                if let sonnetUtil = sevenDaySonnet["utilization"] as? Double {
-                    weeklySonnetUsage = Int(sonnetUtil)
-                    weeklySonnetLimit = 100
-                }
-                if let resetsAtString = sevenDaySonnet["resets_at"] as? String {
-                    NSLog("🕐 Weekly Sonnet resets_at string: \(resetsAtString)")
-                    if let resetsAt = iso8601Formatter.date(from: resetsAtString) {
-                        weeklySonnetResetsAt = resetsAt
-                        NSLog("✅ Parsed weekly Sonnet reset time: \(resetsAt)")
-                    } else {
-                        NSLog("❌ Failed to parse weekly Sonnet reset time")
-                    }
-                }
-            } else {
-                hasWeeklySonnet = false
-            }
-
-            // Fable is a new, separately-counted model. It isn't a top-level
-            // key like seven_day_sonnet — it lives in the `limits` array as a
-            // model-scoped weekly limit (scope.model.display_name == "Fable").
-            // The bar is only surfaced in the UI when usage is above 1%.
-            hasWeeklyFable = false
-            if let limits = json["limits"] as? [[String: Any]] {
-                let fableLimit = limits.first { entry in
-                    let scope = entry["scope"] as? [String: Any]
-                    let model = scope?["model"] as? [String: Any]
-                    return (model?["display_name"] as? String) == "Fable"
-                }
-                if let fable = fableLimit {
-                    hasWeeklyFable = true
-                    // `percent` may decode as Int or Double depending on payload.
-                    if let p = fable["percent"] as? Int {
-                        weeklyFableUsage = p
-                    } else if let p = fable["percent"] as? Double {
-                        weeklyFableUsage = Int(p)
-                    }
-                    weeklyFableLimit = 100
-                    if let resetsAtString = fable["resets_at"] as? String {
-                        NSLog("🕐 Weekly Fable resets_at string: \(resetsAtString)")
-                        if let resetsAt = iso8601Formatter.date(from: resetsAtString) {
-                            weeklyFableResetsAt = resetsAt
-                            NSLog("✅ Parsed weekly Fable reset time: \(resetsAt)")
-                        } else {
-                            NSLog("❌ Failed to parse weekly Fable reset time")
-                        }
-                    }
-                }
-            }
-
-            // (Prepaid usage credits are fetched separately from /prepaid/credits.)
-
-            // Log what we found
-            NSLog("✅ Parsed: Session \(sessionUsage)%, Weekly \(weeklyUsage)%\(hasWeeklySonnet ? ", Weekly Sonnet \(weeklySonnetUsage)%" : "")\(hasWeeklyFable ? ", Weekly Fable \(weeklyFableUsage)%" : "")")
-
-            lastUpdated = Date()
-            errorMessage = nil
-            hasFetchedData = true
-
-            // Update percentage values for progress bars
-            updatePercentages()
-        } catch {
-            NSLog("❌ Parse error: \(error.localizedDescription)")
-            errorMessage = "Parse error"
-        }
-    }
-
-    func updateStatusBar() {
-        let sessionPercent = Int((Double(sessionUsage) / Double(sessionLimit)) * 100)
-
-        // Update the icon color
-        delegate?.updateStatusIcon(percentage: sessionPercent)
-
-        // Check for notification thresholds
-        checkNotificationThresholds(percentage: sessionPercent)
-    }
-
-    func checkNotificationThresholds(percentage: Int) {
-        NSLog("🔔 Checking notifications: percentage=\(percentage)%, enabled=\(usageNotificationsEnabled), lastNotified=\(lastNotifiedThreshold)%")
-
-        guard usageNotificationsEnabled else {
-            NSLog("⚠️ Usage notifications disabled")
-            return
-        }
-
-        let thresholds = [25, 50, 75, 90]
-
-        for threshold in thresholds {
-            if percentage >= threshold && lastNotifiedThreshold < threshold {
-                NSLog("📬 Sending notification for \(threshold)% threshold")
-                sendNotification(percentage: percentage, threshold: threshold)
-                lastNotifiedThreshold = threshold
-                // Persist the threshold
-                UserDefaults.standard.set(lastNotifiedThreshold, forKey: "last_notified_threshold")
-                UserDefaults.standard.synchronize()
-            }
-        }
-
-        // Reset if usage drops below current threshold
-        if percentage < lastNotifiedThreshold {
-            let newThreshold = thresholds.filter { $0 <= percentage }.last ?? 0
-            NSLog("🔄 Resetting notification threshold from \(lastNotifiedThreshold)% to \(newThreshold)%")
-            lastNotifiedThreshold = newThreshold
-            UserDefaults.standard.set(lastNotifiedThreshold, forKey: "last_notified_threshold")
-            UserDefaults.standard.synchronize()
-        }
-    }
-
-    func sendNotification(percentage: Int, threshold: Int) {
-        let notification = NSUserNotification()
-        notification.title = "Claude Usage Alert"
-        notification.informativeText = "You've reached \(percentage)% of your 5-hour session limit"
-        notification.soundName = NSUserNotificationDefaultSoundName
-
-        NSUserNotificationCenter.default.deliver(notification)
-        NSLog("📬 Sent notification for \(threshold)% threshold")
-    }
-
-    func sendTestNotification() {
-        NSLog("🔔 Test notification button clicked")
-
-        let notification = NSUserNotification()
-        notification.title = "Claude Usage Alert"
-        notification.informativeText = "Test notification - You've reached 75% of your 5-hour session limit"
-        notification.soundName = NSUserNotificationDefaultSoundName
-
-        NSUserNotificationCenter.default.deliver(notification)
-        NSLog("📬 Test notification sent successfully")
-    }
-
-    @Published var sessionPercentage: Double = 0.0
-    @Published var weeklyPercentage: Double = 0.0
-    @Published var weeklySonnetPercentage: Double = 0.0
-    @Published var weeklyFablePercentage: Double = 0.0
-
-    func updatePercentages() {
-        sessionPercentage = Double(sessionUsage) / Double(sessionLimit)
-        weeklyPercentage = Double(weeklyUsage) / Double(weeklyLimit)
-        weeklySonnetPercentage = Double(weeklySonnetUsage) / Double(weeklySonnetLimit)
-        weeklyFablePercentage = Double(weeklyFableUsage) / Double(weeklyFableLimit)
     }
 }
 
@@ -1343,51 +805,18 @@ class UpdateManager: ObservableObject {
     }
 }
 
-// Custom NSTextField that properly handles paste
-class CustomTextField: NSTextField {
-    var onTextChange: ((String) -> Void)?
-
-    override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        if event.type == .keyDown {
-            if (event.modifierFlags.contains(.command)) {
-                switch event.charactersIgnoringModifiers {
-                case "v":
-                    if let string = NSPasteboard.general.string(forType: .string) {
-                        self.stringValue = string
-                        onTextChange?(string)
-                        NSLog("ClaudeUsage: Pasted text length: \(string.count)")
-                        return true
-                    }
-                case "a":
-                    self.currentEditor()?.selectAll(nil)
-                    return true
-                case "c":
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(self.stringValue, forType: .string)
-                    return true
-                case "x":
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(self.stringValue, forType: .string)
-                    self.stringValue = ""
-                    onTextChange?("")
-                    return true
-                default:
-                    break
-                }
-            }
-        }
-        return super.performKeyEquivalent(with: event)
-    }
-
-    override func textDidChange(_ notification: Notification) {
-        super.textDidChange(notification)
-        onTextChange?(self.stringValue)
-    }
-}
-
 // Custom TextView that ensures keyboard commands work
 class PasteableNSTextView: NSTextView {
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        // AppKit dispatches performKeyEquivalent DOWN THE VIEW HIERARCHY, not to
+        // the first responder. With one of these in the popover that was
+        // harmless — the only instance was also the focused one. With one per
+        // account, the first in subview order claimed every Cmd+V and returned
+        // true, so the paste landed in account 1's field no matter which field
+        // the user had clicked. Acting only when focused restores the mapping.
+        guard window?.firstResponder === self else {
+            return super.performKeyEquivalent(with: event)
+        }
         if event.modifierFlags.contains(.command) {
             switch event.charactersIgnoringModifiers {
             case "v": // Paste
@@ -1484,10 +913,10 @@ private struct ContentHeightKey: PreferenceKey {
 }
 
 struct UsageView: View {
-    @ObservedObject var usageManager: UsageManager
+    @ObservedObject var store: AccountsStore
     @ObservedObject var statusManager: StatusManager
     @ObservedObject var updateManager: UpdateManager
-    @State private var sessionCookieInput: String = ""
+    @State private var cookieDrafts: [Int: String] = [:]
     @State private var showingCookieInput: Bool = false
     @State private var showingSettings: Bool = false
     @State private var showingStatusDetails: Bool = false
@@ -1496,6 +925,12 @@ struct UsageView: View {
     @AppStorage("appearance_mode") private var appearanceMode: String = "system"
 
     private let maxPopupHeight: CGFloat = 600
+
+    /// The pasted-but-not-yet-saved cookie, keyed by slot so one account's
+    /// draft can never be written onto the other's key.
+    private func binding(for slot: Int) -> Binding<String> {
+        Binding(get: { cookieDrafts[slot] ?? "" }, set: { cookieDrafts[slot] = $0 })
+    }
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -1524,10 +959,7 @@ struct UsageView: View {
                 measuredHeight = value
             }
             .onAppear {
-                if let savedCookie = UserDefaults.standard.string(forKey: "claude_session_cookie") {
-                    sessionCookieInput = String(savedCookie.prefix(20)) + "..."
-                }
-                usageManager.updatePercentages()
+                store.accounts.forEach { $0.updatePercentages() }
             }
             .onChange(of: showingSettings) { isOpen in
                 if isOpen {
@@ -1624,195 +1056,18 @@ struct UsageView: View {
                 .cornerRadius(6)
             }
 
-            if let error = usageManager.errorMessage {
-                Text(error)
-                    .font(.caption)
-                    .foregroundColor(.orange)
-                    .padding(.bottom, 8)
-            }
-
             // Only show usage if data has been fetched
-            if !usageManager.hasFetchedData {
+            if store.configured.isEmpty {
                 Text("👋 Welcome! Set your session cookie below to get started.")
                     .font(.subheadline)
                     .foregroundColor(Color.secondaryText)
                     .padding(.vertical, 8)
             }
 
-            // Session Usage
-            if usageManager.hasFetchedData {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text("Session (5 hour)")
-                        .font(.subheadline)
-                    Spacer()
-                    if let resetTime = usageManager.sessionResetsAt {
-                        Text("Resets \(formatResetTime(resetTime))")
-                            .font(.caption)
-                            .foregroundColor(Color.secondaryText)
-                    }
-                }
-
-                UsageBar(value: usageManager.sessionPercentage,
-                         color: colorForPercentage(usageManager.sessionPercentage))
-
-                Text("\(Int(usageManager.sessionPercentage * 100))% used")
-                    .font(.caption)
-                    .foregroundColor(Color.secondaryText)
-            }
-
-            // Weekly Usage
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text("Weekly (7 day)")
-                        .font(.subheadline)
-                    Spacer()
-                    if let resetTime = usageManager.weeklyResetsAt {
-                        Text("Resets \(formatResetTime(resetTime, includeDate: true))")
-                            .font(.caption)
-                            .foregroundColor(Color.secondaryText)
-                    }
-                }
-
-                UsageBar(value: usageManager.weeklyPercentage,
-                         color: colorForPercentage(usageManager.weeklyPercentage))
-
-                Text("\(Int(usageManager.weeklyPercentage * 100))% used")
-                    .font(.caption)
-                    .foregroundColor(Color.secondaryText)
-            }
-
-            // Weekly Sonnet Usage (only show if available)
-            if usageManager.hasWeeklySonnet && usageManager.hasFetchedData {
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text("Weekly Sonnet (7 day)")
-                            .font(.subheadline)
-                        Spacer()
-                        if let resetTime = usageManager.weeklySonnetResetsAt {
-                            Text("Resets \(formatResetTime(resetTime, includeDate: true))")
-                                .font(.caption)
-                                .foregroundColor(Color.secondaryText)
-                        }
-                    }
-
-                    UsageBar(value: usageManager.weeklySonnetPercentage,
-                             color: colorForPercentage(usageManager.weeklySonnetPercentage))
-
-                    Text("\(Int(usageManager.weeklySonnetPercentage * 100))% used")
-                        .font(.caption)
-                        .foregroundColor(Color.secondaryText)
-                }
-            }
-
-            // Weekly Fable Usage — only surfaced once usage is above 1%
-            // (new model, counted separately; hidden while idle to avoid clutter).
-            if usageManager.hasWeeklyFable && usageManager.hasFetchedData && usageManager.weeklyFableUsage >= 1 {
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text("Weekly Fable (7 day)")
-                            .font(.subheadline)
-                        Spacer()
-                        if let resetTime = usageManager.weeklyFableResetsAt {
-                            Text("Resets \(formatResetTime(resetTime, includeDate: true))")
-                                .font(.caption)
-                                .foregroundColor(Color.secondaryText)
-                        }
-                    }
-
-                    UsageBar(value: usageManager.weeklyFablePercentage,
-                             color: colorForPercentage(usageManager.weeklyFablePercentage))
-
-                    Text("\(Int(usageManager.weeklyFablePercentage * 100))% used")
-                        .font(.caption)
-                        .foregroundColor(Color.secondaryText)
-                }
-            }
-
-            // Usage credits (pay-as-you-go). Only shown once credits are actually
-            // used; links out to manage credits on claude.ai.
-            if usageManager.hasCreditUsage || usageManager.freeCreditsMinor > 0 {
-                let spentMinor = usageManager.extraSpentMinor
-                let limitMinor = usageManager.extraLimitMinor
-                let pct = limitMinor > 0 ? Double(spentMinor) / Double(limitMinor) : 0
-                let pctInt = Int((pct * 100).rounded())
-                // Show the exact % up to the limit; once over, just say "over limit".
-                let pctLabel = pctInt > 100 ? "over limit" : "\(pctInt)%"
-                let fmt: (Int) -> String = { minor in
-                    let v = Double(minor) / 100.0
-                    return usageManager.creditCurrency == "USD"
-                        ? String(format: "$%.2f", v)
-                        : String(format: "%@ %.2f", usageManager.creditCurrency, v)
-                }
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text("Extra usage")
-                            .font(.subheadline)
-                        Spacer()
-                        Button(action: {
-                            if let url = URL(string: "https://claude.ai/new#settings/usage") {
-                                NSWorkspace.shared.open(url)
-                            }
-                        }) {
-                            Text("Manage →")
-                                .font(.caption.weight(.semibold))
-                                .foregroundColor(.accentColor)
-                        }
-                        .buttonStyle(.borderless)
-                    }
-
-                    // Reset date, shortened (e.g. "Resets Aug 1") so it fits inline.
-                    let shortReset: String? = usageManager.extraResetsAt.map { d in
-                        let f = DateFormatter(); f.dateFormat = "MMM d"
-                        return "Resets \(f.string(from: d))"
-                    }
-
-                    // Spend vs monthly limit — only when there's actual spend.
-                    if usageManager.hasCreditUsage {
-                        if limitMinor > 0 {
-                            UsageBar(value: min(pct, 1.0),
-                                     color: colorForPercentage(pct))
-                        }
-                        HStack {
-                            Text(limitMinor > 0
-                                 ? "\(fmt(spentMinor)) of \(fmt(limitMinor)) · \(pctLabel)"
-                                 : "\(fmt(spentMinor)) spent")
-                                .font(.caption)
-                                .foregroundColor(Color.secondaryText)
-                            Spacer()
-                            if let r = shortReset {
-                                Text(r)
-                                    .font(.caption)
-                                    .foregroundColor(Color.secondaryText)
-                            }
-                        }
-                    }
-
-                    if usageManager.freeCreditsMinor > 0 {
-                        Text("\(fmt(usageManager.freeCreditsMinor)) free credits left")
-                            .font(.caption2)
-                            .foregroundColor(Color.secondaryText)
-                            .opacity(0.85)
-                    }
-                }
-            }
-
-            // Discreet reassurance line naming whichever of Fable / extra usage
-            // is not being consumed (nothing shown when both are active).
-            if usageManager.hasFetchedData {
-                let fableActive = usageManager.hasWeeklyFable && usageManager.weeklyFableUsage >= 1
-                let extraActive = usageManager.hasCreditUsage || usageManager.freeCreditsMinor > 0
-                if !fableActive || !extraActive {
-                    Text(
-                        !fableActive && !extraActive ? "No Fable or extra usage"
-                        : !extraActive ? "No extra usage"
-                        : "No Fable usage"
-                    )
-                    .font(.caption2)
-                    .foregroundColor(Color.secondaryText)
-                    .opacity(0.6)
-                }
-            }
+            ForEach(Array(store.configured.enumerated()), id: \.element.slot) { index, account in
+                if index > 0 { Divider() }
+                AccountUsageSection(manager: account,
+                                    badge: store.showsBadges ? account.slot : nil)
             }
 
             if statusManager.hasFetched {
@@ -1944,22 +1199,38 @@ struct UsageView: View {
                 }
             }
 
-            if usageManager.hasFetchedData {
-            Divider()
-
-            HStack {
-                Text("Last updated: \(formatTime(usageManager.lastUpdated))")
+            // Gated on `configured`, not on `hasFetchedData`: Refresh is the way
+            // out of a failed fetch, so it has to stay reachable exactly when the
+            // fetch did not work. Only the label to its left is conditional.
+            if !store.configured.isEmpty {
+                Divider()
+                HStack {
+                    if store.configured.contains(where: { $0.isLoading }) {
+                        Text("Fetching…")
+                            .font(.caption)
+                            .foregroundColor(Color.secondaryText)
+                    } else if let latest = store.configured
+                        .filter({ $0.hasFetchedData })
+                        .map({ $0.lastUpdated }).max() {
+                        // Only accounts that actually parsed a payload count.
+                        // lastUpdated is seeded to Date() at init and moved only on
+                        // a successful parse, so an expired cookie or an offline
+                        // machine used to render the launch time as though a fetch
+                        // had just succeeded — and drift further from the truth the
+                        // longer the app stayed open.
+                        Text("Last updated: \(formatTime(latest))")
+                            .font(.caption)
+                            .foregroundColor(Color.secondaryText)
+                    }
+                    Spacer()
+                    Button("Refresh") {
+                        store.refreshAll()
+                        statusManager.fetch()
+                        updateManager.fetch()
+                    }
+                    .buttonStyle(.borderless)
                     .font(.caption)
-                    .foregroundColor(Color.secondaryText)
-                Spacer()
-                Button("Refresh") {
-                    usageManager.fetchUsage()
-                    statusManager.fetch()
-                    updateManager.fetch()
                 }
-                .buttonStyle(.borderless)
-                .font(.caption)
-            }
             }
 
             Button(showingCookieInput ? "Hide Cookie" : "Set Session Cookie") {
@@ -1996,39 +1267,87 @@ struct UsageView: View {
                     .font(.caption2)
                     .foregroundColor(Color.secondaryText)
 
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Paste full cookie string:")
-                            .font(.caption2)
-                            .foregroundColor(Color.secondaryText)
-                        VStack(spacing: 4) {
-                            PasteableTextField(text: $sessionCookieInput, placeholder: "Paste cookie here...")
-                                .frame(height: 60)
+                    ForEach(store.accounts, id: \.slot) { account in
+                        VStack(alignment: .leading, spacing: 4) {
+                            // displayName, not "Account \(slot)": once the user names
+                            // an account, the popover section header says "Work" and
+                            // this said "Account 2" — one account labelled two ways
+                            // on one screen. Unnamed it still reads "Account N".
+                            Text(account.displayName)
+                                .font(.caption)
+                                .fontWeight(.semibold)
+
+                            TextField("Name (optional)", text: Binding(
+                                get: { account.name },
+                                set: { account.name = $0; account.saveSettings() }
+                            ))
+                            .textFieldStyle(.roundedBorder)
+                            .controlSize(.small)
+
+                            if account.hasCookie {
+                                Text("Cookie saved ••••\(account.cookieSuffix)")
+                                    .font(.caption2)
+                                    .foregroundColor(Color.secondaryText)
+                                // Two cookies are indistinguishable by eye, so the
+                                // address is the only way to tell which claude.ai
+                                // account a slot actually holds.
+                                if !account.email.isEmpty {
+                                    Text(account.email)
+                                        .font(.caption2)
+                                        .foregroundColor(Color.secondaryText)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                }
+                            }
+
+                            // An account with no cookie renders no section in the
+                            // popover, so the error the buttons below can raise
+                            // would otherwise have nowhere to appear.
+                            if !account.hasCookie, let error = account.errorMessage {
+                                Text(error)
+                                    .font(.caption2)
+                                    .foregroundColor(.orange)
+                            }
+
+                            // The paste field always starts EMPTY. Pre-1.4 seeded it
+                            // with a truncated preview of the saved cookie, so saving
+                            // without pasting wrote that truncation back as the real
+                            // cookie and broke authentication.
+                            PasteableTextField(text: binding(for: account.slot),
+                                               placeholder: "Paste cookie here...")
+                                .frame(height: 50)
                                 .cornerRadius(4)
 
                             HStack(spacing: 8) {
-                                Button("Save Cookie & Fetch") {
-                                    NSLog("ClaudeUsage: Save clicked, input length: \(sessionCookieInput.count)")
-                                    if sessionCookieInput.isEmpty {
-                                        usageManager.errorMessage = "Cookie field is empty!"
-                                    } else {
-                                        usageManager.saveSessionCookie(sessionCookieInput)
-                                        usageManager.fetchUsage()
-                                        usageManager.errorMessage = "Cookie saved, fetching..."
+                                Button("Save & Fetch") {
+                                    // Trimmed before the guard: a stray space or a
+                                    // trailing newline off the clipboard is not a
+                                    // cookie, and untrimmed it passed !isEmpty and
+                                    // overwrote a working one.
+                                    let pasted = (cookieDrafts[account.slot] ?? "")
+                                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                                    guard !pasted.isEmpty else {
+                                        account.errorMessage = "Cookie field is empty!"
+                                        return
                                     }
+                                    account.saveSessionCookie(pasted)
+                                    cookieDrafts[account.slot] = ""
+                                    account.fetchUsage()
                                 }
                                 .buttonStyle(.borderedProminent)
                                 .controlSize(.small)
 
-                                if usageManager.hasFetchedData {
-                                    Button("Clear Cookie") {
-                                        sessionCookieInput = ""
-                                        usageManager.clearSessionCookie()
+                                if account.hasCookie {
+                                    Button("Clear") {
+                                        account.clearSessionCookie()
+                                        cookieDrafts[account.slot] = ""
                                     }
                                     .buttonStyle(.bordered)
                                     .controlSize(.small)
                                 }
                             }
                         }
+                        .padding(.vertical, 4)
                     }
                 }
                 .padding(8)
@@ -2058,12 +1377,18 @@ struct UsageView: View {
 
             if showingSettings {
                 VStack(alignment: .leading, spacing: 12) {
+                    // App-wide preferences. They live on slot 1 only because a
+                    // UsageManager is where the UserDefaults handle is; both
+                    // accounts read the same keys, so there is no second copy
+                    // to keep in step.
                     Toggle(isOn: Binding(
-                        get: { usageManager.openAtLogin },
+                        get: { store.accounts[0].openAtLogin },
                         set: { newValue in
-                            usageManager.openAtLogin = newValue
-                            usageManager.applyLoginItem(newValue)
-                            usageManager.saveSettings()
+                            // Register first: on macOS 13+ the getter reports the
+                            // real SMAppService state, so the redraw that the
+                            // assignment triggers must see it already applied.
+                            store.accounts[0].applyLoginItem(newValue)
+                            store.accounts[0].openAtLogin = newValue
                         }
                     )) {
                         VStack(alignment: .leading, spacing: 2) {
@@ -2078,10 +1403,9 @@ struct UsageView: View {
 
                     VStack(alignment: .leading, spacing: 8) {
                         Toggle(isOn: Binding(
-                            get: { usageManager.usageNotificationsEnabled },
+                            get: { store.accounts[0].usageNotificationsEnabled },
                             set: { newValue in
-                                usageManager.usageNotificationsEnabled = newValue
-                                usageManager.saveSettings()
+                                store.accounts[0].usageNotificationsEnabled = newValue
                             }
                         )) {
                             VStack(alignment: .leading, spacing: 2) {
@@ -2096,10 +1420,9 @@ struct UsageView: View {
                         .toggleStyle(.checkbox)
 
                         Toggle(isOn: Binding(
-                            get: { usageManager.statusNotificationsEnabled },
+                            get: { store.accounts[0].statusNotificationsEnabled },
                             set: { newValue in
-                                usageManager.statusNotificationsEnabled = newValue
-                                usageManager.saveSettings()
+                                store.accounts[0].statusNotificationsEnabled = newValue
                             }
                         )) {
                             VStack(alignment: .leading, spacing: 2) {
@@ -2114,7 +1437,7 @@ struct UsageView: View {
                         .toggleStyle(.checkbox)
 
                         Button("Test Notification") {
-                            usageManager.sendTestNotification()
+                            store.accounts[0].sendTestNotification()
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
@@ -2124,10 +1447,9 @@ struct UsageView: View {
 
                     VStack(alignment: .leading, spacing: 8) {
                         Toggle(isOn: Binding(
-                            get: { usageManager.shortcutEnabled },
+                            get: { store.accounts[0].shortcutEnabled },
                             set: { newValue in
-                                usageManager.shortcutEnabled = newValue
-                                usageManager.saveSettings()
+                                store.accounts[0].shortcutEnabled = newValue
                                 if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
                                     appDelegate.setShortcutEnabled(newValue)
                                 }
@@ -2144,7 +1466,7 @@ struct UsageView: View {
                         }
                         .toggleStyle(.switch)
 
-                        if usageManager.shortcutEnabled && !usageManager.isAccessibilityEnabled {
+                        if store.accounts[0].shortcutEnabled && !store.accounts[0].isAccessibilityEnabled {
                             Button("Grant Accessibility Permission") {
                                 NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
                             }
@@ -2215,40 +1537,10 @@ struct UsageView: View {
         }
     }
 
-    func formatNumber(_ number: Int) -> String {
-        let formatter = NumberFormatter()
-        formatter.numberStyle = .decimal
-        return formatter.string(from: NSNumber(value: number)) ?? "\(number)"
-    }
-
     func formatTime(_ date: Date) -> String {
         let formatter = DateFormatter()
         formatter.timeStyle = .short
         return formatter.string(from: date)
-    }
-
-    func formatResetTime(_ date: Date, includeDate: Bool = false) -> String {
-        let formatter = DateFormatter()
-
-        if includeDate {
-            // Format: "on 31 Jan 2026 at 7:59 AM"
-            formatter.dateFormat = "d MMM yyyy 'at' h:mm a"
-            return "on \(formatter.string(from: date))"
-        } else {
-            formatter.timeStyle = .short
-            formatter.dateStyle = .none
-            return "at \(formatter.string(from: date))"
-        }
-    }
-
-    func colorForPercentage(_ percentage: Double) -> Color {
-        if percentage < 0.7 {
-            return .green
-        } else if percentage < 0.9 {
-            return .orange
-        } else {
-            return .red
-        }
     }
 
     func statusColor(for indicator: String) -> Color {
@@ -2259,13 +1551,6 @@ struct UsageView: View {
         case "critical": return .red
         default:         return .gray
         }
-    }
-
-    func statusLabel(for indicator: String, description: String) -> String {
-        if indicator == "none" {
-            return "Claude: all systems operational"
-        }
-        return "Claude: \(description)"
     }
 
     func relativeTime(_ date: Date) -> String {

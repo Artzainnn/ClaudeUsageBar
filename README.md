@@ -25,6 +25,7 @@ A lightweight, open-source macOS menu bar application that displays your Claude.
 ## ✨ Features
 
 - 🟢 **Real-time usage tracking** - Monitor session (5-hour) and weekly (7-day) limits
+- 👥 **Two accounts** - Track two Claude accounts side by side, each with its own menu bar icon
 - 🎨 **Color-coded menu bar icon** - Visual spark icon that changes color (green/yellow/red)
 - 🔔 **Smart notifications** - Alerts at 25%, 50%, 75%, 90% usage thresholds
 - ⌨️ **Keyboard shortcut** - Toggle popup with Cmd+U from anywhere

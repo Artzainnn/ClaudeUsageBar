@@ -7,6 +7,7 @@ A lightweight macOS menu bar app that displays your Claude.ai session and weekly
 ## ✨ Features
 
 - 🟢 **Real-time Usage Tracking**: Monitor session (5-hour) and weekly (7-day) usage
+- 👥 **Two Accounts**: Track two Claude accounts side by side, each with its own menu bar icon
 - 🎨 **Color-Coded Menu Bar Icon**: Visual indication of usage levels (green/yellow/red)
 - 🔔 **Smart Notifications**: Alerts at 25%, 50%, 75%, and 90% usage thresholds
 - ⚡ **Auto-Refresh**: Updates every 5 minutes automatically
@@ -97,10 +98,19 @@ Access settings by clicking the gear icon in the popup:
 ### Launch at Login
 - Start ClaudeUsageBar automatically when you log in
 
+## 👥 Two accounts
+
+Click **Set Session Cookie** and paste a second cookie under **Account 2** —
+a second icon appears in the menu bar, badged 1 and 2. Either icon opens the
+same popup, showing both accounts stacked. Give each one a name to tell them
+apart in notifications.
+
+With a single account configured, nothing changes: one icon, no badge.
+
 ## 🔒 Privacy & Security
 
 - ✅ **All data stays on your Mac** - stored in UserDefaults only
-- ✅ **No analytics or tracking** - zero external services
+- ✅ **No analytics or tracking** - the app only talks to claude.ai, status.claude.com (service status) and GitHub (update check)
 - ✅ **Session cookies stored locally** - never sent anywhere except claude.ai
 - ✅ **No hardcoded credentials** - org ID extracted dynamically from your cookie
 - ✅ **Open source** - review the code yourself

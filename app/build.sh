@@ -33,20 +33,29 @@ if [ -f "ClaudeUsageBar.icns" ]; then
     /usr/libexec/PlistBuddy -c "Set :CFBundleIconFile ClaudeUsageBar" "$APP_PATH/Contents/Info.plist"
 fi
 
+# Explicit list, not a glob: tests/ has its own main.swift and must never be
+# compiled into the app bundle.
+SOURCES=(
+    ClaudeUsageBar.swift
+    UsageLogic.swift
+    UsageManager.swift
+    Accounts.swift
+    MenuBarIcon.swift
+    Views/AccountUsageSection.swift
+)
+
 # Compile the Swift app for arm64
 swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_arm64" \
-    ClaudeUsageBar.swift \
+    "${SOURCES[@]}" \
     -framework SwiftUI \
     -framework AppKit \
-    -framework WebKit \
     -target arm64-apple-macos12.0
 
 # Compile for x86_64 (Intel)
 swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_x86_64" \
-    ClaudeUsageBar.swift \
+    "${SOURCES[@]}" \
     -framework SwiftUI \
     -framework AppKit \
-    -framework WebKit \
     -target x86_64-apple-macos12.0
 
 # Create universal binary
