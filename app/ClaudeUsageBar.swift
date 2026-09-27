@@ -16,9 +16,12 @@ extension Color {
 
 // Deterministic usage bar: the native linear ProgressView ignores .tint() in
 // light (aqua) and vibrant rendering and falls back to accent blue.
+// Optional `pace` draws a tick where usage would be if spread evenly across
+// the window (see Pace).
 struct UsageBar: View {
     let value: Double
     let color: Color
+    var pace: Double? = nil
 
     var body: some View {
         GeometryReader { geo in
@@ -27,9 +30,36 @@ struct UsageBar: View {
                 Capsule()
                     .fill(color)
                     .frame(width: max(0, min(1, value)) * geo.size.width)
+                if let pace = pace {
+                    Rectangle()
+                        .fill(Color.primary.opacity(0.75))
+                        .frame(width: 2, height: 10)
+                        .offset(x: max(0, min(1, pace)) * geo.size.width - 1)
+                }
             }
         }
         .frame(height: 6)
+    }
+}
+
+// Pace: how far through a usage window we are. Usage below that fraction
+// means you can use more before reset; above it means you'll run out early.
+enum Pace {
+    static let sessionWindow: TimeInterval = 5 * 3600
+    static let weeklyWindow: TimeInterval = 7 * 24 * 3600
+
+    // Fraction of the window elapsed (0...1), or nil without a reset time.
+    static func expected(resetsAt: Date?, window: TimeInterval, now: Date = Date()) -> Double? {
+        guard let resetsAt = resetsAt else { return nil }
+        let remaining = resetsAt.timeIntervalSince(now)
+        return max(0, min(1, 1 - remaining / window))
+    }
+
+    // "5% under pace" / "3% over pace", or "on pace" within 2 points.
+    static func label(used: Double, expected: Double) -> String {
+        let diff = Int(((used - expected) * 100).rounded())
+        if abs(diff) <= 2 { return "on pace" }
+        return diff > 0 ? "\(diff)% over pace" : "\(-diff)% under pace"
     }
 }
 
@@ -415,6 +445,7 @@ class UsageManager: ObservableObject {
     @Published var hasFetchedData: Bool = false
     @Published var isAccessibilityEnabled: Bool = false
     @Published var shortcutEnabled: Bool = true
+    @Published var showPaceMarker: Bool = true
 
     private var statusItem: NSStatusItem?
     private var sessionCookie: String = ""
@@ -476,6 +507,9 @@ class UsageManager: ObservableObject {
         } else {
             shortcutEnabled = UserDefaults.standard.bool(forKey: "shortcut_enabled")
         }
+        if UserDefaults.standard.object(forKey: "show_pace_marker") != nil {
+            showPaceMarker = UserDefaults.standard.bool(forKey: "show_pace_marker")
+        }
     }
 
     func saveSettings() {
@@ -483,6 +517,7 @@ class UsageManager: ObservableObject {
         UserDefaults.standard.set(statusNotificationsEnabled, forKey: "status_notifications_enabled")
         UserDefaults.standard.set(openAtLogin, forKey: "open_at_login")
         UserDefaults.standard.set(shortcutEnabled, forKey: "shortcut_enabled")
+        UserDefaults.standard.set(showPaceMarker, forKey: "show_pace_marker")
         UserDefaults.standard.synchronize()
     }
 
@@ -1751,9 +1786,10 @@ struct UsageView: View {
                 }
 
                 UsageBar(value: usageManager.sessionPercentage,
-                         color: colorForPercentage(usageManager.sessionPercentage))
+                         color: colorForPercentage(usageManager.sessionPercentage),
+                         pace: paceFor(usageManager.sessionResetsAt, window: Pace.sessionWindow))
 
-                Text("\(Int(usageManager.sessionPercentage * 100))% used")
+                Text(usedCaption(usageManager.sessionPercentage, pace: paceFor(usageManager.sessionResetsAt, window: Pace.sessionWindow)))
                     .font(.caption)
                     .foregroundColor(Color.secondaryText)
             }
@@ -1772,9 +1808,10 @@ struct UsageView: View {
                 }
 
                 UsageBar(value: usageManager.weeklyPercentage,
-                         color: colorForPercentage(usageManager.weeklyPercentage))
+                         color: colorForPercentage(usageManager.weeklyPercentage),
+                         pace: paceFor(usageManager.weeklyResetsAt, window: Pace.weeklyWindow))
 
-                Text("\(Int(usageManager.weeklyPercentage * 100))% used")
+                Text(usedCaption(usageManager.weeklyPercentage, pace: paceFor(usageManager.weeklyResetsAt, window: Pace.weeklyWindow)))
                     .font(.caption)
                     .foregroundColor(Color.secondaryText)
             }
@@ -1794,9 +1831,10 @@ struct UsageView: View {
                     }
 
                     UsageBar(value: usageManager.weeklySonnetPercentage,
-                             color: colorForPercentage(usageManager.weeklySonnetPercentage))
+                             color: colorForPercentage(usageManager.weeklySonnetPercentage),
+                         pace: paceFor(usageManager.weeklySonnetResetsAt, window: Pace.weeklyWindow))
 
-                    Text("\(Int(usageManager.weeklySonnetPercentage * 100))% used")
+                    Text(usedCaption(usageManager.weeklySonnetPercentage, pace: paceFor(usageManager.weeklySonnetResetsAt, window: Pace.weeklyWindow)))
                         .font(.caption)
                         .foregroundColor(Color.secondaryText)
                 }
@@ -1818,9 +1856,10 @@ struct UsageView: View {
                     }
 
                     UsageBar(value: usageManager.weeklyFablePercentage,
-                             color: colorForPercentage(usageManager.weeklyFablePercentage))
+                             color: colorForPercentage(usageManager.weeklyFablePercentage),
+                         pace: paceFor(usageManager.weeklyFableResetsAt, window: Pace.weeklyWindow))
 
-                    Text("\(Int(usageManager.weeklyFablePercentage * 100))% used")
+                    Text(usedCaption(usageManager.weeklyFablePercentage, pace: paceFor(usageManager.weeklyFableResetsAt, window: Pace.weeklyWindow)))
                         .font(.caption)
                         .foregroundColor(Color.secondaryText)
                 }
@@ -2185,6 +2224,24 @@ struct UsageView: View {
                     }
                     .toggleStyle(.checkbox)
 
+                    Toggle(isOn: Binding(
+                        get: { usageManager.showPaceMarker },
+                        set: { newValue in
+                            usageManager.showPaceMarker = newValue
+                            usageManager.saveSettings()
+                        }
+                    )) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Show Pace Marker")
+                                .font(.caption)
+                            Text("Mark where usage would be if spread evenly until reset")
+                                .font(.caption2)
+                                .foregroundColor(Color.secondaryText)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .toggleStyle(.checkbox)
+
                     VStack(alignment: .leading, spacing: 8) {
                         Toggle(isOn: Binding(
                             get: { usageManager.usageNotificationsEnabled },
@@ -2348,6 +2405,16 @@ struct UsageView: View {
             formatter.dateStyle = .none
             return "at \(formatter.string(from: date))"
         }
+    }
+
+    func paceFor(_ resetsAt: Date?, window: TimeInterval) -> Double? {
+        usageManager.showPaceMarker ? Pace.expected(resetsAt: resetsAt, window: window) : nil
+    }
+
+    func usedCaption(_ percentage: Double, pace: Double?) -> String {
+        let used = "\(Int(percentage * 100))% used"
+        guard let pace = pace else { return used }
+        return "\(used) · \(Pace.label(used: percentage, expected: pace))"
     }
 
     func colorForPercentage(_ percentage: Double) -> Color {
