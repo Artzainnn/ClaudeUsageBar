@@ -119,3 +119,30 @@ func menuBarIcon(percentage: Int, badge: Int?) -> NSImage {
     image.isTemplate = false
     return image
 }
+
+// MARK: - Two accounts
+
+/// Both accounts in one button title: icon, percentage, icon, percentage.
+/// Icons ride in as text attachments rather than as button.image, which holds
+/// one image and pins it to the left of the whole title — the second icon has
+/// to sit beside its own number, not beside the first one's.
+func menuBarTitle(readings: [(slot: Int, percentage: Int)], font: NSFont) -> NSAttributedString {
+    let text: [NSAttributedString.Key: Any] = [.font: font]
+    let title = NSMutableAttributedString()
+    for (index, reading) in readings.enumerated() {
+        // Two spaces: wide enough that "3%" does not run into the next spark,
+        // far narrower than the gap macOS leaves between two separate items.
+        if index > 0 { title.append(NSAttributedString(string: "  ", attributes: text)) }
+
+        let icon = menuBarIcon(percentage: reading.percentage, badge: reading.slot)
+        let attachment = NSTextAttachment()
+        attachment.image = icon
+        // Centred on the digits' cap height, and rounded to a whole point so
+        // the badge's cells stay on the pixel grid they were drawn for.
+        attachment.bounds = NSRect(x: 0, y: ((font.capHeight - icon.size.height) / 2).rounded(),
+                                   width: icon.size.width, height: icon.size.height)
+        title.append(NSAttributedString(attachment: attachment))
+        title.append(NSAttributedString(string: " \(reading.percentage)%", attributes: text))
+    }
+    return title
+}

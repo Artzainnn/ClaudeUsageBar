@@ -22,7 +22,7 @@ final class AccountsStore: ObservableObject {
 
         // A nested ObservableObject does not notify its parent. Without this
         // republish, pasting a cookie into account 2 would not make its menu
-        // bar item or its popover section appear — no error, no log, the UI
+        // bar reading or its popover section appear — no error, no log, the UI
         // simply would not update.
         //
         // The same signal also drives the notification prefixes: saving a

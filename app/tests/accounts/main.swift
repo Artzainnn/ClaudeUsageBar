@@ -380,6 +380,22 @@ for row in 0..<7 {
 }
 checkEqual(partialCells, 0, "every badge cell is fully on or fully off at 1x")
 
+// (e) Two accounts share one button: each icon sits right before its own
+// number, in slot order, and on a whole point so (d) still holds on screen.
+let menuFont = NSFont.menuBarFont(ofSize: 0)
+let sharedTitle = menuBarTitle(readings: [(slot: 1, percentage: 5), (slot: 2, percentage: 73)], font: menuFont)
+var icons: [NSTextAttachment] = []
+sharedTitle.enumerateAttribute(.attachment, in: NSRange(location: 0, length: sharedTitle.length)) { value, _, _ in
+    if let attachment = value as? NSTextAttachment { icons.append(attachment) }
+}
+checkEqual(icons.count, 2, "one icon per account in the shared title")
+checkEqual(sharedTitle.string.replacingOccurrences(of: "\u{FFFC}", with: "#"), "# 5%  # 73%",
+           "each icon leads its own percentage, account 1 first")
+check(icons.allSatisfy { $0.bounds.origin.y == $0.bounds.origin.y.rounded() },
+      "the icons sit on whole points, keeping the badge on the pixel grid")
+checkEqual(icons.map { $0.bounds.size }, [NSSize(width: 16, height: 16), NSSize(width: 16, height: 16)],
+           "the icons keep their 16pt box inside the title")
+
 print("")
 print(failures == 0 ? "PASS" : "\(failures) FAILURE(S)")
 exit(failures == 0 ? 0 : 1)
