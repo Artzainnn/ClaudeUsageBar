@@ -55,7 +55,10 @@ A lightweight, open-source macOS menu bar application that displays your Claude.
 - Session (5-hour) usage with progress bar
 - Weekly (7-day) usage with progress bar
 - Weekly Sonnet usage (Pro plan only)
-- Settings for notifications and shortcuts
+
+**Settings window** (right-click the menu bar icon → **Settings…**):
+- Session cookies and names for up to two accounts
+- Notifications, keyboard shortcut, appearance and tracked services
 
 ## 📁 Repository Structure
 

@@ -42,6 +42,7 @@ SOURCES=(
     Accounts.swift
     MenuBarIcon.swift
     Views/AccountUsageSection.swift
+    Views/SettingsView.swift
 )
 
 # Compile the Swift app for arm64

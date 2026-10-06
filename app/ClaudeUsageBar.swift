@@ -39,6 +39,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// macOS spaces any two apps' icons, and read as two unrelated things.
     var statusItem: NSStatusItem!
     var popover: NSPopover!
+    /// Built on first open and kept: closing only hides it, so reopening
+    /// lands where the user left it.
+    var settingsWindow: NSWindow?
     var store: AccountsStore!
     var statusManager: StatusManager!
     var updateManager: UpdateManager!
@@ -278,6 +281,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let toggleItem = NSMenuItem(title: "Toggle Usage (⌘U)", action: #selector(togglePopover), keyEquivalent: "u")
             toggleItem.keyEquivalentModifierMask = .command
             menu.addItem(toggleItem)
+            menu.addItem(NSMenuItem(title: "Settings…", action: #selector(openSettings as () -> Void), keyEquivalent: ","))
             menu.addItem(NSMenuItem.separator())
             menu.addItem(NSMenuItem(title: "Quit ClaudeUsageBar", action: #selector(quitApp), keyEquivalent: "q"))
             statusItem.menu = menu
@@ -287,6 +291,37 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // Left click - toggle popover
             togglePopover()
         }
+    }
+
+    @objc func openSettings() {
+        openSettings(page: nil)
+    }
+
+    /// `page` nil reopens on the page the user last left the window on.
+    func openSettings(page: String?) {
+        if popover.isShown { closePopover() }
+        if let page = page {
+            UserDefaults.standard.set(page, forKey: SettingsView.pageKey)
+        }
+
+        if settingsWindow == nil {
+            let window = NSWindow(contentViewController: NSHostingController(
+                rootView: SettingsView(store: store, statusManager: statusManager)))
+            window.title = "ClaudeUsageBar Settings"
+            window.styleMask = [.titled, .closable]
+            window.isReleasedWhenClosed = false
+            window.center()
+            settingsWindow = window
+        }
+
+        // Permission is only read at launch; granting it in System Settings
+        // while the app runs would otherwise leave the button up for good.
+        store.accounts[0].checkAccessibilityStatus()
+
+        // An accessory app is never frontmost on its own, so without this the
+        // window opens behind whatever app the user was in.
+        NSApp.activate(ignoringOtherApps: true)
+        settingsWindow?.makeKeyAndOrderFront(nil)
     }
 
     func openPopover() {
@@ -892,60 +927,39 @@ struct UsageView: View {
     @ObservedObject var store: AccountsStore
     @ObservedObject var statusManager: StatusManager
     @ObservedObject var updateManager: UpdateManager
-    @State private var cookieDrafts: [Int: String] = [:]
-    @State private var showingCookieInput: Bool = false
-    @State private var showingSettings: Bool = false
     @State private var showingStatusDetails: Bool = false
     @State private var measuredHeight: CGFloat = 250
     @Environment(\.colorScheme) private var colorScheme
-    @AppStorage("appearance_mode") private var appearanceMode: String = "system"
 
     private let maxPopupHeight: CGFloat = 600
 
-    /// The pasted-but-not-yet-saved cookie, keyed by slot so one account's
-    /// draft can never be written onto the other's key.
-    private func binding(for slot: Int) -> Binding<String> {
-        Binding(get: { cookieDrafts[slot] ?? "" }, set: { cookieDrafts[slot] = $0 })
-    }
-
     var body: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                content
-                    .padding()
-                    .background(
-                        GeometryReader { geo in
-                            Color.clear.preference(key: ContentHeightKey.self, value: geo.size.height)
-                        }
-                    )
-            }
-            .frame(width: 360, height: min(max(measuredHeight, 100), maxPopupHeight))
-            // Dark: light scrim over the native material — between fully native
-            // (too transparent) and the v1.3.2 0.62 scrim (read as "too dark").
-            // TEST VALUE on ClaudeUsageBar only; CodexUsageBar stays fully native.
-            // Light: near-opaque backing, or a dark desktop bleeds through as
-            // murky blue-gray when forced.
-            .background(
-                colorScheme == .dark
-                    ? Color(red: 0.07, green: 0.07, blue: 0.08).opacity(0.3)
-                    : Color.white.opacity(0.85)
-            )
-            .onPreferenceChange(ContentHeightKey.self) { value in
-                guard value > 0 else { return }
-                measuredHeight = value
-            }
-            .onAppear {
-                store.accounts.forEach { $0.updatePercentages() }
-            }
-            .onChange(of: showingSettings) { isOpen in
-                if isOpen {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                        withAnimation(.easeInOut(duration: 0.35)) {
-                            proxy.scrollTo("settings-anchor", anchor: .bottom)
-                        }
+        ScrollView {
+            content
+                .padding()
+                .background(
+                    GeometryReader { geo in
+                        Color.clear.preference(key: ContentHeightKey.self, value: geo.size.height)
                     }
-                }
-            }
+                )
+        }
+        .frame(width: 360, height: min(max(measuredHeight, 100), maxPopupHeight))
+        // Dark: light scrim over the native material — between fully native
+        // (too transparent) and the v1.3.2 0.62 scrim (read as "too dark").
+        // TEST VALUE on ClaudeUsageBar only; CodexUsageBar stays fully native.
+        // Light: near-opaque backing, or a dark desktop bleeds through as
+        // murky blue-gray when forced.
+        .background(
+            colorScheme == .dark
+                ? Color(red: 0.07, green: 0.07, blue: 0.08).opacity(0.3)
+                : Color.white.opacity(0.85)
+        )
+        .onPreferenceChange(ContentHeightKey.self) { value in
+            guard value > 0 else { return }
+            measuredHeight = value
+        }
+        .onAppear {
+            store.accounts.forEach { $0.updatePercentages() }
         }
     }
 
@@ -1033,11 +1047,18 @@ struct UsageView: View {
             }
 
             // Only show usage if data has been fetched
+            // The cookie is entered in Settings, which is otherwise only on the
+            // right-click menu — a first-run user would never find it.
             if store.configured.isEmpty {
-                Text("👋 Welcome! Set your session cookie below to get started.")
+                Text("👋 Welcome! Set your session cookie to get started.")
                     .font(.subheadline)
                     .foregroundColor(Color.secondaryText)
-                    .padding(.vertical, 8)
+                    .padding(.top, 8)
+                Button("Set Session Cookie…") {
+                    (NSApplication.shared.delegate as? AppDelegate)?.openSettings(page: "accounts")
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
             }
 
             ForEach(Array(store.configured.enumerated()), id: \.element.slot) { index, account in
@@ -1207,308 +1228,6 @@ struct UsageView: View {
                     .buttonStyle(.borderless)
                     .font(.caption)
                 }
-            }
-
-            Button(showingCookieInput ? "Hide Cookie" : "Set Session Cookie") {
-                showingCookieInput.toggle()
-            }
-            .buttonStyle(.borderless)
-            .font(.caption)
-
-            if showingCookieInput {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Text("How to get your session cookie:")
-                            .font(.caption)
-                            .fontWeight(.semibold)
-                        Spacer()
-                        Button(action: {
-                            NSWorkspace.shared.open(URL(string: "https://github.com/Artzainnn/ClaudeUsageBar/blob/main/setup-guide.png")!)
-                        }) {
-                            Text("View tutorial →")
-                                .font(.caption2)
-                                .foregroundColor(.blue)
-                        }
-                        .buttonStyle(.borderless)
-                    }
-
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("1. Go to Settings > Usage on claude.ai")
-                        Text("2. Press F12 (or Cmd+Option+I)")
-                        Text("3. Go to Network tab")
-                        Text("4. Refresh page, click 'usage' request")
-                        Text("5. Find 'Cookie' in Request Headers")
-                        Text("6. Copy full cookie value\n   (starts with anthropic-device-id=...)")
-                    }
-                    .font(.caption2)
-                    .foregroundColor(Color.secondaryText)
-
-                    ForEach(store.accounts, id: \.slot) { account in
-                        VStack(alignment: .leading, spacing: 4) {
-                            // displayName, not "Account \(slot)": once the user names
-                            // an account, the popover section header says "Work" and
-                            // this said "Account 2" — one account labelled two ways
-                            // on one screen. Unnamed it still reads "Account N".
-                            Text(account.displayName)
-                                .font(.caption)
-                                .fontWeight(.semibold)
-
-                            TextField("Name (optional)", text: Binding(
-                                get: { account.name },
-                                set: { account.name = $0; account.saveSettings() }
-                            ))
-                            .textFieldStyle(.roundedBorder)
-                            .controlSize(.small)
-
-                            if account.hasCookie {
-                                Text("Cookie saved ••••\(account.cookieSuffix)")
-                                    .font(.caption2)
-                                    .foregroundColor(Color.secondaryText)
-                                // Two cookies are indistinguishable by eye, so the
-                                // address is the only way to tell which claude.ai
-                                // account a slot actually holds.
-                                if !account.email.isEmpty {
-                                    Text(account.email)
-                                        .font(.caption2)
-                                        .foregroundColor(Color.secondaryText)
-                                        .lineLimit(1)
-                                        .truncationMode(.middle)
-                                }
-                            }
-
-                            // An account with no cookie renders no section in the
-                            // popover, so the error the buttons below can raise
-                            // would otherwise have nowhere to appear.
-                            if !account.hasCookie, let error = account.errorMessage {
-                                Text(error)
-                                    .font(.caption2)
-                                    .foregroundColor(.orange)
-                            }
-
-                            // The paste field always starts EMPTY. Pre-1.4 seeded it
-                            // with a truncated preview of the saved cookie, so saving
-                            // without pasting wrote that truncation back as the real
-                            // cookie and broke authentication.
-                            PasteableTextField(text: binding(for: account.slot),
-                                               placeholder: "Paste cookie here...")
-                                .frame(height: 50)
-                                .cornerRadius(4)
-
-                            HStack(spacing: 8) {
-                                Button("Save & Fetch") {
-                                    // Trimmed before the guard: a stray space or a
-                                    // trailing newline off the clipboard is not a
-                                    // cookie, and untrimmed it passed !isEmpty and
-                                    // overwrote a working one.
-                                    let pasted = (cookieDrafts[account.slot] ?? "")
-                                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                                    guard !pasted.isEmpty else {
-                                        account.errorMessage = "Cookie field is empty!"
-                                        return
-                                    }
-                                    account.saveSessionCookie(pasted)
-                                    cookieDrafts[account.slot] = ""
-                                    account.fetchUsage()
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .controlSize(.small)
-
-                                if account.hasCookie {
-                                    Button("Clear") {
-                                        account.clearSessionCookie()
-                                        cookieDrafts[account.slot] = ""
-                                    }
-                                    .buttonStyle(.bordered)
-                                    .controlSize(.small)
-                                }
-                            }
-                        }
-                        .padding(.vertical, 4)
-                    }
-                }
-                .padding(8)
-                .background(Color.secondary.opacity(0.1))
-                .cornerRadius(6)
-            }
-
-            // Support Section
-            Button(action: {
-                NSWorkspace.shared.open(URL(string: "https://donate.stripe.com/3cIcN5b5H7Q8ay8bIDfIs02")!)
-            }) {
-                HStack(spacing: 4) {
-                    Text("☕")
-                    Text("Buy Dev a Coffee")
-                }
-            }
-            .buttonStyle(.borderless)
-            .font(.caption)
-            .foregroundColor(.orange)
-
-            // Settings Section
-            Button(showingSettings ? "Hide Settings" : "Settings") {
-                showingSettings.toggle()
-            }
-            .buttonStyle(.borderless)
-            .font(.caption)
-
-            if showingSettings {
-                VStack(alignment: .leading, spacing: 12) {
-                    // App-wide preferences. They live on slot 1 only because a
-                    // UsageManager is where the UserDefaults handle is; both
-                    // accounts read the same keys, so there is no second copy
-                    // to keep in step.
-                    Toggle(isOn: Binding(
-                        get: { store.accounts[0].openAtLogin },
-                        set: { newValue in
-                            // Register first: on macOS 13+ the getter reports the
-                            // real SMAppService state, so the redraw that the
-                            // assignment triggers must see it already applied.
-                            store.accounts[0].applyLoginItem(newValue)
-                            store.accounts[0].openAtLogin = newValue
-                        }
-                    )) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Open at Login")
-                                .font(.caption)
-                            Text("Launch app automatically when you log in")
-                                .font(.caption2)
-                                .foregroundColor(Color.secondaryText)
-                        }
-                    }
-                    .toggleStyle(.checkbox)
-
-                    VStack(alignment: .leading, spacing: 8) {
-                        Toggle(isOn: Binding(
-                            get: { store.accounts[0].usageNotificationsEnabled },
-                            set: { newValue in
-                                store.accounts[0].usageNotificationsEnabled = newValue
-                            }
-                        )) {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Enable Usage Notifications")
-                                    .font(.caption)
-                                Text("Get alerts at 25%, 50%, 75%,\nand 90% session usage")
-                                    .font(.caption2)
-                                    .foregroundColor(Color.secondaryText)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                        }
-                        .toggleStyle(.checkbox)
-
-                        Toggle(isOn: Binding(
-                            get: { store.accounts[0].statusNotificationsEnabled },
-                            set: { newValue in
-                                store.accounts[0].statusNotificationsEnabled = newValue
-                            }
-                        )) {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Enable Status Notifications")
-                                    .font(.caption)
-                                Text("Get alerts when tracked Claude services have an outage")
-                                    .font(.caption2)
-                                    .foregroundColor(Color.secondaryText)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                        }
-                        .toggleStyle(.checkbox)
-
-                        Button("Test Notification") {
-                            store.accounts[0].sendTestNotification()
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                    }
-
-                    Divider()
-
-                    VStack(alignment: .leading, spacing: 8) {
-                        Toggle(isOn: Binding(
-                            get: { store.accounts[0].shortcutEnabled },
-                            set: { newValue in
-                                store.accounts[0].shortcutEnabled = newValue
-                                if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
-                                    appDelegate.setShortcutEnabled(newValue)
-                                }
-                            }
-                        )) {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Keyboard Shortcut (⌘U)")
-                                    .font(.caption)
-                                Text("Toggle popup from anywhere.\nDisable if it conflicts with other apps.")
-                                    .font(.caption2)
-                                    .foregroundColor(Color.secondaryText)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                        }
-                        .toggleStyle(.switch)
-
-                        if store.accounts[0].shortcutEnabled && !store.accounts[0].isAccessibilityEnabled {
-                            Button("Grant Accessibility Permission") {
-                                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .controlSize(.small)
-
-                            Text("Accessibility permission may be needed\nfor the shortcut to work in all apps")
-                                .font(.caption2)
-                                .foregroundColor(Color.secondaryText)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-
-                    Divider()
-
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Status alerts: services to track")
-                            .font(.caption)
-                            .fontWeight(.semibold)
-                        Text("Only tick the Claude services you use. Status issues with unticked services won't be shown or trigger alerts.")
-                            .font(.caption2)
-                            .foregroundColor(Color.secondaryText)
-                            .fixedSize(horizontal: false, vertical: true)
-                        ForEach(statusManager.allComponents) { component in
-                            Toggle(isOn: Binding(
-                                get: { statusManager.isTracked(component.id) },
-                                set: { _ in statusManager.toggleComponent(component.id) }
-                            )) {
-                                Text(component.name)
-                                    .font(.caption2)
-                            }
-                            .toggleStyle(.checkbox)
-                        }
-                    }
-
-                    Divider()
-
-                    // Appearance sits last on purpose: opening Settings auto-scrolls
-                    // to the anchor below, so this lands in view.
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Appearance")
-                            .font(.caption)
-                        Picker("Appearance", selection: $appearanceMode) {
-                            Text("System").tag("system")
-                            Text("Dark").tag("dark")
-                            Text("Light").tag("light")
-                        }
-                        .pickerStyle(.segmented)
-                        .labelsHidden()
-                        .onChange(of: appearanceMode) { _ in
-                            (NSApplication.shared.delegate as? AppDelegate)?.applyAppearancePreference()
-                        }
-                        Text("Match macOS, or keep the classic dark look")
-                            .font(.caption2)
-                            .foregroundColor(Color.secondaryText)
-                    }
-
-                }
-                .padding(8)
-                .background(Color.secondary.opacity(0.1))
-                .cornerRadius(6)
-
-                // Anchor for scroll-to-bottom when Settings opens
-                Color.clear
-                    .frame(height: 1)
-                    .id("settings-anchor")
             }
         }
     }

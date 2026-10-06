@@ -26,7 +26,10 @@ A lightweight macOS menu bar app that displays your Claude.ai session and weekly
 - Session (5-hour) usage with progress bar and reset time
 - Weekly (7-day) usage with progress bar and reset date
 - Weekly Sonnet usage (Pro plan only)
-- Settings for notifications and keyboard shortcuts
+
+**Settings window** (right-click the menu bar icon → **Settings…**):
+- Session cookies and names for up to two accounts
+- Notifications, keyboard shortcut, appearance and tracked services
 
 ## 📋 Requirements
 
@@ -76,14 +79,14 @@ When you first launch ClaudeUsageBar, you'll see a welcome message. Follow these
 
 ### Adding Cookie to App
 
-1. Click **"Set Session Cookie"** in the app
+1. Right-click the menu bar icon → **Settings…** → **Accounts** (on first launch, the popup's **Set Session Cookie…** button opens it)
 2. Paste your cookie (Cmd+V works!)
-3. Click **"Save Cookie & Fetch"**
+3. Click **"Save & Fetch"**
 4. Your usage will appear immediately! 🎉
 
 ## ⚙️ Settings
 
-Access settings by clicking the gear icon in the popup:
+Right-click the menu bar icon and choose **Settings…**. The **General** tab holds:
 
 ### Notifications
 - Enable/disable usage alerts
@@ -100,7 +103,7 @@ Access settings by clicking the gear icon in the popup:
 
 ## 👥 Two accounts
 
-Click **Set Session Cookie** and paste a second cookie under **Account 2** —
+Open **Settings… → Accounts** and paste a second cookie under **Account 2** —
 the menu bar item grows a second reading, badged 1 and 2 (`✱1 5%  ✱2 0%`).
 Clicking it opens one popup, showing both accounts stacked. Give each one a name to tell them
 apart in notifications.
@@ -145,7 +148,7 @@ rm -rf build
 
 ### "No data yet" showing
 - Make sure you've pasted your session cookie
-- Click "Save Cookie & Fetch"
+- Click "Save & Fetch"
 - Verify you copied the full cookie string
 
 ### Cookie expired
