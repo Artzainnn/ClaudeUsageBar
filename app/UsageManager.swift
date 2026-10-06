@@ -28,7 +28,6 @@ class UsageManager: ObservableObject {
     @Published var hasWeeklySonnet: Bool = false
     @Published var hasWeeklyFable: Bool = false
     @Published var hasFetchedData: Bool = false
-    @Published var isAccessibilityEnabled: Bool = false
     @Published var name: String = ""
     /// The account's claude.ai address, fetched once per cookie from
     /// /api/bootstrap. Two cookies look identical to a human, so without this
@@ -144,11 +143,6 @@ class UsageManager: ObservableObject {
         self.defaults = defaults
         loadSessionCookie()
         loadSettings()
-        checkAccessibilityStatus()
-    }
-
-    func checkAccessibilityStatus() {
-        isAccessibilityEnabled = AXIsProcessTrusted()
     }
 
     func loadSessionCookie() {

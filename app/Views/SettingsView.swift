@@ -46,8 +46,8 @@ struct SettingsView: View {
         .padding(20)
         .frame(width: 420)
         // Fixed height: the window takes its size from this view, and grows or
-        // shrinks with it — on a page switch, when the Accessibility button
-        // comes and goes, and when the live service list replaces the default.
+        // shrinks with it — on a page switch, and when the live service list
+        // replaces the default one.
         .fixedSize(horizontal: false, vertical: true)
     }
 
@@ -232,18 +232,6 @@ struct SettingsView: View {
                           "Toggle popup from anywhere. Disable if it conflicts with other apps.")
                 }
                 .toggleStyle(.checkbox)
-
-                if prefs.shortcutEnabled && !prefs.isAccessibilityEnabled {
-                    Button("Grant Accessibility Permission") {
-                        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
-                    }
-                    .buttonStyle(.borderedProminent)
-
-                    Text("Accessibility permission may be needed for the shortcut to work in all apps")
-                        .font(.subheadline)
-                        .foregroundColor(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
             }
 
             section("Status Alerts") {

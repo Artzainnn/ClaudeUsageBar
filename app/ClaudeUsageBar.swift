@@ -159,10 +159,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func setupKeyboardShortcut() {
-        // Check Accessibility permissions
-        checkAccessibilityPermissions()
-
-        // Only register if user has the shortcut enabled
+        // No Accessibility check: RegisterEventHotKey works without that
+        // permission (sandboxed apps, which can never hold it, use it too).
+        // Asking for it anyway nagged on every launch of a locally built,
+        // ad-hoc signed copy, whose grant dies with each rebuild — even with
+        // the shortcut turned off, since the check ran before this test.
         if store.accounts[0].shortcutEnabled {
             registerGlobalHotKey()
         }
@@ -173,32 +174,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             registerGlobalHotKey()
         } else {
             unregisterGlobalHotKey()
-        }
-    }
-
-    func checkAccessibilityPermissions() {
-        // Check if app has Accessibility permissions
-        let trusted = AXIsProcessTrusted()
-
-        if !trusted {
-            NSLog("⚠️ Accessibility permissions not granted")
-            // Show alert to guide user
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                let alert = NSAlert()
-                alert.messageText = "Accessibility Permission Required"
-                alert.informativeText = "ClaudeUsageBar needs Accessibility permission to use the Cmd+U keyboard shortcut.\n\nPlease enable it in:\nSystem Settings → Privacy & Security → Accessibility"
-                alert.alertStyle = .informational
-                alert.addButton(withTitle: "Open System Settings")
-                alert.addButton(withTitle: "Skip for Now")
-
-                let response = alert.runModal()
-                if response == .alertFirstButtonReturn {
-                    // Open System Settings
-                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
-                }
-            }
-        } else {
-            NSLog("✅ Accessibility permissions granted")
         }
     }
 
@@ -313,10 +288,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             window.center()
             settingsWindow = window
         }
-
-        // Permission is only read at launch; granting it in System Settings
-        // while the app runs would otherwise leave the button up for good.
-        store.accounts[0].checkAccessibilityStatus()
 
         // An accessory app is never frontmost on its own, so without this the
         // window opens behind whatever app the user was in.

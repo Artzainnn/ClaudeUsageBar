@@ -95,8 +95,7 @@ Right-click the menu bar icon and choose **Settings…**. The **General** tab ho
 
 ### Keyboard Shortcut (Cmd+U)
 - Toggle popup from anywhere on your Mac
-- Requires Accessibility permission
-- Click "Enable Keyboard Shortcut" to grant permission
+- No special permission needed; turn it off if it clashes with another app
 
 ### Launch at Login
 - Start ClaudeUsageBar automatically when you log in
@@ -162,9 +161,8 @@ rm -rf build
 - Check macOS Focus mode isn't blocking them
 
 ### Cmd+U shortcut not working
-- Click "Enable Keyboard Shortcut" in Settings
-- Grant Accessibility permission in System Settings
-- Restart the app after granting permission
+- Check "Enable Keyboard Shortcut" in Settings
+- Another app may already own Cmd+U; quit it or turn the shortcut off
 
 ### Usage not updating
 - App auto-refreshes every 5 minutes
