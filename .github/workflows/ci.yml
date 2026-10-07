@@ -1,0 +1,105 @@
+# .github/workflows/ci.yml
+#
+# Runs on every pull_request and every push to main.
+# No secrets, no write scopes, no pull_request_target — pwn-request-safe
+# per docs.github.com/en/actions/security-for-github-actions/security-guides.
+#
+# Two jobs:
+#   1. static-grep — cheap static checks that catch known regression patterns.
+#      This is where the PR-1 "belt-and-braces" credential-leak defence lives:
+#      any PR that reintroduces the deleted "📦 Response:" pattern or raw-
+#      interpolation NSLog calls with sessionCookie / orgId / responseString
+#      fails CI before human review.
+#   2. build-and-test — (placeholder) once PR 2a lands Package.swift, this
+#      job will run `swift build` + `swift test`. Kept as a no-op comment
+#      here so PR 1's diff does not silently add a runner cost. PR 2a wires
+#      the real build/test steps in.
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static-grep:
+    name: Static credential-leak guard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Reject reintroduced "📦 Response:" pattern
+        run: |
+          if grep -rn '📦 Response' -- app/ ; then
+            echo "::error::Forbidden pattern '📦 Response' found. Deleted in PR 1 to prevent full-response-body logging; do not reintroduce." >&2
+            exit 1
+          fi
+
+      - name: Reject raw NSLog interpolation of credentials
+        run: |
+          # NSLog calls that interpolate sessionCookie, orgId, responseString,
+          # or sessionCookieInput are forbidden. Use Log.info(.count) /
+          # Log.info(.identifier) / Log.info(.sensitive) instead.
+          if grep -rnE 'NSLog\([^)]*\\\(.*(sessionCookie|orgId|responseString|sessionCookieInput)' -- app/ ; then
+            echo "::error::Raw NSLog interpolation of credentials found. Use Log.info(.count/.identifier/.sensitive) instead." >&2
+            exit 1
+          fi
+
+      - name: Reject NSLog on cookie/response tokens
+        run: |
+          # Broader net: any NSLog that mentions cookie or response bodies.
+          # If a diagnostic genuinely needs it, use Log.debug (DEBUG-only).
+          if grep -rnE 'NSLog\([^)]*(cookie|Cookie|Response body|responseString)' -- app/ ; then
+            echo "::error::NSLog referencing cookie/response found. Move to Log.debug (DEBUG-only) or delete." >&2
+            exit 1
+          fi
+
+  build-and-test:
+    name: Build and test (macOS)
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          swift --version
+          xcodebuild -version || true
+
+      - name: swift build
+        run: swift build --configuration debug
+
+      - name: swift run TestRunner
+        # Assertion-based test runner (see Package.swift header for why
+        # we do not use XCTest / Testing here — CLT compatibility).
+        run: swift run TestRunner --configuration debug
+
+      - name: Legacy build.sh compile smoke (unsigned)
+        run: |
+          # Verify the swiftc-driven build.sh path still compiles cleanly.
+          # We patch out the hardcoded Developer ID for CI, but leave the
+          # local file on disk unchanged.
+          sed 's|Developer ID Application: Linkko Technology Pte Ltd (Q467HQ5432)|-|' \
+            app/build.sh > /tmp/build-ci.sh
+          chmod +x /tmp/build-ci.sh
+          cd app
+          # Skip the launch step at the end of build.sh — CI has no display.
+          sed -i.bak '/^open "\$APP_PATH"/d' /tmp/build-ci.sh
+          /tmp/build-ci.sh
