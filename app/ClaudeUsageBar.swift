@@ -34,13 +34,15 @@ struct UsageBar: View {
 }
 
 // Main entry point
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     var statusItem: NSStatusItem!
     var popover: NSPopover!
     var usageManager: UsageManager!
     var statusManager: StatusManager!
     var updateManager: UpdateManager!
     var eventMonitor: Any?
+    var popoverResizeObserver: Any?
+    var popoverAnchoredHeight: CGFloat = 0
     var hotKeyRef: EventHotKeyRef?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -72,6 +74,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Initial guess; SwiftUI's intrinsic size (capped at 600) will drive the actual size.
         popover.contentSize = NSSize(width: 360, height: 320)
         popover.behavior = .transient
+        popover.delegate = self
         popover.contentViewController = NSHostingController(rootView: UsageView(
             usageManager: usageManager,
             statusManager: statusManager,
@@ -278,6 +281,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            anchorPopover(to: button)
 
             // Add event monitor to detect clicks outside the popover
             eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
@@ -288,14 +292,51 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // show() places the popover for its initial contentSize, then grows it to fit
+    // the SwiftUI content while keeping the bottom edge, which pushes the top under
+    // the menu bar. Re-setting positioningRect makes AppKit place it again, but for
+    // contentSize, so that has to be synced to the grown size first or the content
+    // gets clipped back to it.
+    private func anchorPopover(to button: NSStatusBarButton) {
+        guard let content = popover.contentViewController?.view,
+              let window = content.window else { return }
+        removePopoverResizeObserver()
+        popoverAnchoredHeight = 0
+        popoverResizeObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didResizeNotification, object: window, queue: .main
+        ) { [weak self, weak content, weak button] _ in
+            guard let self = self, let content = content, let button = button else { return }
+            self.reanchorPopover(content, to: button)
+        }
+        reanchorPopover(content, to: button)
+    }
+
+    private func reanchorPopover(_ content: NSView, to button: NSStatusBarButton) {
+        // Re-placing posts didResize itself; the height check stops the loop.
+        guard content.frame.height != popoverAnchoredHeight else { return }
+        popoverAnchoredHeight = content.frame.height
+        popover.contentSize = content.frame.size
+        popover.positioningRect = button.bounds
+    }
+
+    private func removePopoverResizeObserver() {
+        if let observer = popoverResizeObserver {
+            NotificationCenter.default.removeObserver(observer)
+            popoverResizeObserver = nil
+        }
+    }
+
     func closePopover() {
         popover.performClose(nil)
+    }
 
-        // Remove event monitor
+    // Also reached when the transient popover closes itself, which bypasses closePopover().
+    func popoverDidClose(_ notification: Notification) {
         if let monitor = eventMonitor {
             NSEvent.removeMonitor(monitor)
             eventMonitor = nil
         }
+        removePopoverResizeObserver()
     }
 
     func updateStatusIcon(percentage: Int) {
@@ -380,6 +421,20 @@ struct Main {
     }
 }
 
+enum MenuBarMetric: String, CaseIterable {
+    case session, weekly, sonnet, fable, extra
+
+    var label: String {
+        switch self {
+        case .session: return "Session (5h)"
+        case .weekly:  return "Weekly (7d)"
+        case .sonnet:  return "Weekly Sonnet"
+        case .fable:   return "Weekly Fable"
+        case .extra:   return "Extra usage"
+        }
+    }
+}
+
 class UsageManager: ObservableObject {
     @Published var sessionUsage: Int = 0
     @Published var sessionLimit: Int = 100
@@ -415,6 +470,7 @@ class UsageManager: ObservableObject {
     @Published var hasFetchedData: Bool = false
     @Published var isAccessibilityEnabled: Bool = false
     @Published var shortcutEnabled: Bool = true
+    @Published var menuBarMetric: MenuBarMetric = .session
 
     private var statusItem: NSStatusItem?
     private var sessionCookie: String = ""
@@ -476,6 +532,8 @@ class UsageManager: ObservableObject {
         } else {
             shortcutEnabled = UserDefaults.standard.bool(forKey: "shortcut_enabled")
         }
+        menuBarMetric = UserDefaults.standard.string(forKey: "menu_bar_metric")
+            .flatMap(MenuBarMetric.init(rawValue:)) ?? .session
     }
 
     func saveSettings() {
@@ -483,6 +541,7 @@ class UsageManager: ObservableObject {
         UserDefaults.standard.set(statusNotificationsEnabled, forKey: "status_notifications_enabled")
         UserDefaults.standard.set(openAtLogin, forKey: "open_at_login")
         UserDefaults.standard.set(shortcutEnabled, forKey: "shortcut_enabled")
+        UserDefaults.standard.set(menuBarMetric.rawValue, forKey: "menu_bar_metric")
         UserDefaults.standard.synchronize()
     }
 
@@ -542,8 +601,7 @@ class UsageManager: ObservableObject {
         lastNotifiedThreshold = 0
         UserDefaults.standard.set(0, forKey: "last_notified_threshold")
 
-        // Update status bar to show 0%
-        delegate?.updateStatusIcon(percentage: 0)
+        refreshMenuBarTitle()
 
         NSLog("ClaudeUsage: Cookie cleared, data reset")
     }
@@ -739,6 +797,7 @@ class UsageManager: ObservableObject {
                 }
                 self.hasCreditUsage = spent > 0
                 NSLog("💳 Extra usage: \(spent)/\(limit) \(self.creditCurrency)")
+                self.refreshMenuBarTitle()
             }
         }.resume()
     }
@@ -917,13 +976,39 @@ class UsageManager: ObservableObject {
     }
 
     func updateStatusBar() {
-        let sessionPercent = Int((Double(sessionUsage) / Double(sessionLimit)) * 100)
+        refreshMenuBarTitle()
 
-        // Update the icon color
-        delegate?.updateStatusIcon(percentage: sessionPercent)
-
-        // Check for notification thresholds
+        // Notifications always track the session, whatever the menu bar shows
         checkNotificationThresholds(percentage: sessionPercent)
+    }
+
+    private var sessionPercent: Int {
+        Int((Double(sessionUsage) / Double(sessionLimit)) * 100)
+    }
+
+    func isAvailable(_ metric: MenuBarMetric) -> Bool {
+        switch metric {
+        case .session, .weekly: return true
+        case .sonnet: return hasWeeklySonnet
+        case .fable:  return hasWeeklyFable
+        case .extra:  return extraLimitMinor > 0
+        }
+    }
+
+    var menuBarPercent: Int {
+        guard isAvailable(menuBarMetric) else { return sessionPercent }
+        switch menuBarMetric {
+        case .session: return sessionPercent
+        case .weekly:  return Int((Double(weeklyUsage) / Double(weeklyLimit)) * 100)
+        case .sonnet:  return Int((Double(weeklySonnetUsage) / Double(weeklySonnetLimit)) * 100)
+        case .fable:   return Int((Double(weeklyFableUsage) / Double(weeklyFableLimit)) * 100)
+        case .extra:   return Int((Double(extraSpentMinor) / Double(extraLimitMinor) * 100).rounded())
+        }
+    }
+
+    func refreshMenuBarTitle() {
+        delegate?.updateStatusIcon(percentage: menuBarPercent)
+        delegate?.statusItem?.button?.toolTip = (isAvailable(menuBarMetric) ? menuBarMetric : .session).label
     }
 
     func checkNotificationThresholds(percentage: Int) {
@@ -2265,6 +2350,39 @@ struct UsageView: View {
                                 .foregroundColor(Color.secondaryText)
                                 .fixedSize(horizontal: false, vertical: true)
                         }
+                    }
+
+                    Divider()
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Menu bar value")
+                            .font(.caption)
+                        Picker("Menu bar value", selection: Binding(
+                            get: { usageManager.menuBarMetric },
+                            set: { newValue in
+                                usageManager.menuBarMetric = newValue
+                                usageManager.saveSettings()
+                                usageManager.refreshMenuBarTitle()
+                            }
+                        )) {
+                            ForEach(MenuBarMetric.allCases.filter {
+                                usageManager.isAvailable($0) || $0 == usageManager.menuBarMetric
+                            }, id: \.self) { metric in
+                                Text(metric.label).tag(metric)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .labelsHidden()
+                        if !usageManager.isAvailable(usageManager.menuBarMetric) {
+                            Text("\(usageManager.menuBarMetric.label) isn't available right now, so the menu bar shows the session")
+                                .font(.caption2)
+                                .foregroundColor(Color.secondaryText)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Text("Usage notifications always follow the 5-hour session")
+                            .font(.caption2)
+                            .foregroundColor(Color.secondaryText)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
 
                     Divider()

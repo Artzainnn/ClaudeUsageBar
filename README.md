@@ -26,6 +26,7 @@ A lightweight, open-source macOS menu bar application that displays your Claude.
 
 - 🟢 **Real-time usage tracking** - Monitor session (5-hour) and weekly (7-day) limits
 - 🎨 **Color-coded menu bar icon** - Visual spark icon that changes color (green/yellow/red)
+- 🔢 **Choose the menu bar value** - Show session, weekly, Sonnet, Fable or extra usage in Settings
 - 🔔 **Smart notifications** - Alerts at 25%, 50%, 75%, 90% usage thresholds
 - ⌨️ **Keyboard shortcut** - Toggle popup with Cmd+U from anywhere
 - ⚡ **Auto-refresh** - Updates every 5 minutes automatically
