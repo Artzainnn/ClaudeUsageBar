@@ -38,6 +38,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var popover: NSPopover!
     var usageManager: UsageManager!
+    var usageManager2: UsageManager!
     var statusManager: StatusManager!
     var updateManager: UpdateManager!
     var eventMonitor: Any?
@@ -64,6 +65,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Initialize managers
         usageManager = UsageManager(statusItem: statusItem, delegate: self)
+        usageManager2 = UsageManager(statusItem: statusItem, delegate: self, accountIndex: 1)
         statusManager = StatusManager()
         updateManager = UpdateManager()
 
@@ -72,11 +74,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Initial guess; SwiftUI's intrinsic size (capped at 600) will drive the actual size.
         popover.contentSize = NSSize(width: 360, height: 320)
         popover.behavior = .transient
-        popover.contentViewController = NSHostingController(rootView: UsageView(
+        let hostingController = NSHostingController(rootView: UsageView(
             usageManager: usageManager,
+            usageManager2: usageManager2,
             statusManager: statusManager,
-            updateManager: updateManager
+            updateManager: updateManager,
+            onHeightChange: { [weak self] height in
+                self?.popover.contentSize = NSSize(width: 360, height: height)
+            }
         ))
+        // Let the popover own its size. If the hosting controller resizes the popover
+        // window itself, AppKit keeps the window's bottom edge, so taller content
+        // (e.g. a second account's data) grows the popup up past the screen top.
+        if #available(macOS 13.0, *) {
+            hostingController.sizingOptions = []
+        }
+        popover.contentViewController = hostingController
 
         // Appearance preference: "system" (default) tracks the macOS light/dark
         // setting; "dark"/"light" force one (dark was hard-forced in v1.3.2 and
@@ -98,12 +111,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Fetch initial data
         usageManager.fetchUsage()
+        usageManager2.fetchUsage()
         statusManager.fetch()
         updateManager.fetch()
 
         // Usage + Anthropic status are time-sensitive — poll every 5 min.
         Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { _ in
             self.usageManager.fetchUsage()
+            self.usageManager2.fetchUsage()
             self.statusManager.fetch()
         }
 
@@ -275,6 +290,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // Force UI refresh by updating percentages
             DispatchQueue.main.async {
                 self.usageManager.updatePercentages()
+                self.usageManager2.updatePercentages()
             }
 
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
@@ -298,7 +314,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func updateStatusIcon(percentage: Int) {
+    // Menu bar shows account 1's session %, plus account 2's when it has a cookie.
+    // Icon color follows whichever account is closer to its limit.
+    func refreshStatusIcon() {
+        guard let primary = usageManager else { return }
+        let p1 = primary.sessionPercent
+        if let secondary = usageManager2, secondary.hasSessionCookie {
+            let p2 = secondary.sessionPercent
+            if primary.hasSessionCookie {
+                updateStatusIcon(percentage: max(p1, p2), title: " \(p1)% · \(p2)%")
+            } else {
+                updateStatusIcon(percentage: p2)
+            }
+        } else {
+            updateStatusIcon(percentage: p1)
+        }
+    }
+
+    func updateStatusIcon(percentage: Int, title: String? = nil) {
         guard let button = statusItem.button else { return }
 
         // Determine color based on percentage
@@ -316,7 +349,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Set image and title
         button.image = sparkIcon
-        button.title = " \(percentage)%"
+        button.title = title ?? " \(percentage)%"
     }
 
     func createSparkIcon(color: NSColor) -> NSImage {
@@ -421,9 +454,26 @@ class UsageManager: ObservableObject {
     private weak var delegate: AppDelegate?
     private var lastNotifiedThreshold: Int = 0
 
-    init(statusItem: NSStatusItem?, delegate: AppDelegate? = nil) {
+    // 0 = primary account (legacy, unsuffixed UserDefaults keys), 1 = second account ("_2" keys).
+    let accountIndex: Int
+    // User-chosen label (e.g. "Work", "Personal"); blank falls back to "Account N".
+    @Published var customName: String = ""
+    var accountName: String {
+        let trimmed = customName.trimmingCharacters(in: .whitespaces)
+        return trimmed.isEmpty ? "Account \(accountIndex + 1)" : trimmed
+    }
+    var hasSessionCookie: Bool { !sessionCookie.isEmpty }
+    var sessionPercent: Int { Int((Double(sessionUsage) / Double(sessionLimit)) * 100) }
+    private var keySuffix: String { accountIndex == 0 ? "" : "_\(accountIndex + 1)" }
+    var cookieKey: String { "claude_session_cookie" + keySuffix }
+    private var thresholdKey: String { "last_notified_threshold" + keySuffix }
+    private var nameKey: String { "account_name" + keySuffix }
+
+    init(statusItem: NSStatusItem?, delegate: AppDelegate? = nil, accountIndex: Int = 0) {
         self.statusItem = statusItem
         self.delegate = delegate
+        self.accountIndex = accountIndex
+        customName = UserDefaults.standard.string(forKey: nameKey) ?? ""
         loadSessionCookie()
         loadSettings()
         checkAccessibilityStatus()
@@ -434,7 +484,7 @@ class UsageManager: ObservableObject {
     }
 
     func loadSessionCookie() {
-        if let savedCookie = UserDefaults.standard.string(forKey: "claude_session_cookie") {
+        if let savedCookie = UserDefaults.standard.string(forKey: cookieKey) {
             sessionCookie = savedCookie
         }
     }
@@ -469,7 +519,7 @@ class UsageManager: ObservableObject {
         } else {
             openAtLogin = UserDefaults.standard.bool(forKey: "open_at_login")
         }
-        lastNotifiedThreshold = UserDefaults.standard.integer(forKey: "last_notified_threshold")
+        lastNotifiedThreshold = UserDefaults.standard.integer(forKey: thresholdKey)
         // Default shortcut to enabled if not previously set
         if UserDefaults.standard.object(forKey: "shortcut_enabled") == nil {
             shortcutEnabled = true
@@ -505,10 +555,15 @@ class UsageManager: ObservableObject {
         }
     }
 
+    func renameAccount(_ name: String) {
+        customName = name
+        UserDefaults.standard.set(name, forKey: nameKey)
+    }
+
     func saveSessionCookie(_ cookie: String) {
         NSLog("ClaudeUsage: Saving cookie, length: \(cookie.count)")
         sessionCookie = cookie
-        UserDefaults.standard.set(cookie, forKey: "claude_session_cookie")
+        UserDefaults.standard.set(cookie, forKey: cookieKey)
         UserDefaults.standard.synchronize()
         NSLog("ClaudeUsage: Cookie saved successfully")
     }
@@ -516,7 +571,7 @@ class UsageManager: ObservableObject {
     func clearSessionCookie() {
         NSLog("ClaudeUsage: Clearing cookie")
         sessionCookie = ""
-        UserDefaults.standard.removeObject(forKey: "claude_session_cookie")
+        UserDefaults.standard.removeObject(forKey: cookieKey)
         UserDefaults.standard.synchronize()
 
         // Reset all data
@@ -540,10 +595,10 @@ class UsageManager: ObservableObject {
         hasWeeklyFable = false
         errorMessage = nil
         lastNotifiedThreshold = 0
-        UserDefaults.standard.set(0, forKey: "last_notified_threshold")
+        UserDefaults.standard.set(0, forKey: thresholdKey)
 
         // Update status bar to show 0%
-        delegate?.updateStatusIcon(percentage: 0)
+        delegate?.refreshStatusIcon()
 
         NSLog("ClaudeUsage: Cookie cleared, data reset")
     }
@@ -591,7 +646,8 @@ class UsageManager: ObservableObject {
         guard !sessionCookie.isEmpty else {
             DispatchQueue.main.async {
                 self.errorMessage = "Session cookie not set"
-                self.updateStatusBar()
+                // An unused second account shouldn't touch the menu bar or notifications.
+                if self.accountIndex == 0 { self.updateStatusBar() }
             }
             return
         }
@@ -917,10 +973,8 @@ class UsageManager: ObservableObject {
     }
 
     func updateStatusBar() {
-        let sessionPercent = Int((Double(sessionUsage) / Double(sessionLimit)) * 100)
-
         // Update the icon color
-        delegate?.updateStatusIcon(percentage: sessionPercent)
+        delegate?.refreshStatusIcon()
 
         // Check for notification thresholds
         checkNotificationThresholds(percentage: sessionPercent)
@@ -929,7 +983,9 @@ class UsageManager: ObservableObject {
     func checkNotificationThresholds(percentage: Int) {
         NSLog("🔔 Checking notifications: percentage=\(percentage)%, enabled=\(usageNotificationsEnabled), lastNotified=\(lastNotifiedThreshold)%")
 
-        guard usageNotificationsEnabled else {
+        // Settings toggles live on the primary account's manager; read the shared
+        // persisted flag so the second account follows them too.
+        guard UserDefaults.standard.bool(forKey: "usage_notifications_enabled") else {
             NSLog("⚠️ Usage notifications disabled")
             return
         }
@@ -942,7 +998,7 @@ class UsageManager: ObservableObject {
                 sendNotification(percentage: percentage, threshold: threshold)
                 lastNotifiedThreshold = threshold
                 // Persist the threshold
-                UserDefaults.standard.set(lastNotifiedThreshold, forKey: "last_notified_threshold")
+                UserDefaults.standard.set(lastNotifiedThreshold, forKey: thresholdKey)
                 UserDefaults.standard.synchronize()
             }
         }
@@ -952,14 +1008,15 @@ class UsageManager: ObservableObject {
             let newThreshold = thresholds.filter { $0 <= percentage }.last ?? 0
             NSLog("🔄 Resetting notification threshold from \(lastNotifiedThreshold)% to \(newThreshold)%")
             lastNotifiedThreshold = newThreshold
-            UserDefaults.standard.set(lastNotifiedThreshold, forKey: "last_notified_threshold")
+            UserDefaults.standard.set(lastNotifiedThreshold, forKey: thresholdKey)
             UserDefaults.standard.synchronize()
         }
     }
 
     func sendNotification(percentage: Int, threshold: Int) {
         let notification = NSUserNotification()
-        notification.title = "Claude Usage Alert"
+        let multiAccount = delegate?.usageManager2?.hasSessionCookie == true
+        notification.title = multiAccount ? "Claude Usage Alert (\(accountName))" : "Claude Usage Alert"
         notification.informativeText = "You've reached \(percentage)% of your 5-hour session limit"
         notification.soundName = NSUserNotificationDefaultSoundName
 
@@ -1581,7 +1638,8 @@ private struct ContentHeightKey: PreferenceKey {
 }
 
 struct UsageView: View {
-    @ObservedObject var usageManager: UsageManager
+    @ObservedObject var usageManager: UsageManager      // primary account; also owns app settings
+    @ObservedObject var usageManager2: UsageManager     // second account
     @ObservedObject var statusManager: StatusManager
     @ObservedObject var updateManager: UpdateManager
     @State private var sessionCookieInput: String = ""
@@ -1589,8 +1647,18 @@ struct UsageView: View {
     @State private var showingSettings: Bool = false
     @State private var showingStatusDetails: Bool = false
     @State private var measuredHeight: CGFloat = 250
+    var onHeightChange: ((CGFloat) -> Void)? = nil
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage("appearance_mode") private var appearanceMode: String = "system"
+    @AppStorage("selected_account") private var selectedAccount: Int = 0
+
+    // Account whose usage and cookie the popup currently shows.
+    private var account: UsageManager { selectedAccount == 1 ? usageManager2 : usageManager }
+
+    private func cookiePreview(for manager: UsageManager) -> String {
+        guard let savedCookie = UserDefaults.standard.string(forKey: manager.cookieKey) else { return "" }
+        return String(savedCookie.prefix(20)) + "..."
+    }
 
     private let maxPopupHeight: CGFloat = 600
 
@@ -1619,12 +1687,15 @@ struct UsageView: View {
             .onPreferenceChange(ContentHeightKey.self) { value in
                 guard value > 0 else { return }
                 measuredHeight = value
+                onHeightChange?(min(max(value, 100), maxPopupHeight))
             }
             .onAppear {
-                if let savedCookie = UserDefaults.standard.string(forKey: "claude_session_cookie") {
-                    sessionCookieInput = String(savedCookie.prefix(20)) + "..."
-                }
+                sessionCookieInput = cookiePreview(for: account)
                 usageManager.updatePercentages()
+                usageManager2.updatePercentages()
+            }
+            .onChange(of: selectedAccount) { _ in
+                sessionCookieInput = cookiePreview(for: account)
             }
             .onChange(of: showingSettings) { isOpen in
                 if isOpen {
@@ -1643,6 +1714,13 @@ struct UsageView: View {
             Text("Claude Usage")
                 .font(.headline)
                 .padding(.bottom, 4)
+
+            Picker("", selection: $selectedAccount) {
+                Text(usageManager.hasFetchedData ? "\(usageManager.accountName) · \(usageManager.sessionPercent)%" : usageManager.accountName).tag(0)
+                Text(usageManager2.hasFetchedData ? "\(usageManager2.accountName) · \(usageManager2.sessionPercent)%" : usageManager2.accountName).tag(1)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
 
             // Free-form message banner (author-controlled). Takes priority over
             // the version-update banner when both are present.
@@ -1721,7 +1799,7 @@ struct UsageView: View {
                 .cornerRadius(6)
             }
 
-            if let error = usageManager.errorMessage {
+            if let error = account.errorMessage {
                 Text(error)
                     .font(.caption)
                     .foregroundColor(.orange)
@@ -1729,7 +1807,7 @@ struct UsageView: View {
             }
 
             // Only show usage if data has been fetched
-            if !usageManager.hasFetchedData {
+            if !account.hasFetchedData {
                 Text("👋 Welcome! Set your session cookie below to get started.")
                     .font(.subheadline)
                     .foregroundColor(Color.secondaryText)
@@ -1737,23 +1815,23 @@ struct UsageView: View {
             }
 
             // Session Usage
-            if usageManager.hasFetchedData {
+            if account.hasFetchedData {
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
                     Text("Session (5 hour)")
                         .font(.subheadline)
                     Spacer()
-                    if let resetTime = usageManager.sessionResetsAt {
+                    if let resetTime = account.sessionResetsAt {
                         Text("Resets \(formatResetTime(resetTime))")
                             .font(.caption)
                             .foregroundColor(Color.secondaryText)
                     }
                 }
 
-                UsageBar(value: usageManager.sessionPercentage,
-                         color: colorForPercentage(usageManager.sessionPercentage))
+                UsageBar(value: account.sessionPercentage,
+                         color: colorForPercentage(account.sessionPercentage))
 
-                Text("\(Int(usageManager.sessionPercentage * 100))% used")
+                Text("\(Int(account.sessionPercentage * 100))% used")
                     .font(.caption)
                     .foregroundColor(Color.secondaryText)
             }
@@ -1764,39 +1842,39 @@ struct UsageView: View {
                     Text("Weekly (7 day)")
                         .font(.subheadline)
                     Spacer()
-                    if let resetTime = usageManager.weeklyResetsAt {
+                    if let resetTime = account.weeklyResetsAt {
                         Text("Resets \(formatResetTime(resetTime, includeDate: true))")
                             .font(.caption)
                             .foregroundColor(Color.secondaryText)
                     }
                 }
 
-                UsageBar(value: usageManager.weeklyPercentage,
-                         color: colorForPercentage(usageManager.weeklyPercentage))
+                UsageBar(value: account.weeklyPercentage,
+                         color: colorForPercentage(account.weeklyPercentage))
 
-                Text("\(Int(usageManager.weeklyPercentage * 100))% used")
+                Text("\(Int(account.weeklyPercentage * 100))% used")
                     .font(.caption)
                     .foregroundColor(Color.secondaryText)
             }
 
             // Weekly Sonnet Usage (only show if available)
-            if usageManager.hasWeeklySonnet && usageManager.hasFetchedData {
+            if account.hasWeeklySonnet && account.hasFetchedData {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
                         Text("Weekly Sonnet (7 day)")
                             .font(.subheadline)
                         Spacer()
-                        if let resetTime = usageManager.weeklySonnetResetsAt {
+                        if let resetTime = account.weeklySonnetResetsAt {
                             Text("Resets \(formatResetTime(resetTime, includeDate: true))")
                                 .font(.caption)
                                 .foregroundColor(Color.secondaryText)
                         }
                     }
 
-                    UsageBar(value: usageManager.weeklySonnetPercentage,
-                             color: colorForPercentage(usageManager.weeklySonnetPercentage))
+                    UsageBar(value: account.weeklySonnetPercentage,
+                             color: colorForPercentage(account.weeklySonnetPercentage))
 
-                    Text("\(Int(usageManager.weeklySonnetPercentage * 100))% used")
+                    Text("\(Int(account.weeklySonnetPercentage * 100))% used")
                         .font(.caption)
                         .foregroundColor(Color.secondaryText)
                 }
@@ -1804,23 +1882,23 @@ struct UsageView: View {
 
             // Weekly Fable Usage — only surfaced once usage is above 1%
             // (new model, counted separately; hidden while idle to avoid clutter).
-            if usageManager.hasWeeklyFable && usageManager.hasFetchedData && usageManager.weeklyFableUsage >= 1 {
+            if account.hasWeeklyFable && account.hasFetchedData && account.weeklyFableUsage >= 1 {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
                         Text("Weekly Fable (7 day)")
                             .font(.subheadline)
                         Spacer()
-                        if let resetTime = usageManager.weeklyFableResetsAt {
+                        if let resetTime = account.weeklyFableResetsAt {
                             Text("Resets \(formatResetTime(resetTime, includeDate: true))")
                                 .font(.caption)
                                 .foregroundColor(Color.secondaryText)
                         }
                     }
 
-                    UsageBar(value: usageManager.weeklyFablePercentage,
-                             color: colorForPercentage(usageManager.weeklyFablePercentage))
+                    UsageBar(value: account.weeklyFablePercentage,
+                             color: colorForPercentage(account.weeklyFablePercentage))
 
-                    Text("\(Int(usageManager.weeklyFablePercentage * 100))% used")
+                    Text("\(Int(account.weeklyFablePercentage * 100))% used")
                         .font(.caption)
                         .foregroundColor(Color.secondaryText)
                 }
@@ -1828,18 +1906,18 @@ struct UsageView: View {
 
             // Usage credits (pay-as-you-go). Only shown once credits are actually
             // used; links out to manage credits on claude.ai.
-            if usageManager.hasCreditUsage || usageManager.freeCreditsMinor > 0 {
-                let spentMinor = usageManager.extraSpentMinor
-                let limitMinor = usageManager.extraLimitMinor
+            if account.hasCreditUsage || account.freeCreditsMinor > 0 {
+                let spentMinor = account.extraSpentMinor
+                let limitMinor = account.extraLimitMinor
                 let pct = limitMinor > 0 ? Double(spentMinor) / Double(limitMinor) : 0
                 let pctInt = Int((pct * 100).rounded())
                 // Show the exact % up to the limit; once over, just say "over limit".
                 let pctLabel = pctInt > 100 ? "over limit" : "\(pctInt)%"
                 let fmt: (Int) -> String = { minor in
                     let v = Double(minor) / 100.0
-                    return usageManager.creditCurrency == "USD"
+                    return account.creditCurrency == "USD"
                         ? String(format: "$%.2f", v)
-                        : String(format: "%@ %.2f", usageManager.creditCurrency, v)
+                        : String(format: "%@ %.2f", account.creditCurrency, v)
                 }
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
@@ -1859,13 +1937,13 @@ struct UsageView: View {
                     }
 
                     // Reset date, shortened (e.g. "Resets Aug 1") so it fits inline.
-                    let shortReset: String? = usageManager.extraResetsAt.map { d in
+                    let shortReset: String? = account.extraResetsAt.map { d in
                         let f = DateFormatter(); f.dateFormat = "MMM d"
                         return "Resets \(f.string(from: d))"
                     }
 
                     // Spend vs monthly limit — only when there's actual spend.
-                    if usageManager.hasCreditUsage {
+                    if account.hasCreditUsage {
                         if limitMinor > 0 {
                             UsageBar(value: min(pct, 1.0),
                                      color: colorForPercentage(pct))
@@ -1885,8 +1963,8 @@ struct UsageView: View {
                         }
                     }
 
-                    if usageManager.freeCreditsMinor > 0 {
-                        Text("\(fmt(usageManager.freeCreditsMinor)) free credits left")
+                    if account.freeCreditsMinor > 0 {
+                        Text("\(fmt(account.freeCreditsMinor)) free credits left")
                             .font(.caption2)
                             .foregroundColor(Color.secondaryText)
                             .opacity(0.85)
@@ -1897,9 +1975,9 @@ struct UsageView: View {
             // Discreet info line: available limit resets when there are any (as in
             // CodexUsageBar), else a reassurance naming whichever of Fable / extra
             // usage is not being consumed (nothing shown when both are active).
-            if usageManager.hasFetchedData && usageManager.limitResetsLeft > 0 {
-                let n = usageManager.limitResetsLeft
-                let until: String = usageManager.limitResetsEndAt.map { d in
+            if account.hasFetchedData && account.limitResetsLeft > 0 {
+                let n = account.limitResetsLeft
+                let until: String = account.limitResetsEndAt.map { d in
                     // Last usable instant: an end at local midnight would read as the next day.
                     let f = DateFormatter(); f.dateFormat = "MMM d"
                     return " until \(f.string(from: d.addingTimeInterval(-1)))"
@@ -1908,9 +1986,9 @@ struct UsageView: View {
                     .font(.caption2)
                     .foregroundColor(Color.secondaryText)
                     .opacity(0.6)
-            } else if usageManager.hasFetchedData {
-                let fableActive = usageManager.hasWeeklyFable && usageManager.weeklyFableUsage >= 1
-                let extraActive = usageManager.hasCreditUsage || usageManager.freeCreditsMinor > 0
+            } else if account.hasFetchedData {
+                let fableActive = account.hasWeeklyFable && account.weeklyFableUsage >= 1
+                let extraActive = account.hasCreditUsage || account.freeCreditsMinor > 0
                 if !fableActive || !extraActive {
                     Text(
                         !fableActive && !extraActive ? "No Fable or extra usage"
@@ -2053,16 +2131,17 @@ struct UsageView: View {
                 }
             }
 
-            if usageManager.hasFetchedData {
+            if account.hasFetchedData {
             Divider()
 
             HStack {
-                Text("Last updated: \(formatTime(usageManager.lastUpdated))")
+                Text("Last updated: \(formatTime(account.lastUpdated))")
                     .font(.caption)
                     .foregroundColor(Color.secondaryText)
                 Spacer()
                 Button("Refresh") {
                     usageManager.fetchUsage()
+                    usageManager2.fetchUsage()
                     statusManager.fetch()
                     updateManager.fetch()
                 }
@@ -2071,7 +2150,7 @@ struct UsageView: View {
             }
             }
 
-            Button(showingCookieInput ? "Hide Cookie" : "Set Session Cookie") {
+            Button(showingCookieInput ? "Hide Account Setup" : "Set Cookie & Name") {
                 showingCookieInput.toggle()
             }
             .buttonStyle(.borderless)
@@ -2079,6 +2158,18 @@ struct UsageView: View {
 
             if showingCookieInput {
                 VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 6) {
+                        Text("Account name:")
+                            .font(.caption)
+                            .fontWeight(.semibold)
+                        TextField("Account \(account.accountIndex + 1)", text: Binding(
+                            get: { account.customName },
+                            set: { account.renameAccount($0) }
+                        ))
+                        .textFieldStyle(.roundedBorder)
+                        .font(.caption)
+                    }
+
                     HStack {
                         Text("How to get your session cookie:")
                             .font(.caption)
@@ -2118,20 +2209,20 @@ struct UsageView: View {
                                 Button("Save Cookie & Fetch") {
                                     NSLog("ClaudeUsage: Save clicked, input length: \(sessionCookieInput.count)")
                                     if sessionCookieInput.isEmpty {
-                                        usageManager.errorMessage = "Cookie field is empty!"
+                                        account.errorMessage = "Cookie field is empty!"
                                     } else {
-                                        usageManager.saveSessionCookie(sessionCookieInput)
-                                        usageManager.fetchUsage()
-                                        usageManager.errorMessage = "Cookie saved, fetching..."
+                                        account.saveSessionCookie(sessionCookieInput)
+                                        account.fetchUsage()
+                                        account.errorMessage = "Cookie saved, fetching..."
                                     }
                                 }
                                 .buttonStyle(.borderedProminent)
                                 .controlSize(.small)
 
-                                if usageManager.hasFetchedData {
+                                if account.hasFetchedData {
                                     Button("Clear Cookie") {
                                         sessionCookieInput = ""
-                                        usageManager.clearSessionCookie()
+                                        account.clearSessionCookie()
                                     }
                                     .buttonStyle(.bordered)
                                     .controlSize(.small)
