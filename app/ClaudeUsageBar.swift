@@ -496,6 +496,11 @@ class UsageManager: ObservableObject {
     @Published var limitResetGrants: [ResetGrant] = []
     @Published var creditCurrency: String = "USD"
     @Published var hasCreditUsage: Bool = false
+    // Dollar allowance claude.ai calls `iguana_necktie` (e.g. $250, renews monthly).
+    // nil when the account doesn't have it: the row is hidden entirely.
+    @Published var sessionCreditsUsed: Double = 0
+    @Published var sessionCreditsLimit: Double = 0
+    @Published var sessionCreditsResetsAt: Date?
     @Published var sessionResetsAt: Date?
     @Published var weeklyResetsAt: Date?
     @Published var weeklySonnetResetsAt: Date?
@@ -635,6 +640,9 @@ class UsageManager: ObservableObject {
         freeCreditsMinor = 0
         limitResetsLeft = 0
         limitResetGrants = []
+        sessionCreditsLimit = 0
+        sessionCreditsUsed = 0
+        sessionCreditsResetsAt = nil
         hasCreditUsage = false
         hasFetchedData = false
         hasWeeklySonnet = false
@@ -927,6 +935,20 @@ class UsageManager: ObservableObject {
                         NSLog("❌ Failed to parse session reset time")
                     }
                 }
+            }
+
+            if let credits = json["iguana_necktie"] as? [String: Any],
+               let limit = (credits["limit_dollars"] as? NSNumber)?.doubleValue, limit > 0 {
+                sessionCreditsLimit = limit
+                sessionCreditsUsed = (credits["used_dollars"] as? NSNumber)?.doubleValue ?? 0
+                let f = ISO8601DateFormatter()
+                f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                let resets = credits["resets_at"] as? String
+                sessionCreditsResetsAt = resets.flatMap { f.date(from: $0) ?? ISO8601DateFormatter().date(from: $0) }
+            } else {
+                sessionCreditsLimit = 0
+                sessionCreditsUsed = 0
+                sessionCreditsResetsAt = nil
             }
 
             if let sevenDay = json["seven_day"] as? [String: Any] {
@@ -1958,6 +1980,34 @@ struct UsageView: View {
                              pace: paceMarker(resetsAt: usageManager.weeklyFableResetsAt, window: PaceWindow.weekly))
 
                     Text("\(Int(usageManager.weeklyFablePercentage * 100))% used")
+                        .font(.caption)
+                        .foregroundColor(Color.secondaryText)
+                }
+            }
+
+            // Session credits: only when the account has the allowance.
+            if usageManager.sessionCreditsLimit > 0 {
+                let used = usageManager.sessionCreditsUsed
+                let limit = usageManager.sessionCreditsLimit
+                let left = max(0, limit - used)
+                let money: (Double) -> String = { v in
+                    v == v.rounded() ? String(format: "$%.0f", v) : String(format: "$%.2f", v)
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Session credits")
+                            .font(.subheadline)
+                        Spacer()
+                        if let resetTime = usageManager.sessionCreditsResetsAt {
+                            Text(resetText(resetTime)).help(resetHelp(resetTime))
+                                .font(.caption)
+                                .foregroundColor(Color.secondaryText)
+                        }
+                    }
+
+                    UsageBar(value: used / limit, color: colorForPercentage(used / limit))
+
+                    Text("\(money(left)) of \(money(limit)) left")
                         .font(.caption)
                         .foregroundColor(Color.secondaryText)
                 }
