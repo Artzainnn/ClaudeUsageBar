@@ -1985,10 +1985,9 @@ struct UsageView: View {
                 }
             }
 
-            // Claude session credits: same rule as the Fable bar, hidden until at
-            // least 1% of the allowance is used (and when the account has none).
-            if usageManager.sessionCreditsLimit > 0,
-               usageManager.sessionCreditsUsed / usageManager.sessionCreditsLimit >= 0.01 {
+            // Claude session credits: shown from the first cent used; hidden while
+            // untouched or when the account has no allowance.
+            if usageManager.sessionCreditsLimit > 0, usageManager.sessionCreditsUsed >= 0.01 {
                 let used = usageManager.sessionCreditsUsed
                 let limit = usageManager.sessionCreditsLimit
                 let left = max(0, limit - used)
