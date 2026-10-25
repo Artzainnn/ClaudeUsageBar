@@ -1,7 +1,7 @@
 {
-  "version": "1.3.4",
-  "title": "New: see your free limit resets",
-  "description": "The app now shows the free usage-limit resets Claude gives you, and until when you can use them.",
+  "version": "1.3.5",
+  "title": "New time format: \"Resets in 5d 23h\"",
+  "description": "Reset times now show as a countdown instead of a date, and your limit resets show when they expire. Prefer the date format? Switch back in Settings > Reset times.",
   "buttons": [
     {
       "label": "Download latest",

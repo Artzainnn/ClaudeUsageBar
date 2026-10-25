@@ -14,6 +14,33 @@ extension Color {
     })
 }
 
+/// A banked limit reset the user can trigger (Claude grant or Codex reset credit).
+struct ResetGrant: Equatable {
+    let title: String
+    let count: Int
+    let expiresAt: Date?
+}
+
+/// Banked resets as a plain line: count on the left, expiry aligned right.
+struct ResetRow: View {
+    let title: String
+    let detail: String?
+    let help: String
+
+    var body: some View {
+        HStack {
+            Text(title)
+            Spacer()
+            if let detail = detail {
+                Text(detail)
+            }
+        }
+        .font(.caption)
+        .foregroundColor(Color.secondaryText)
+        .help(help)
+    }
+}
+
 // Deterministic usage bar: the native linear ProgressView ignores .tint() in
 // light (aqua) and vibrant rendering and falls back to accent blue.
 struct UsageBar: View {
@@ -397,7 +424,7 @@ class UsageManager: ObservableObject {
     // Banked usage-limit resets the user can trigger on claude.ai (e.g. the Opus 5.5
     // launch grant). Read-only here: using one is a POST on /reset_rate_limits.
     @Published var limitResetsLeft: Int = 0
-    @Published var limitResetsEndAt: Date?
+    @Published var limitResetGrants: [ResetGrant] = []
     @Published var creditCurrency: String = "USD"
     @Published var hasCreditUsage: Bool = false
     @Published var sessionResetsAt: Date?
@@ -533,7 +560,7 @@ class UsageManager: ObservableObject {
         extraResetsAt = nil
         freeCreditsMinor = 0
         limitResetsLeft = 0
-        limitResetsEndAt = nil
+        limitResetGrants = []
         hasCreditUsage = false
         hasFetchedData = false
         hasWeeklySonnet = false
@@ -636,20 +663,19 @@ class UsageManager: ObservableObject {
                       let http = response as? HTTPURLResponse, http.statusCode == 200,
                       let data = data,
                       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
-                let (left, endAt) = Self.parseLimitResets(json["cedar_ember"])
-                self.limitResetsLeft = left
-                self.limitResetsEndAt = endAt
-                NSLog("🔄 Limit resets available: \(left)")
+                let grants = Self.parseLimitResets(json["cedar_ember"])
+                self.limitResetGrants = grants
+                self.limitResetsLeft = grants.reduce(0) { $0 + $1.count }
+                NSLog("🔄 Limit resets available: \(self.limitResetsLeft)")
             }
         }.resume()
     }
 
-    /// Counts resets still usable across grants (not paused, inside their window)
-    /// and returns the earliest end date among them.
-    static func parseLimitResets(_ raw: Any?, now: Date = Date()) -> (Int, Date?) {
+    /// Grants with resets still usable (not paused, inside their window).
+    static func parseLimitResets(_ raw: Any?, now: Date = Date()) -> [ResetGrant] {
         guard let obj = raw as? [String: Any],
               (obj["eligible"] as? Bool) == true,
-              let grants = obj["grants"] as? [[String: Any]] else { return (0, nil) }
+              let grants = obj["grants"] as? [[String: Any]] else { return [] }
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let isoNoFrac = ISO8601DateFormatter()
@@ -657,17 +683,15 @@ class UsageManager: ObservableObject {
             guard let s = v as? String else { return nil }
             return iso.date(from: s) ?? isoNoFrac.date(from: s)
         }
-        var total = 0
-        var earliestEnd: Date?
+        var out: [ResetGrant] = []
         for g in grants {
             let left = (g["resets_left"] as? Int) ?? 0
             guard left > 0, (g["paused"] as? Bool) != true,
                   let end = date(g["ends_at"]), end > now else { continue }
             if let start = date(g["starts_at"]), start > now { continue }
-            total += left
-            earliestEnd = min(earliestEnd ?? end, end)
+            out.append(ResetGrant(title: (g["label"] as? String) ?? "Usage-limit reset", count: left, expiresAt: end))
         }
-        return (total, earliestEnd)
+        return out
     }
 
     // Remaining free/promo credits (balance) from /prepaid/credits.
@@ -1591,6 +1615,9 @@ struct UsageView: View {
     @State private var measuredHeight: CGFloat = 250
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage("appearance_mode") private var appearanceMode: String = "system"
+    @AppStorage("reset_time_style") private var resetTimeStyle: String = "countdown"
+    @State private var now = Date()
+    private let minuteTicker = Timer.publish(every: 60, on: .main, in: .common).autoconnect()
 
     private let maxPopupHeight: CGFloat = 600
 
@@ -1620,7 +1647,9 @@ struct UsageView: View {
                 guard value > 0 else { return }
                 measuredHeight = value
             }
+            .onReceive(minuteTicker) { now = $0 }
             .onAppear {
+                now = Date()
                 if let savedCookie = UserDefaults.standard.string(forKey: "claude_session_cookie") {
                     sessionCookieInput = String(savedCookie.prefix(20)) + "..."
                 }
@@ -1744,7 +1773,7 @@ struct UsageView: View {
                         .font(.subheadline)
                     Spacer()
                     if let resetTime = usageManager.sessionResetsAt {
-                        Text("Resets \(formatResetTime(resetTime))")
+                        Text(resetText(resetTime, includeDate: false)).help(resetHelp(resetTime, includeDate: false))
                             .font(.caption)
                             .foregroundColor(Color.secondaryText)
                     }
@@ -1765,7 +1794,7 @@ struct UsageView: View {
                         .font(.subheadline)
                     Spacer()
                     if let resetTime = usageManager.weeklyResetsAt {
-                        Text("Resets \(formatResetTime(resetTime, includeDate: true))")
+                        Text(resetText(resetTime)).help(resetHelp(resetTime))
                             .font(.caption)
                             .foregroundColor(Color.secondaryText)
                     }
@@ -1787,7 +1816,7 @@ struct UsageView: View {
                             .font(.subheadline)
                         Spacer()
                         if let resetTime = usageManager.weeklySonnetResetsAt {
-                            Text("Resets \(formatResetTime(resetTime, includeDate: true))")
+                            Text(resetText(resetTime)).help(resetHelp(resetTime))
                                 .font(.caption)
                                 .foregroundColor(Color.secondaryText)
                         }
@@ -1811,7 +1840,7 @@ struct UsageView: View {
                             .font(.subheadline)
                         Spacer()
                         if let resetTime = usageManager.weeklyFableResetsAt {
-                            Text("Resets \(formatResetTime(resetTime, includeDate: true))")
+                            Text(resetText(resetTime)).help(resetHelp(resetTime))
                                 .font(.caption)
                                 .foregroundColor(Color.secondaryText)
                         }
@@ -1898,16 +1927,7 @@ struct UsageView: View {
             // CodexUsageBar), else a reassurance naming whichever of Fable / extra
             // usage is not being consumed (nothing shown when both are active).
             if usageManager.hasFetchedData && usageManager.limitResetsLeft > 0 {
-                let n = usageManager.limitResetsLeft
-                let until: String = usageManager.limitResetsEndAt.map { d in
-                    // Last usable instant: an end at local midnight would read as the next day.
-                    let f = DateFormatter(); f.dateFormat = "MMM d"
-                    return " until \(f.string(from: d.addingTimeInterval(-1)))"
-                } ?? ""
-                Text("\(n) usage-limit reset\(n == 1 ? "" : "s") available\(until)")
-                    .font(.caption2)
-                    .foregroundColor(Color.secondaryText)
-                    .opacity(0.6)
+                resetRow(usageManager.limitResetGrants)
             } else if usageManager.hasFetchedData {
                 let fableActive = usageManager.hasWeeklyFable && usageManager.weeklyFableUsage >= 1
                 let extraActive = usageManager.hasCreditUsage || usageManager.freeCreditsMinor > 0
@@ -2231,6 +2251,22 @@ struct UsageView: View {
 
                     Divider()
 
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Reset times")
+                            .font(.caption)
+                        Picker("Reset times", selection: $resetTimeStyle) {
+                            Text("Time left").tag("countdown")
+                            Text("Date").tag("date")
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        Text("Show reset times as time left or as a date")
+                            .font(.caption2)
+                            .foregroundColor(Color.secondaryText)
+                    }
+
+                    Divider()
+
                     VStack(alignment: .leading, spacing: 8) {
                         Toggle(isOn: Binding(
                             get: { usageManager.shortcutEnabled },
@@ -2334,6 +2370,61 @@ struct UsageView: View {
         let formatter = DateFormatter()
         formatter.timeStyle = .short
         return formatter.string(from: date)
+    }
+
+    /// "5d 23h", "3h 12m" or "12m"; minutes round up so it never reads "0m" early.
+    static func countdown(to date: Date, from now: Date) -> String {
+        let mins = Int((date.timeIntervalSince(now) / 60).rounded(.up))
+        let d = mins / 1440, h = (mins % 1440) / 60, m = mins % 60
+        if d > 0 { return "\(d)d \(h)h" }
+        if h > 0 { return "\(h)h \(m)m" }
+        return "\(m)m"
+    }
+
+    private func timeLeft(_ date: Date) -> String {
+        date <= now ? "now" : "in \(Self.countdown(to: date, from: now))"
+    }
+
+    /// Reset label, as time left or as a date per Settings > Reset times.
+    /// `includeDate: false` (5-hour session) shows just the clock time in date mode.
+    func resetText(_ date: Date, includeDate: Bool = true) -> String {
+        resetTimeStyle == "date" ? "Resets \(formatResetTime(date, includeDate: includeDate))" : "Resets \(timeLeft(date))"
+    }
+
+    /// The other format, on hover.
+    func resetHelp(_ date: Date, includeDate: Bool = true) -> String {
+        resetTimeStyle == "date" ? "Resets \(timeLeft(date))" : "Resets \(formatResetTime(date, includeDate: includeDate))"
+    }
+
+    /// Right side of the reset chip: "Expires in 6d 4h" or "Until Oct 22". With several
+    /// resets expiring on different days, the soonest one is what matters ("Next ...").
+    func resetsExpiryText(_ grants: [ResetGrant]) -> String? {
+        let ends = grants.compactMap { $0.expiresAt }
+        guard let first = ends.min() else { return nil }
+        let next = Set(ends).count > 1 ? "Next " : ""
+        if resetTimeStyle == "date" {
+            // Last usable instant: an end at local midnight would read as the next day.
+            let f = DateFormatter(); f.dateFormat = "MMM d"
+            let day = f.string(from: first.addingTimeInterval(-1))
+            return next.isEmpty ? "Until \(day)" : "Next until \(day)"
+        }
+        return next.isEmpty ? "Expires \(timeLeft(first))" : "Next expires \(timeLeft(first))"
+    }
+
+    func resetRow(_ grants: [ResetGrant]) -> some View {
+        let n = grants.reduce(0) { $0 + $1.count }
+        return ResetRow(title: "\(n) limit reset\(n == 1 ? "" : "s") available",
+                         detail: resetsExpiryText(grants),
+                         help: resetsHelp(grants))
+    }
+
+    func resetsHelp(_ grants: [ResetGrant]) -> String {
+        let f = DateFormatter(); f.dateFormat = "MMM d, h:mm a"
+        return grants.sorted { ($0.expiresAt ?? .distantFuture) < ($1.expiresAt ?? .distantFuture) }.map { g in
+            let count = g.count > 1 ? " (x\(g.count))" : ""
+            let when = g.expiresAt.map { "expires \(f.string(from: $0))" } ?? "no expiry"
+            return "\(g.title)\(count): \(when)"
+        }.joined(separator: "\n")
     }
 
     func formatResetTime(_ date: Date, includeDate: Bool = false) -> String {
