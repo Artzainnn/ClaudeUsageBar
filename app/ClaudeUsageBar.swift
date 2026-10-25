@@ -1985,7 +1985,7 @@ struct UsageView: View {
                 }
             }
 
-            // Session credits: only when the account has the allowance.
+            // Claude session credits: only when the account has the allowance.
             if usageManager.sessionCreditsLimit > 0 {
                 let used = usageManager.sessionCreditsUsed
                 let limit = usageManager.sessionCreditsLimit
@@ -1995,7 +1995,7 @@ struct UsageView: View {
                 }
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
-                        Text("Session credits")
+                        Text("Claude session credits")
                             .font(.subheadline)
                         Spacer()
                         if let resetTime = usageManager.sessionCreditsResetsAt {
