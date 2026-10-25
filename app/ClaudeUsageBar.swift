@@ -14,6 +14,37 @@ extension Color {
     })
 }
 
+/// Compact choice control with the accent-blue selection of the app's prominent
+/// buttons. Native segmented pickers only tint while their window is key, which
+/// the popover never is, so they read as flat gray.
+struct ChoicePills: View {
+    @Binding var selection: String
+    let options: [(label: String, tag: String)]
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(options, id: \.tag) { option in
+                let selected = selection == option.tag
+                Button(action: { selection = option.tag }) {
+                    Text(option.label)
+                        .font(.caption)
+                        .fontWeight(selected ? .semibold : .regular)
+                        .foregroundColor(selected ? .white : Color.secondaryText)
+                        .frame(minWidth: 64)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(RoundedRectangle(cornerRadius: 5).fill(selected ? Color.accentColor : Color.clear))
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(2)
+        .background(RoundedRectangle(cornerRadius: 7).fill(Color.secondary.opacity(0.15)))
+        .fixedSize()
+    }
+}
+
 /// A banked limit reset the user can trigger (Claude grant or Codex reset credit).
 struct ResetGrant: Equatable {
     let title: String
@@ -2406,12 +2437,8 @@ struct UsageView: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Reset times")
                             .font(.caption)
-                        Picker("Reset times", selection: $resetTimeStyle) {
-                            Text("Time left").tag("countdown")
-                            Text("Date").tag("date")
-                        }
-                        .pickerStyle(.segmented)
-                        .labelsHidden()
+                        ChoicePills(selection: $resetTimeStyle,
+                                    options: [("Time left", "countdown"), ("Date", "date")])
                         Text("Show reset times as time left or as a date")
                             .font(.caption2)
                             .foregroundColor(Color.secondaryText)
