@@ -2082,23 +2082,16 @@ struct UsageView: View {
             }
 
             // Discreet info line: available limit resets when there are any (as in
-            // CodexUsageBar), else a reassurance naming whichever of Fable / extra
-            // usage is not being consumed (nothing shown when both are active).
+            // CodexUsageBar), else "No extra usage" when none is being consumed.
+            // Idle Fable shows nothing at all (its bar just stays hidden).
             if usageManager.hasFetchedData && usageManager.limitResetsLeft > 0 {
                 resetRow(usageManager.limitResetGrants)
-            } else if usageManager.hasFetchedData {
-                let fableActive = usageManager.hasWeeklyFable && usageManager.weeklyFableUsage >= 1
-                let extraActive = usageManager.hasCreditUsage || usageManager.freeCreditsMinor > 0
-                if !fableActive || !extraActive {
-                    Text(
-                        !fableActive && !extraActive ? "No Fable or extra usage"
-                        : !extraActive ? "No extra usage"
-                        : "No Fable usage"
-                    )
+            } else if usageManager.hasFetchedData
+                        && !(usageManager.hasCreditUsage || usageManager.freeCreditsMinor > 0) {
+                Text("No extra usage")
                     .font(.caption2)
                     .foregroundColor(Color.secondaryText)
                     .opacity(0.6)
-                }
             }
             }
 
