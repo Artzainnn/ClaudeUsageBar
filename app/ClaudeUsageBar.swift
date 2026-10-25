@@ -2531,13 +2531,8 @@ struct UsageView: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Appearance")
                             .font(.caption)
-                        Picker("Appearance", selection: $appearanceMode) {
-                            Text("System").tag("system")
-                            Text("Dark").tag("dark")
-                            Text("Light").tag("light")
-                        }
-                        .pickerStyle(.segmented)
-                        .labelsHidden()
+                        ChoicePills(selection: $appearanceMode,
+                                    options: [("System", "system"), ("Dark", "dark"), ("Light", "light")])
                         .onChange(of: appearanceMode) { _ in
                             (NSApplication.shared.delegate as? AppDelegate)?.applyAppearancePreference()
                         }
