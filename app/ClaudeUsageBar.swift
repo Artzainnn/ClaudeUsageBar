@@ -446,6 +446,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         button.title = " \(percentage)%"
     }
 
+    // Points ahead of the weekly pace line at which the Pace style turns red and
+    // shows the number. 15 is about one day of the weekly budget (100 / 7 ≈ 14.3).
+    static let strongAheadOfPace = 15
+
+    // "Pace" menu bar style: green with no number while every weekly limit is on
+    // or behind schedule, yellow once one runs ahead, red with "+N%" once it is
+    // ahead by strongAheadOfPace points or more. Quiet until it's worth a look.
+    func updateStatusIcon(aheadOfPace: Int?) {
+        guard let button = statusItem.button else { return }
+
+        let ahead = aheadOfPace ?? 0
+        let color: NSColor
+        if ahead >= Self.strongAheadOfPace {
+            color = NSColor(red: 1.0, green: 0.23, blue: 0.19, alpha: 1.0) // Red
+        } else if ahead > 0 {
+            color = NSColor(red: 1.0, green: 0.8, blue: 0.0, alpha: 1.0) // Yellow
+        } else {
+            color = NSColor(red: 0.13, green: 0.77, blue: 0.37, alpha: 1.0) // Green
+        }
+
+        button.image = createSparkIcon(color: color)
+        button.title = ahead >= Self.strongAheadOfPace ? " +\(ahead)%" : ""
+    }
+
     func createSparkIcon(color: NSColor) -> NSImage {
         let size = NSSize(width: 16, height: 16)
         let image = NSImage(size: size)
@@ -1067,11 +1091,30 @@ class UsageManager: ObservableObject {
         }
     }
 
+    // Worst gap, in percentage points, between usage and the pace line across
+    // the weekly limits (all models, plus Sonnet / Fable when the account has
+    // them). Positive means ahead of schedule. nil when no window has a pace yet.
+    func weeklyAheadOfPace(now: Date = Date()) -> Int? {
+        var windows: [(usage: Int, resetsAt: Date?)] = [(weeklyUsage, weeklyResetsAt)]
+        if hasWeeklySonnet { windows.append((weeklySonnetUsage, weeklySonnetResetsAt)) }
+        if hasWeeklyFable { windows.append((weeklyFableUsage, weeklyFableResetsAt)) }
+
+        let gaps = windows.compactMap { w -> Int? in
+            guard let pace = Pace(resetsAt: w.resetsAt, window: PaceWindow.weekly, now: now) else { return nil }
+            return Int((Double(w.usage) - pace.expected * 100).rounded())
+        }
+        return gaps.max()
+    }
+
     func updateStatusBar() {
         let sessionPercent = Int((Double(sessionUsage) / Double(sessionLimit)) * 100)
 
         // Update the icon color
-        delegate?.updateStatusIcon(percentage: sessionPercent)
+        if UserDefaults.standard.string(forKey: "menu_bar_style") == "pace" {
+            delegate?.updateStatusIcon(aheadOfPace: weeklyAheadOfPace())
+        } else {
+            delegate?.updateStatusIcon(percentage: sessionPercent)
+        }
 
         // Check for notification thresholds
         checkNotificationThresholds(percentage: sessionPercent)
@@ -1773,6 +1816,7 @@ struct UsageView: View {
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage("appearance_mode") private var appearanceMode: String = "system"
     @AppStorage("reset_time_style") private var resetTimeStyle: String = "countdown"
+    @AppStorage("menu_bar_style") private var menuBarStyle: String = "percent"
     @State private var now = Date()
     private let minuteTicker = Timer.publish(every: 60, on: .main, in: .common).autoconnect()
 
@@ -2523,6 +2567,22 @@ struct UsageView: View {
                         }
                     }
                     .toggleStyle(.checkbox)
+
+                    Divider()
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Menu bar")
+                            .font(.caption)
+                        ChoicePills(selection: $menuBarStyle,
+                                    options: [("Percent", "percent"), ("Pace", "pace")])
+                        .onChange(of: menuBarStyle) { _ in
+                            usageManager.updateStatusBar()
+                        }
+                        Text("Session % or weekly pace: green on pace, yellow ahead, red with +N% when 15+ points ahead")
+                            .font(.caption2)
+                            .foregroundColor(Color.secondaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
 
                     Divider()
 
