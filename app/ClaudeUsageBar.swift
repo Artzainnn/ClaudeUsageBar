@@ -569,6 +569,7 @@ class UsageManager: ObservableObject {
     @Published var hasWeeklySonnet: Bool = false
     @Published var hasWeeklyFable: Bool = false
     @Published var hasFetchedData: Bool = false
+    @Published var hasSession: Bool = false
     @Published var isAccessibilityEnabled: Bool = false
     @Published var shortcutEnabled: Bool = true
     @Published var paceMarkerEnabled: Bool = false
@@ -975,7 +976,14 @@ class UsageManager: ObservableObject {
             let iso8601Formatter = ISO8601DateFormatter()
             iso8601Formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
 
-            // Parse the actual claude.ai response format
+            // Parse the actual claude.ai response format.
+            // five_hour comes back null on plans without a 5-hour limit: the
+            // session row is hidden then instead of sitting at 0%.
+            hasSession = json["five_hour"] is [String: Any]
+            if !hasSession {
+                sessionUsage = 0
+                sessionResetsAt = nil
+            }
             if let fiveHour = json["five_hour"] as? [String: Any] {
                 if let sessionUtil = fiveHour["utilization"] as? Double {
                     sessionUsage = Int(sessionUtil)
@@ -1968,6 +1976,7 @@ struct UsageView: View {
 
             // Session Usage
             if usageManager.hasFetchedData {
+            if usageManager.hasSession {
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
                     Text("Session (5 hour)")
@@ -1987,6 +1996,7 @@ struct UsageView: View {
                 Text("\(Int(usageManager.sessionPercentage * 100))% used")
                     .font(.caption)
                     .foregroundColor(Color.secondaryText)
+            }
             }
 
             // Weekly Usage
