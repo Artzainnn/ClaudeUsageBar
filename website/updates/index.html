@@ -225,7 +225,32 @@
   <h1>ClaudeUsageBar updates</h1>
   <p class="sub">Every release, with the message shown in the app and what changed. The app tells you when a new version is out, and the latest version is always one click away.</p>
   <div class="updates">
-    <details class="update" id="v1.3.5" open>
+    <details class="update" id="v1.3.6" open>
+      <summary>
+        <span class="update-version">v1.3.6</span>
+        <span class="update-title">5-hour session hidden when you don&#x27;t have one</span>
+        <span class="update-date">Nov 10, 2026</span>
+        <svg class="update-chevron" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3l5 5-5 5"/></svg>
+      </summary>
+      <div class="update-body">
+      <div class="update-message">
+        <div class="update-label">In-app update message</div>
+        <div class="update-message-title">5-hour session hidden when you don&#x27;t have one</div>
+        <div class="update-message-body">If your plan has no 5-hour limit, or you haven&#x27;t used it yet, the app now hides it. Without one, the menu bar and alerts follow your weekly limit.</div>
+      </div>
+      <div class="update-changes">
+        <div class="update-label">What changed</div>
+        <ul>
+          <li>The 5-hour session is hidden when it&#x27;s at 0%, and on plans that no longer have a 5-hour limit (like Max 20x).</li>
+          <li>Checked again on every refresh: if your plan gets a 5-hour limit back, the session reappears on its own.</li>
+          <li>Without a 5-hour limit, the menu bar percentage and usage alerts follow your weekly limit instead of staying at 0%.</li>
+          <li>The pace marker tooltip now says whether you're over or under pace, with your usage next to the expected one (it always said "On pace" before).</li>
+        </ul>
+      </div>
+      <a class="update-link" href="https://github.com/Artzainnn/ClaudeUsageBar/releases/tag/v1.3.6" target="_blank" rel="noopener">Release on GitHub →</a>
+      </div>
+    </details>
+    <details class="update" id="v1.3.5">
       <summary>
         <span class="update-version">v1.3.5</span>
         <span class="update-title">New time format: &quot;Resets in 5d 23h&quot; + pacing</span>

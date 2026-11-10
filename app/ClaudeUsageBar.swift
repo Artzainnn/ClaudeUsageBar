@@ -135,7 +135,7 @@ struct UsageBar: View {
 //
 // Solid backing rather than a material: over the popover's own translucent
 // backing a material reads as muddy. Sized to its text, which is safe because
-// the string is bounded — at its longest, "On pace: 100% by now · 6d 23h in"
+// the string is bounded — at its longest, "Under pace: 100% used, 100% expected by now"
 // still sits comfortably inside the bar.
 struct PaceTooltip: View {
     let text: String
@@ -509,6 +509,8 @@ struct Main {
 
 class UsageManager: ObservableObject {
     @Published var sessionUsage: Int = 0
+    // False when the plan has no 5-hour limit (`five_hour: null`, e.g. Max 20x).
+    @Published var hasSession: Bool = false
     @Published var sessionLimit: Int = 100
     @Published var weeklyUsage: Int = 0
     @Published var weeklyLimit: Int = 100
@@ -953,6 +955,7 @@ class UsageManager: ObservableObject {
 
             // Parse the actual claude.ai response format
             if let fiveHour = json["five_hour"] as? [String: Any] {
+                hasSession = true
                 if let sessionUtil = fiveHour["utilization"] as? Double {
                     sessionUsage = Int(sessionUtil)
                     sessionLimit = 100
@@ -966,6 +969,12 @@ class UsageManager: ObservableObject {
                         NSLog("❌ Failed to parse session reset time")
                     }
                 }
+            } else {
+                // No 5-hour limit on this plan. Re-checked on every fetch, so the
+                // session comes back on its own if the plan gets one again.
+                hasSession = false
+                sessionUsage = 0
+                sessionResetsAt = nil
             }
 
             if let credits = json["iguana_necktie"] as? [String: Any],
@@ -1068,13 +1077,16 @@ class UsageManager: ObservableObject {
     }
 
     func updateStatusBar() {
-        let sessionPercent = Int((Double(sessionUsage) / Double(sessionLimit)) * 100)
+        // Plans without a 5-hour limit follow the weekly limit instead.
+        let percent = hasSession
+            ? Int((Double(sessionUsage) / Double(sessionLimit)) * 100)
+            : Int((Double(weeklyUsage) / Double(weeklyLimit)) * 100)
 
         // Update the icon color
-        delegate?.updateStatusIcon(percentage: sessionPercent)
+        delegate?.updateStatusIcon(percentage: percent)
 
         // Check for notification thresholds
-        checkNotificationThresholds(percentage: sessionPercent)
+        checkNotificationThresholds(percentage: percent)
     }
 
     func checkNotificationThresholds(percentage: Int) {
@@ -1111,7 +1123,7 @@ class UsageManager: ObservableObject {
     func sendNotification(percentage: Int, threshold: Int) {
         let notification = NSUserNotification()
         notification.title = "Claude Usage Alert"
-        notification.informativeText = "You've reached \(percentage)% of your 5-hour session limit"
+        notification.informativeText = "You've reached \(percentage)% of your \(hasSession ? "5-hour session" : "weekly") limit"
         notification.soundName = NSUserNotificationDefaultSoundName
 
         NSUserNotificationCenter.default.deliver(notification)
@@ -1922,8 +1934,9 @@ struct UsageView: View {
                     .padding(.vertical, 8)
             }
 
-            // Session Usage
+            // Session Usage: hidden at 0% and on plans without a 5-hour limit
             if usageManager.hasFetchedData {
+            if usageManager.hasSession && usageManager.sessionUsage >= 1 {
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
                     Text("Session (5 hour)")
@@ -1938,11 +1951,12 @@ struct UsageView: View {
 
                 UsageBar(value: usageManager.sessionPercentage,
                          color: colorForPercentage(usageManager.sessionPercentage),
-                         pace: paceMarker(resetsAt: usageManager.sessionResetsAt, window: PaceWindow.session))
+                         pace: paceMarker(used: usageManager.sessionPercentage, resetsAt: usageManager.sessionResetsAt, window: PaceWindow.session))
 
                 Text("\(Int(usageManager.sessionPercentage * 100))% used")
                     .font(.caption)
                     .foregroundColor(Color.secondaryText)
+            }
             }
 
             // Weekly Usage
@@ -1960,7 +1974,7 @@ struct UsageView: View {
 
                 UsageBar(value: usageManager.weeklyPercentage,
                          color: colorForPercentage(usageManager.weeklyPercentage),
-                         pace: paceMarker(resetsAt: usageManager.weeklyResetsAt, window: PaceWindow.weekly))
+                         pace: paceMarker(used: usageManager.weeklyPercentage, resetsAt: usageManager.weeklyResetsAt, window: PaceWindow.weekly))
 
                 Text("\(Int(usageManager.weeklyPercentage * 100))% used")
                     .font(.caption)
@@ -1983,7 +1997,7 @@ struct UsageView: View {
 
                     UsageBar(value: usageManager.weeklySonnetPercentage,
                              color: colorForPercentage(usageManager.weeklySonnetPercentage),
-                             pace: paceMarker(resetsAt: usageManager.weeklySonnetResetsAt, window: PaceWindow.weekly))
+                             pace: paceMarker(used: usageManager.weeklySonnetPercentage, resetsAt: usageManager.weeklySonnetResetsAt, window: PaceWindow.weekly))
 
                     Text("\(Int(usageManager.weeklySonnetPercentage * 100))% used")
                         .font(.caption)
@@ -2008,7 +2022,7 @@ struct UsageView: View {
 
                     UsageBar(value: usageManager.weeklyFablePercentage,
                              color: colorForPercentage(usageManager.weeklyFablePercentage),
-                             pace: paceMarker(resetsAt: usageManager.weeklyFableResetsAt, window: PaceWindow.weekly))
+                             pace: paceMarker(used: usageManager.weeklyFablePercentage, resetsAt: usageManager.weeklyFableResetsAt, window: PaceWindow.weekly))
 
                     Text("\(Int(usageManager.weeklyFablePercentage * 100))% used")
                         .font(.caption)
@@ -2399,7 +2413,7 @@ struct UsageView: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("Enable Usage Notifications")
                                     .font(.caption)
-                                Text("Get alerts at 25%, 50%, 75%,\nand 90% session usage")
+                                Text("Get alerts at 25%, 50%, 75%,\nand 90% of your usage limit")
                                     .font(.caption2)
                                     .foregroundColor(Color.secondaryText)
                                     .fixedSize(horizontal: false, vertical: true)
@@ -2640,25 +2654,20 @@ struct UsageView: View {
     //
     // The row label already names the window ("Weekly (7 day)"), so the tooltip
     // doesn't repeat it — a longer string overflows the 360pt popup.
-    func paceMarker(resetsAt: Date?, window: TimeInterval) -> PaceMarker? {
+    func paceMarker(used: Double, resetsAt: Date?, window: TimeInterval) -> PaceMarker? {
         guard usageManager.paceMarkerEnabled,
               let pace = Pace(resetsAt: resetsAt, window: window) else { return nil }
-        let percent = Int((pace.expected * 100).rounded())
+        let usedPct = Int((used * 100).rounded())
+        let expectedPct = Int((pace.expected * 100).rounded())
+        // Within 2 points counts as on pace; otherwise say which side of it you are.
+        let status = abs(usedPct - expectedPct) <= 2 ? "On pace"
+            : usedPct > expectedPct ? "Over pace" : "Under pace"
         return PaceMarker(
             expected: pace.expected,
-            tooltip: "On pace: \(percent)% by now · \(formatElapsed(pace.elapsed)) in"
+            tooltip: "\(status): \(usedPct)% used, \(expectedPct)% expected by now"
         )
     }
 
-    func formatElapsed(_ interval: TimeInterval) -> String {
-        let totalMinutes = max(0, Int(interval / 60))
-        let days = totalMinutes / 1440
-        let hours = (totalMinutes % 1440) / 60
-        let minutes = totalMinutes % 60
-        if days > 0 { return "\(days)d \(hours)h" }
-        if hours > 0 { return "\(hours)h \(minutes)m" }
-        return "\(minutes)m"
-    }
 
     func colorForPercentage(_ percentage: Double) -> Color {
         if percentage < 0.7 {
