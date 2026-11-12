@@ -507,6 +507,201 @@ struct Main {
     }
 }
 
+// MARK: - ClaudeWeb
+// Fetches claude.ai API data from inside a real WebKit session. claude.ai sits behind
+// Cloudflare, which rejects plain URLSession requests (403 "Just a moment...") even with a
+// valid cookie. A WKWebView passes the browser check itself, and the sign-in persists in
+// WebKit's own cookie store, so no cookie needs to be copied by hand.
+final class WebTask {
+    private let body: () -> Void
+    init(_ body: @escaping () -> Void) { self.body = body }
+    func resume() { body() }
+}
+
+final class ClaudeWeb: NSObject, WKNavigationDelegate, WKUIDelegate, NSWindowDelegate {
+    static let shared = ClaudeWeb()
+
+    var onSignedIn: (() -> Void)?
+
+    private let webView: WKWebView
+    private let window: NSWindow
+    private var loadWaiters: [() -> Void] = []
+    private var windowChecking = false
+    private var pollTimer: Timer?
+
+    private override init() {
+        let config = WKWebViewConfiguration()
+        config.websiteDataStore = .default()
+        config.applicationNameForUserAgent = "Version/18.0 Safari/605.1.15"
+        webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 520, height: 720), configuration: config)
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 720),
+                          styleMask: [.titled, .closable, .resizable],
+                          backing: .buffered, defer: false)
+        super.init()
+        webView.navigationDelegate = self
+        webView.uiDelegate = self
+        window.title = "Sign in to Claude"
+        window.contentView = webView
+        window.isReleasedWhenClosed = false
+        window.delegate = self
+        window.center()
+    }
+
+    // MARK: Public
+
+    func showLogin() {
+        if webView.url == nil || webView.url?.host != "claude.ai" {
+            webView.load(URLRequest(url: URL(string: "https://claude.ai/login")!))
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        pollTimer?.invalidate()
+        // claude.ai navigates without full page loads, so poll for the signed-in state.
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            if self.window.isVisible { self.checkSignedIn() } else { self.pollTimer?.invalidate(); self.pollTimer = nil }
+        }
+    }
+
+    /// Drop-in replacement for `URLSession.shared.dataTask(with:)` on claude.ai API URLs.
+    func task(_ request: URLRequest, _ completion: @escaping (Data?, URLResponse?, Error?) -> Void) -> WebTask {
+        WebTask { [weak self] in
+            guard let self = self, let url = request.url else { return }
+            var path = url.path
+            if let q = url.query { path += "?" + q }
+            self.get(path) { status, data in
+                let resp = HTTPURLResponse(url: url, statusCode: status, httpVersion: nil, headerFields: nil)
+                completion(data, resp, nil)
+            }
+        }
+    }
+
+    // MARK: Fetching
+
+    private func get(_ path: String, retry: Bool = true, _ done: @escaping (Int, Data?) -> Void) {
+        ensureHome { [weak self] in
+            guard let self = self else { return }
+            let js = """
+            const ac = new AbortController();
+            const to = setTimeout(() => ac.abort(), 15000);
+            try {
+              const r = await fetch(path, {credentials: 'include', headers: {'Accept': 'application/json'}, signal: ac.signal});
+              const t = await r.text();
+              clearTimeout(to);
+              return [r.status, t];
+            } catch (e) { return [0, 'JSERR ' + e]; }
+            """
+            self.webView.callAsyncJavaScript(js, arguments: ["path": path], in: nil, in: .page) { result in
+                DispatchQueue.main.async {
+                    switch result {
+                    case .success(let value):
+                        guard let arr = value as? [Any], arr.count == 2,
+                              let status = arr[0] as? Int, let text = arr[1] as? String else {
+                            done(0, nil); return
+                        }
+                        if status == 403 && retry && text.contains("Just a moment") {
+                            // Challenge page: reload the home page and try once more.
+                            self.webView.load(URLRequest(url: URL(string: "https://claude.ai/settings/usage")!))
+                            self.waitForHome { self.get(path, retry: false, done) }
+                            return
+                        }
+                        if status == 401 || status == 403 {
+                            self.showLogin()
+                        }
+                        done(status, text.data(using: .utf8))
+                    case .failure(let err):
+                        NSLog("❌ ClaudeWeb JS error: \(err.localizedDescription)")
+                        done(0, nil)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Make sure the web view is sitting on a claude.ai page (so fetches are same-origin).
+    private func ensureHome(_ ready: @escaping () -> Void) {
+        if webView.url?.host == "claude.ai" && !webView.isLoading {
+            ready(); return
+        }
+        if !webView.isLoading || webView.url?.host != "claude.ai" {
+            webView.load(URLRequest(url: URL(string: "https://claude.ai/settings/usage")!))
+        }
+        waitForHome(ready)
+    }
+
+    private func waitForHome(_ ready: @escaping () -> Void) {
+        loadWaiters.append(ready)
+    }
+
+    // MARK: WKNavigationDelegate
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard webView.url?.host == "claude.ai" else { return }
+        // The Cloudflare check finishes on its own and redirects; wait for the real page.
+        webView.evaluateJavaScript("document.title") { [weak self] title, _ in
+            guard let self = self else { return }
+            if let t = title as? String, t.contains("Just a moment") {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    // Re-check; didFinish fires again after the redirect.
+                    if self.webView.url?.host == "claude.ai" { self.webView(self.webView, didFinish: nil) }
+                }
+                return
+            }
+            let waiters = self.loadWaiters
+            self.loadWaiters.removeAll()
+            waiters.forEach { $0() }
+            if self.window.isVisible { self.checkSignedIn() }
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        flushWaiters()
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        flushWaiters()
+    }
+
+    private func flushWaiters() {
+        let waiters = loadWaiters
+        loadWaiters.removeAll()
+        waiters.forEach { $0() }
+    }
+
+    // Keep OAuth popups (e.g. "Continue with Google") inside the same web view.
+    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
+                 for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        if navigationAction.targetFrame == nil { webView.load(navigationAction.request) }
+        return nil
+    }
+
+    // MARK: Sign-in detection
+
+    private func checkSignedIn() {
+        guard !windowChecking else { return }
+        windowChecking = true
+        let js = """
+        try {
+          const r = await fetch('/api/bootstrap', {credentials: 'include'});
+          if (!r.ok) return false;
+          const j = await r.json();
+          return !!(j && j.account);
+        } catch (e) { return false; }
+        """
+        webView.callAsyncJavaScript(js, arguments: [:], in: nil, in: .page) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.windowChecking = false
+                if case .success(let v) = result, (v as? Bool) == true {
+                    self.pollTimer?.invalidate(); self.pollTimer = nil
+                    self.window.orderOut(nil)
+                    self.onSignedIn?()
+                }
+            }
+        }
+    }
+}
+
 class UsageManager: ObservableObject {
     @Published var sessionUsage: Int = 0
     // False when the plan has no 5-hour limit (`five_hour: null`, e.g. Max 20x).
@@ -560,6 +755,7 @@ class UsageManager: ObservableObject {
         self.statusItem = statusItem
         self.delegate = delegate
         loadSessionCookie()
+        ClaudeWeb.shared.onSignedIn = { [weak self] in self?.fetchUsage() }
         loadSettings()
         checkAccessibilityStatus()
     }
@@ -715,7 +911,7 @@ class UsageManager: ObservableObject {
 
         NSLog("📡 Fetching bootstrap to get org ID...")
 
-        URLSession.shared.dataTask(with: request) { data, response, error in
+        ClaudeWeb.shared.task(request) { data, response, error in
             guard let data = data,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let account = json["account"] as? [String: Any],
@@ -730,14 +926,6 @@ class UsageManager: ObservableObject {
     }
 
     func fetchUsage() {
-        guard !sessionCookie.isEmpty else {
-            DispatchQueue.main.async {
-                self.errorMessage = "Session cookie not set"
-                self.updateStatusBar()
-            }
-            return
-        }
-
         isLoading = true
         errorMessage = nil
 
@@ -772,7 +960,7 @@ class UsageManager: ObservableObject {
         request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
         request.setValue("claude.ai", forHTTPHeaderField: "authority")
 
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
+        ClaudeWeb.shared.task(request) { [weak self] data, response, _ in
             DispatchQueue.main.async {
                 guard let self = self,
                       let http = response as? HTTPURLResponse, http.statusCode == 200,
@@ -822,7 +1010,7 @@ class UsageManager: ObservableObject {
         request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
         request.setValue("claude.ai", forHTTPHeaderField: "authority")
 
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
+        ClaudeWeb.shared.task(request) { [weak self] data, response, _ in
             DispatchQueue.main.async {
                 guard let self = self,
                       let http = response as? HTTPURLResponse, http.statusCode == 200,
@@ -859,7 +1047,7 @@ class UsageManager: ObservableObject {
         request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
         request.setValue("claude.ai", forHTTPHeaderField: "authority")
 
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
+        ClaudeWeb.shared.task(request) { [weak self] data, response, _ in
             DispatchQueue.main.async {
                 guard let self = self,
                       let http = response as? HTTPURLResponse, http.statusCode == 200,
@@ -907,7 +1095,7 @@ class UsageManager: ObservableObject {
 
         NSLog("🔍 Fetching from: \(urlString)")
 
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+        ClaudeWeb.shared.task(request) { [weak self] data, response, error in
             DispatchQueue.main.async {
                 self?.isLoading = false
 
@@ -2287,6 +2475,12 @@ struct UsageView: View {
                 .font(.caption)
             }
             }
+
+            Button("Sign in to Claude…") {
+                ClaudeWeb.shared.showLogin()
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
 
             Button(showingCookieInput ? "Hide Cookie" : "Set Session Cookie") {
                 showingCookieInput.toggle()
