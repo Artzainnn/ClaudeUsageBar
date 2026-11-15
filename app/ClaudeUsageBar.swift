@@ -161,7 +161,7 @@ struct PaceTooltip: View {
 }
 
 // Main entry point
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     var statusItem: NSStatusItem!
     var popover: NSPopover!
     var usageManager: UsageManager!
@@ -169,6 +169,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var updateManager: UpdateManager!
     var eventMonitor: Any?
     var hotKeyRef: EventHotKeyRef?
+    private weak var observedPopoverWindow: NSWindow?
+    private var popoverResizeObserver: NSObjectProtocol?
+    private var isAdjustingPopoverFrame = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // NSUserNotification (deprecated but works without permissions for unsigned apps)
@@ -199,6 +202,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Initial guess; SwiftUI's intrinsic size (capped at 600) will drive the actual size.
         popover.contentSize = NSSize(width: 360, height: 320)
         popover.behavior = .transient
+        popover.delegate = self
         popover.contentViewController = NSHostingController(rootView: UsageView(
             usageManager: usageManager,
             statusManager: statusManager,
@@ -374,6 +378,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         unregisterGlobalHotKey()
+        if let observer = popoverResizeObserver {
+            NotificationCenter.default.removeObserver(observer)
+            popoverResizeObserver = nil
+        }
     }
 
     @objc func quitApp() {
@@ -423,6 +431,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            attachPopoverWindowObserverIfNeeded()
+            clampPopoverBelowMenuBar()
 
             // Add event monitor to detect clicks outside the popover
             eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
@@ -441,6 +451,55 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             NSEvent.removeMonitor(monitor)
             eventMonitor = nil
         }
+    }
+
+    func popoverWillShow(_ notification: Notification) {
+        attachPopoverWindowObserverIfNeeded()
+        clampPopoverBelowMenuBar()
+    }
+
+    func popoverDidShow(_ notification: Notification) {
+        attachPopoverWindowObserverIfNeeded()
+        clampPopoverBelowMenuBar()
+    }
+
+    private func attachPopoverWindowObserverIfNeeded() {
+        guard let popoverWindow = popover.contentViewController?.view.window else { return }
+        guard popoverWindow !== observedPopoverWindow else { return }
+        if let existing = popoverResizeObserver {
+            NotificationCenter.default.removeObserver(existing)
+            popoverResizeObserver = nil
+        }
+        observedPopoverWindow = popoverWindow
+        popoverResizeObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didResizeNotification,
+            object: popoverWindow,
+            queue: .main
+        ) { [weak self] _ in
+            self?.clampPopoverBelowMenuBar()
+        }
+    }
+
+    private func clampPopoverBelowMenuBar() {
+        guard !isAdjustingPopoverFrame,
+              let contentViewController = popover.contentViewController,
+              let popoverWindow = contentViewController.view.window,
+              let screen = statusItem.button?.window?.screen ?? popoverWindow.screen ?? NSScreen.main else {
+            return
+        }
+
+        let viewInWindow = contentViewController.view.convert(contentViewController.view.bounds, to: nil)
+        let viewInScreen = popoverWindow.convertToScreen(viewInWindow)
+        let maxAllowedTop = screen.visibleFrame.maxY - 6.0
+        let overflow = viewInScreen.maxY - maxAllowedTop
+        guard overflow > 0.5 else { return }
+
+        isAdjustingPopoverFrame = true
+        defer { isAdjustingPopoverFrame = false }
+        popoverWindow.setFrameOrigin(NSPoint(
+            x: popoverWindow.frame.origin.x,
+            y: popoverWindow.frame.origin.y - overflow
+        ))
     }
 
     func updateStatusIcon(percentage: Int?) {
