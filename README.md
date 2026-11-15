@@ -13,23 +13,27 @@ A lightweight, open-source macOS menu bar application that displays your Claude.
 
 **[Download Latest Release](https://github.com/Artzainnn/claudeusagebar/releases)** (DMG Installer)
 
-## 📦 Set Up (1mn)
+## 📦 Set Up
 
-1. Go to [claude.ai/settings/usage](https://claude.ai/settings/usage)
-2. Open Developer Tools (`Cmd+Option+I`) → **Network** tab
-3. Refresh the page, click the **"usage"** request
-4. Copy the full **"Cookie"** value from the Request Headers
+ClaudeUsageBar supports three ways to connect, configurable under **Account & Connection**:
+
+1. **Automatic Claude Code detection** — If you are signed in to Claude Code, ClaudeUsageBar detects its macOS Keychain credentials automatically.
+2. **Built-in Web Sign-In** — Click **"Sign in with Claude.ai"** to authenticate in an embedded `WKWebView` window.
+3. **Manual Cookie (Advanced)** — Under **Advanced: Paste Cookie Manually**, paste a `Cookie` header from [claude.ai/settings/usage](https://claude.ai/settings/usage) (`Cmd+Option+I` → **Network** → `usage` request).
+
+All web session cookies are stored securely in the macOS Keychain.
 
 ![Setup Guide](setup-guide.png)
 
 ## ✨ Features
 
 - 🟢 **Real-time usage tracking** - Monitor session (5-hour) and weekly (7-day) limits
+- 🔑 **Flexible authentication** - Automatic Claude Code Keychain detection or built-in `"Sign in with Claude.ai"` (`WKWebView`)
 - 🎨 **Color-coded menu bar icon** - Visual spark icon that changes color (green/yellow/red)
 - 🔔 **Smart notifications** - Alerts at 25%, 50%, 75%, 90% usage thresholds
 - ⌨️ **Keyboard shortcut** - Toggle popup with Cmd+U from anywhere
-- ⚡ **Auto-refresh** - Updates every 5 minutes automatically
-- 🔒 **Privacy-first** - All data stored locally on your Mac
+- ⚡ **Auto-refresh** - Updates every 5 minutes automatically and on Mac wake
+- 🔒 **Privacy-first** - Credentials and cookies stored securely in the macOS Keychain on your Mac
 - 📊 **Pro plan support** - Shows weekly Sonnet usage for Pro subscribers
 - 🎯 **Menu bar only** - No Dock icon, stays out of your way
 
@@ -40,7 +44,7 @@ A lightweight, open-source macOS menu bar application that displays your Claude.
 1. **Download** `ClaudeUsageBar-Installer.dmg` from [Releases](https://github.com/Artzainnn/ClaudeUsageBar/releases)
 2. **Open DMG** and drag ClaudeUsageBar to Applications folder
 3. **Launch** ClaudeUsageBar from Applications
-4. **Set cookie** from claude.ai (follow in-app instructions)
+4. **Connect** via automatic Claude Code detection, **"Sign in with Claude.ai"**, or the advanced manual cookie option
 5. **Done!** Usage appears in menu bar
 
 ## 📸 Screenshots
@@ -54,7 +58,7 @@ A lightweight, open-source macOS menu bar application that displays your Claude.
 - Session (5-hour) usage with progress bar
 - Weekly (7-day) usage with progress bar
 - Weekly Sonnet usage (Pro plan only)
-- Settings for notifications and shortcuts
+- Account & Connection controls and settings
 
 ## 📁 Repository Structure
 
@@ -88,7 +92,8 @@ The built app will be in `app/build/ClaudeUsageBar.app`
 ### Project Structure
 
 - `app/ClaudeUsageBar.swift` - Main application code
-- `app/build.sh` - Build script
+- `app/AuthSupport.swift` - Keychain storage, cookie normalization, ISO-8601 parsing, and web sign-in window
+- `app/build.sh` - Build script (supports optional `CODESIGN_IDENTITY` override)
 - `app/create_dmg.sh` - DMG installer creation
 - `website/index.html` - Landing page
 
@@ -96,6 +101,8 @@ The built app will be in `app/build/ClaudeUsageBar.app`
 
 - **SwiftUI** - Modern macOS UI framework
 - **AppKit** - Menu bar integration
+- **WebKit** - Embedded `"Sign in with Claude.ai"` authentication flow
+- **Security** - macOS Keychain storage for cookies and Claude Code credentials
 - **Carbon** - Global keyboard shortcuts
 - **NSUserNotification** - System notifications (no permissions needed)
 
