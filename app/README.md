@@ -7,31 +7,32 @@ A lightweight macOS menu bar app that displays your Claude.ai session and weekly
 ## ✨ Features
 
 - 🟢 **Real-time Usage Tracking**: Monitor session (5-hour) and weekly (7-day) usage
+- 🔑 **Automatic & Web Authentication**: Detects Claude Code credentials in the macOS Keychain or signs in via the built-in `"Sign in with Claude.ai"` (`WKWebView`) window
 - 🎨 **Color-Coded Menu Bar Icon**: Visual indication of usage levels (green/yellow/red)
 - 🔔 **Smart Notifications**: Alerts at 25%, 50%, 75%, and 90% usage thresholds
-- ⚡ **Auto-Refresh**: Updates every 5 minutes automatically
+- ⚡ **Auto-Refresh**: Updates every 5 minutes automatically and when your Mac wakes
 - ⌨️ **Keyboard Shortcut**: Toggle popup with Cmd+U from anywhere
-- 🔒 **Privacy First**: All data stored locally on your Mac
+- 🔒 **Privacy First**: Web cookies and credentials stay in your macOS Keychain
 - 📊 **Pro Plan Support**: Shows weekly Sonnet usage for Pro subscribers
 - 🎯 **Menu Bar Only**: No Dock icon, stays out of your way
 
 ## 🖼️ Screenshots
 
 **Menu Bar Display:**
-- Shows current session percentage with color-coded emoji
-- Example: `🟢 45%` (green < 70%, yellow 70-90%, red > 90%)
+- Shows current session percentage with color-coded icon
+- Example: `⚡ 45%` (green < 70%, yellow 70-90%, red > 90%)
 
 **Popup Interface:**
 - Session (5-hour) usage with progress bar and reset time
 - Weekly (7-day) usage with progress bar and reset date
 - Weekly Sonnet usage (Pro plan only)
-- Settings for notifications and keyboard shortcuts
+- Account & Connection panel and settings
 
 ## 📋 Requirements
 
 - macOS 12.0 (Monterey) or later
 - Apple Silicon (M1/M2/M3) or Intel Mac
-- Active Claude.ai account (Free or Pro)
+- Active Claude.ai or Claude Code account
 
 ## 🚀 Installation
 
@@ -62,27 +63,29 @@ The built app will be in `build/ClaudeUsageBar.app`.
 
 ## 🔧 First-Time Setup
 
-When you first launch ClaudeUsageBar, you'll see a welcome message. Follow these steps:
+When you launch ClaudeUsageBar, choose any of the following connection methods:
 
-### Getting Your Session Cookie
+### Option A: Automatic Claude Code Detection
+If you have signed in with Claude Code (`claude` CLI), ClaudeUsageBar detects its macOS Keychain credentials automatically. Click **"Use Claude Code Auth"** (or keep **Automatic** selected in **Account & Connection**).
 
-1. Go to **Settings > Usage** on claude.ai
-2. Press **F12** (or Cmd+Option+I on Mac)
-3. Go to **Network** tab in DevTools
-4. Refresh the page, click the "usage" request
-5. Find **'Cookie'** in Request Headers
-6. Copy the **full cookie value** (starts with `anthropic-device-id=...`)
+### Option B: Built-in Web Sign-In (Recommended for Claude.ai)
+1. Click **"Sign in with Claude.ai"** in the popup (or under **Account & Connection**).
+2. Sign in inside the `"Sign in to Claude"` window (`WKWebView`).
+3. Once authenticated, the window closes automatically and stores your session cookie securely in the macOS Keychain.
 
-### Adding Cookie to App
-
-1. Click **"Set Session Cookie"** in the app
-2. Paste your cookie (Cmd+V works!)
-3. Click **"Save Cookie & Fetch"**
-4. Your usage will appear immediately! 🎉
+### Option C: Manual Session Cookie (Advanced)
+1. Go to **Settings > Usage** on claude.ai and open DevTools (`Cmd+Option+I`) → **Network** tab.
+2. Refresh the page, click the `usage` request, and copy the **`Cookie`** value from Request Headers.
+3. Open **Account & Connection** → **Advanced: Paste Cookie Manually**, paste the cookie, and click **"Save Cookie & Fetch"**.
 
 ## ⚙️ Settings
 
-Access settings by clicking the gear icon in the popup:
+Access settings inside the popup:
+
+### Account & Connection
+- Switch source between **Automatic**, **Claude Code**, and **Claude.ai**
+- Sign in, switch accounts, or disconnect your Claude.ai web session
+- Expand **Advanced: Paste Cookie Manually** when needed
 
 ### Notifications
 - Enable/disable usage alerts
@@ -92,26 +95,24 @@ Access settings by clicking the gear icon in the popup:
 ### Keyboard Shortcut (Cmd+U)
 - Toggle popup from anywhere on your Mac
 - Requires Accessibility permission
-- Click "Enable Keyboard Shortcut" to grant permission
+- Click "Grant Accessibility Permission" in Settings
 
 ### Launch at Login
 - Start ClaudeUsageBar automatically when you log in
 
 ## 🔒 Privacy & Security
 
-- ✅ **All data stays on your Mac** - stored in UserDefaults only
-- ✅ **No analytics or tracking** - zero external services
-- ✅ **Session cookies stored locally** - never sent anywhere except claude.ai
-- ✅ **No hardcoded credentials** - org ID extracted dynamically from your cookie
-- ✅ **Open source** - review the code yourself
+- ✅ **Keychain storage** - Web session cookies are stored securely in the macOS Keychain (`com.claude.usagebar`), not in plain preferences
+- ✅ **No analytics or tracking** - Zero third-party services
+- ✅ **Local-only credentials** - Never sent anywhere except `claude.ai` or `api.anthropic.com`
+- ✅ **Open source** - Review `ClaudeUsageBar.swift` and `AuthSupport.swift` yourself
 
 ## 🎯 How It Works
 
-1. Uses your session cookie to authenticate with claude.ai API
-2. Fetches usage data from the same endpoints the website uses
-3. Extracts org ID dynamically from your cookie
-4. Displays real-time usage in your menu bar
-5. Sends notifications when you hit usage thresholds
+1. Resolves your preferred connection source (`Automatic`, `Claude Code`, or `Claude.ai Web`)
+2. Reads Claude Code OAuth credentials or your Keychain-stored web session cookie
+3. Fetches live usage data from `api.anthropic.com` or `claude.ai`
+4. Displays real-time usage in your menu bar and sends threshold alerts
 
 ## 🔨 Building & Distribution
 
@@ -119,6 +120,7 @@ Access settings by clicking the gear icon in the popup:
 ```bash
 ./build.sh
 ```
+You can override the signing certificate via `CODESIGN_IDENTITY="..." ./build.sh`.
 
 ### Create DMG Installer
 ```bash
@@ -134,14 +136,12 @@ rm -rf build
 ## 🐛 Troubleshooting
 
 ### "No data yet" showing
-- Make sure you've pasted your session cookie
-- Click "Save Cookie & Fetch"
-- Verify you copied the full cookie string
+- Sign in with **"Sign in with Claude.ai"** or click **"Use Claude Code Auth"**
+- If pasting a cookie manually, verify you copied the full cookie string
 
-### Cookie expired
-- Session cookies expire periodically
-- Get a new cookie from claude.ai
-- Click "Clear Cookie" then re-add it
+### Session expired
+- Click **"Sign in with Claude.ai"** to refresh your web session, or run `claude` in Terminal if using Claude Code
+- Use **Disconnect Claude.ai** under **Account & Connection** to clear stored web cookies
 
 ### Notifications not working
 - Click "Test Notification" in Settings
@@ -149,18 +149,18 @@ rm -rf build
 - Check macOS Focus mode isn't blocking them
 
 ### Cmd+U shortcut not working
-- Click "Enable Keyboard Shortcut" in Settings
-- Grant Accessibility permission in System Settings
+- Enable Keyboard Shortcut in Settings and grant Accessibility permission in System Settings
 - Restart the app after granting permission
 
 ### Usage not updating
-- App auto-refreshes every 5 minutes
-- Click the refresh button to update manually
-- If cookie expired, get a new one
+- App auto-refreshes every 5 minutes and on Mac wake
+- Click **Refresh** in the popup to update manually
 
 ## 📦 Distribution Files
 
-- **ClaudeUsageBar-Installer.dmg** - Drag-to-install DMG (1.6 MB)
+- **ClaudeUsageBar.swift** - Main application code
+- **AuthSupport.swift** - Keychain storage, cookie normalization, ISO-8601 parsing, and `WKWebView` sign-in controller
+- **ClaudeUsageBar-Installer.dmg** - Drag-to-install DMG
 - **README.md** - This file
 - **LICENSE** - MIT License
 
@@ -178,13 +178,15 @@ MIT License - see [LICENSE](LICENSE) file for details
 
 ## ⚠️ Disclaimer
 
-This app uses claude.ai's internal API endpoints which may change without notice. It is not affiliated with or endorsed by Anthropic. Use at your own risk.
+This app uses claude.ai and Claude Code endpoints which may change without notice. It is not affiliated with or endorsed by Anthropic. Use at your own risk.
 
 ## 🙏 Acknowledgments
 
 Built with:
 - SwiftUI for the interface
 - AppKit for menu bar integration
+- WebKit for embedded sign-in
+- Security for macOS Keychain storage
 - Carbon for global keyboard shortcuts
 - NSUserNotification for alerts
 

@@ -33,20 +33,25 @@ if [ -f "ClaudeUsageBar.icns" ]; then
     /usr/libexec/PlistBuddy -c "Set :CFBundleIconFile ClaudeUsageBar" "$APP_PATH/Contents/Info.plist"
 fi
 
+# Ensure inherited SDKROOT (e.g. CommandLineTools) does not override the active Xcode SDK.
+unset SDKROOT
+
 # Compile the Swift app for arm64
-swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_arm64" \
-    ClaudeUsageBar.swift \
+swiftc -parse-as-library -swift-version 5 -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_arm64" \
+    ClaudeUsageBar.swift AuthSupport.swift \
     -framework SwiftUI \
     -framework AppKit \
     -framework WebKit \
+    -framework Security \
     -target arm64-apple-macos12.0
 
 # Compile for x86_64 (Intel)
-swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_x86_64" \
-    ClaudeUsageBar.swift \
+swiftc -parse-as-library -swift-version 5 -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_x86_64" \
+    ClaudeUsageBar.swift AuthSupport.swift \
     -framework SwiftUI \
     -framework AppKit \
     -framework WebKit \
+    -framework Security \
     -target x86_64-apple-macos12.0
 
 # Create universal binary
@@ -70,9 +75,9 @@ find "$APP_PATH" -name '._*' -delete 2>/dev/null
 find "$APP_PATH" -name '.DS_Store' -delete 2>/dev/null
 dot_clean "$APP_PATH" 2>/dev/null
 
-# Sign with Developer ID certificate. NEVER silently fall back to ad-hoc — that
-# fails notarization later. If real signing fails, error out loudly.
-DEVELOPER_ID="Developer ID Application: Linkko Technology Pte Ltd (Q467HQ5432)"
+# Sign with Developer ID certificate (or CODESIGN_IDENTITY override). NEVER silently
+# fall back to ad-hoc — that fails notarization later. If signing fails, error out loudly.
+DEVELOPER_ID="${CODESIGN_IDENTITY:-Developer ID Application: Linkko Technology Pte Ltd (Q467HQ5432)}"
 if codesign --force --deep --options runtime --sign "$DEVELOPER_ID" "$APP_PATH"; then
     echo "✅ App signed with Developer ID"
     if codesign --verify --verbose=2 "$APP_PATH" 2>&1 | grep -q "valid on disk"; then
